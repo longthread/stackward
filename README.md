@@ -53,7 +53,7 @@ Prebuilt binaries are published per release. Nothing else is needed to run
 them — no Python, no package manager.
 
 ```sh
-curl -fsSL https://github.com/longthread/stackward/releases/latest/download/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/longthread/stackward/main/install.sh | sh
 ```
 
 The installer verifies the published checksum, and build provenance too when
@@ -61,16 +61,23 @@ The installer verifies the published checksum, and build provenance too when
 symlink, so upgrading never disturbs a running process — a git hook, for
 instance.
 
-Pin the version in CI; a build should not move underneath you:
+In CI, pin both halves. `raw` serves any ref, so a tag pins the installer, and
+`STACKWARD_VERSION` pins the binary it fetches:
 
 ```sh
-STACKWARD_VERSION=v0.1.1 sh install.sh
+curl -fsSL https://raw.githubusercontent.com/longthread/stackward/v0.1.1/install.sh \
+  | STACKWARD_VERSION=v0.1.1 sh
 ```
 
-`releases/latest/download/` is also served through a cache that can lag a
-release by around a minute, so immediately after publishing it may still hand
-back the previous version. Another reason a pipeline should name the version it
-wants rather than asking for whatever is newest.
+Both endpoints are cached — `raw` for five minutes, and the
+`releases/latest/download` redirect for around a minute after a release — so an
+unpinned install can briefly return the previous version. That is the practical
+argument for naming the version rather than asking for whatever is newest.
+
+The installer comes from the git tree rather than a release asset so that a fix
+to it ships without cutting a release. The binaries cannot work that way: they
+are build artifacts rather than repository files, so they are fetched from
+release assets, which is also what the provenance attestation covers.
 
 | Platform | Requirement |
 |---|---|

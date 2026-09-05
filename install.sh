@@ -1,7 +1,15 @@
 #!/bin/sh
 # Install stackward.
 #
-#   curl -fsSL https://github.com/longthread/stackward/releases/latest/download/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/longthread/stackward/main/install.sh | sh
+#
+# This script is fetched from the git tree rather than from a release asset, so
+# a fix to the installer reaches people without cutting a release. Swap `main`
+# for a tag to pin the installer itself; raw serves any ref.
+#
+# The binaries below are a different matter and must come from release assets:
+# they are build artifacts, not repository files, and raw.githubusercontent
+# returns 404 for them.
 #
 # Environment:
 #   STACKWARD_VERSION  tag to install (default: latest). Pin this in CI — a
