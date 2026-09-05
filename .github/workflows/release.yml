@@ -1,0 +1,131 @@
+# Build, sign and publish the self-contained binaries.
+#
+# Two things here are load-bearing and easy to get subtly wrong:
+#
+#   * Asset names must match exactly what install.sh asks for. The installer
+#     builds the name from `uname -s` and `uname -m`, so the matrix uses those
+#     values verbatim (Linux-x86_64, Darwin-arm64) rather than prettier ones.
+#
+#   * The Linux build runs in a manylinux container, not on ubuntu-latest. A
+#     bundle links against the glibc it was built on, so building on the newest
+#     runner silently produces a binary that will not start on an older distro.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build and publish"
+        required: true
+
+permissions:
+  contents: write     # create the release
+  id-token: write     # keyless signing
+  attestations: write # build provenance
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            container: quay.io/pypa/manylinux_2_28_x86_64
+            asset: Linux-x86_64
+            python: /opt/python/cp311-cp311/bin/python
+          - os: macos-14
+            container: ""
+            asset: Darwin-arm64
+            python: python3
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Trust the workspace
+        # The manylinux image ships a git that refuses a repo owned by another
+        # uid; without this, later git calls fail with "dubious ownership".
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build the bundle
+        env:
+          PYTHON: ${{ matrix.python }}
+        run: |
+          set -euo pipefail
+          "$PYTHON" -m pip install --quiet --upgrade pip
+          "$PYTHON" -m pip install --quiet . pyinstaller
+          "$PYTHON" -m PyInstaller --noconfirm --clean --onedir \
+            --name stackward --paths src --distpath dist --workpath build entry.py
+
+      - name: It must actually run
+        # A bundle that builds is not a bundle that works. doctor performs a
+        # real Argon2id + AES-GCM round trip, so this catches a native
+        # extension that failed to freeze — the classic failure of this route.
+        run: |
+          set -euo pipefail
+          ./dist/stackward/stackward --version
+          ./dist/stackward/stackward doctor
+
+      - name: Sign for macOS
+        if: runner.os == 'macOS'
+        # Ad-hoc signature. Not notarisation, but enough that arm64 will load a
+        # locally-extracted binary.
+        run: codesign --force --sign - --deep ./dist/stackward/stackward
+
+      - name: Package
+        env:
+          ASSET: ${{ matrix.asset }}
+        run: |
+          set -euo pipefail
+          tar -czf "stackward-${ASSET}.tar.gz" -C dist stackward
+          shasum -a 256 "stackward-${ASSET}.tar.gz" > "stackward-${ASSET}.tar.gz.sha256" \
+            2>/dev/null || sha256sum "stackward-${ASSET}.tar.gz" > "stackward-${ASSET}.tar.gz.sha256"
+          cat "stackward-${ASSET}.tar.gz.sha256"
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: stackward-${{ matrix.asset }}.tar.gz
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stackward-${{ matrix.asset }}
+          path: |
+            stackward-${{ matrix.asset }}.tar.gz
+            stackward-${{ matrix.asset }}.tar.gz.sha256
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Verify the install path before publishing it
+        # Install exactly as a user would, from the artifacts about to be
+        # released, and run the smoke test. A release that cannot be installed
+        # is deleted, not patched: the tag is already immutable in people's
+        # lockfiles and instructions.
+        run: |
+          set -euo pipefail
+          cd artifacts
+          sha256sum --check stackward-Linux-x86_64.tar.gz.sha256
+          mkdir -p /tmp/probe && tar -xzf stackward-Linux-x86_64.tar.gz -C /tmp/probe
+          /tmp/probe/stackward/stackward --version
+          /tmp/probe/stackward/stackward doctor
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --generate-notes \
+            artifacts/* install.sh
