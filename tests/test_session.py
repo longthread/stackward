@@ -338,10 +338,6 @@ def test_current_backend_raises_on_an_unreadable_file_rather_than_treating_it_as
         session._current_backend()
 
 
-def test_guard_allows_a_match():
-    session._check_backend_guard("file:///same")  # no current backend at all: fine
-
-
 def test_guard_passes_when_never_logged_in_at_all(monkeypatch):
     monkeypatch.setattr(session, "_current_backend", lambda: None)
     session._check_backend_guard("file:///anything")  # must not raise
@@ -359,6 +355,128 @@ def test_guard_refuses_a_mismatch_naming_both(monkeypatch):
     message = str(raised.value)
     assert "file:///mine" in message
     assert "file:///other" in message
+
+
+def test_guard_message_redacts_userinfo_in_both_urls(monkeypatch):
+    """The guard's "naming both" message must never print a password that
+    happened to be embedded in a backend URL (`postgres://user:pass@host/db`
+    is a documented Pulumi backend form)."""
+    monkeypatch.setattr(
+        session, "_current_backend", lambda: "postgres://u:current-secret@host/db"
+    )
+    with pytest.raises(SessionError) as raised:
+        session._check_backend_guard("postgres://u:resolved-secret@host/db")
+    message = str(raised.value)
+    assert "current-secret" not in message
+    assert "resolved-secret" not in message
+    assert "<redacted>@host/db" in message
+
+
+def test_exec_refuses_against_a_real_disagreeing_credentials_file_on_disk(
+    cli_store, monkeypatch, tmp_path, stub, capsys
+):
+    """The guard's two halves -- reading a real file, and comparing against
+    it -- proven together, not each in isolation against a mock of the
+    other."""
+    seed_profile(
+        cli_store, "staging", backend_url="file:///staging-backend", credentials=FULL_CREDENTIALS
+    )
+    monkeypatch.setenv(ENV_STORE_PASSWORD, PASSWORD)
+    # `no_real_pulumi_state` (autouse) already points PULUMI_HOME here.
+    home = Path(os.environ["PULUMI_HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "credentials.json").write_text(
+        json.dumps({"current": "file:///a-real-disagreement"})
+    )
+    marker_file = tmp_path / "ran"
+    monkeypatch.setenv("STUB_DUMP_ARGV_TO", str(marker_file))
+
+    code = main(["exec", "--profile", "staging", "--", str(stub)])
+
+    assert code == 2
+    err = capsys.readouterr().err
+    assert "file:///staging-backend" in err
+    assert "file:///a-real-disagreement" in err
+    assert not marker_file.exists()
+
+
+# ---------------------------------------------------------------------------
+# `_redact_url`
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "s3://placeholder-bucket/placeholder-prefix",
+        "file:///placeholder/path",
+        "gs://placeholder-bucket",
+    ],
+)
+def test_redact_url_leaves_a_userinfo_free_url_unchanged(url):
+    assert session._redact_url(url) == url
+
+
+def test_redact_url_replaces_userinfo_with_a_placeholder():
+    url = "postgres://dbuser:super-secret@db.invalid:5432/state"
+    redacted = session._redact_url(url)
+    assert "super-secret" not in redacted
+    assert "dbuser" not in redacted
+    assert redacted == "postgres://<redacted>@db.invalid:5432/state"
+
+
+def test_redact_url_handles_a_username_with_no_password():
+    url = "postgres://dbuser@db.invalid:5432/state"
+    assert session._redact_url(url) == "postgres://<redacted>@db.invalid:5432/state"
+
+
+def test_redact_url_only_touches_the_first_at_sign():
+    """A later `@` -- in a path or query string, say -- is not userinfo and
+    must survive."""
+    url = "postgres://dbuser:secret@db.invalid:5432/state?note=a@b"
+    redacted = session._redact_url(url)
+    assert "secret" not in redacted
+    assert redacted.endswith("?note=a@b")
+
+
+# ---------------------------------------------------------------------------
+# `_current_backend` honouring an already-exported `PULUMI_BACKEND_URL`
+# ---------------------------------------------------------------------------
+
+
+def test_current_backend_prefers_an_exported_env_var_over_the_persisted_file(
+    monkeypatch, tmp_path
+):
+    """Pulumi's own CLI honours `PULUMI_BACKEND_URL` over a persisted login,
+    so a value already exported into the caller's shell is what a stray
+    `pulumi` command would actually use -- and is what the guard must catch,
+    even when the persisted file says something else entirely."""
+    home = tmp_path / "ph"
+    home.mkdir()
+    monkeypatch.setenv("PULUMI_HOME", str(home))
+    (home / "credentials.json").write_text(json.dumps({"current": "file:///from-the-file"}))
+    monkeypatch.setenv(PULUMI_BACKEND_URL, "file:///from-the-env-var")
+    assert session._current_backend() == "file:///from-the-env-var"
+
+
+def test_current_backend_falls_back_to_the_file_when_the_env_var_is_absent(
+    monkeypatch, tmp_path
+):
+    home = tmp_path / "ph"
+    home.mkdir()
+    monkeypatch.setenv("PULUMI_HOME", str(home))
+    (home / "credentials.json").write_text(json.dumps({"current": "file:///from-the-file"}))
+    monkeypatch.delenv(PULUMI_BACKEND_URL, raising=False)
+    assert session._current_backend() == "file:///from-the-file"
+
+
+def test_current_backend_treats_an_empty_env_var_as_absent(monkeypatch, tmp_path):
+    home = tmp_path / "ph"
+    home.mkdir()
+    monkeypatch.setenv("PULUMI_HOME", str(home))
+    (home / "credentials.json").write_text(json.dumps({"current": "file:///from-the-file"}))
+    monkeypatch.setenv(PULUMI_BACKEND_URL, "")
+    assert session._current_backend() == "file:///from-the-file"
 
 
 # ---------------------------------------------------------------------------
@@ -523,6 +641,38 @@ def test_run_child_passes_env_none_through_to_inherit_unchanged(monkeypatch, stu
     monkeypatch.setattr(session.subprocess, "run", fake_run)
     session._run_child([str(stub)])
     assert dump is None
+
+
+def test_run_child_catches_a_keyboard_interrupt_and_returns_the_sigint_status(monkeypatch):
+    """`fail_closed` cannot catch this -- `KeyboardInterrupt` inherits from
+    `BaseException`, not `Exception` -- so `_run_child` must, or a `Ctrl-C`
+    during `stackward exec -- pulumi up` prints a raw traceback."""
+
+    def fake_run(command, env=None):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(session.subprocess, "run", fake_run)
+    assert session._run_child(["irrelevant"]) == 128 + signal.SIGINT
+
+
+def test_exec_prints_no_traceback_on_a_keyboard_interrupt(
+    cli_store, monkeypatch, stub, capsys
+):
+    seed_profile(
+        cli_store, "staging", backend_url="file:///staging-backend", credentials=FULL_CREDENTIALS
+    )
+    monkeypatch.setenv(ENV_STORE_PASSWORD, PASSWORD)
+
+    def fake_run(command, env=None):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(session.subprocess, "run", fake_run)
+    code = main(["exec", "--profile", "staging", "--", str(stub)])
+
+    assert code == 128 + signal.SIGINT
+    captured = capsys.readouterr()
+    assert "Traceback" not in captured.err
+    assert "KeyboardInterrupt" not in captured.err
 
 
 # ---------------------------------------------------------------------------
@@ -825,16 +975,21 @@ def test_exec_runs_the_child_with_exactly_the_expected_environment_delta(
         PULUMI_CONFIG_PASSPHRASE,
         PULUMI_BACKEND_URL,
     }
-    assert parent_keys - child_keys == set()
-    for key in parent_keys - {"STUB_DUMP_ENV_TO"}:
+    # The one name that must be *dropped*, not merely left alone: the store
+    # master password unlocks every profile, not just this one, and must
+    # never reach caller-supplied code.
+    assert parent_keys - child_keys == {ENV_STORE_PASSWORD}
+    assert ENV_STORE_PASSWORD not in child_env
+    for key in parent_keys - {"STUB_DUMP_ENV_TO", ENV_STORE_PASSWORD}:
         assert child_env[key] == parent_before[key]
     assert child_env[AWS_ACCESS_KEY_ID] == MARKER_KEY
     assert child_env[AWS_SECRET_ACCESS_KEY] == MARKER_SECRET
     assert child_env[PULUMI_CONFIG_PASSPHRASE] == MARKER_PASSPHRASE
     assert child_env[PULUMI_BACKEND_URL] == "file:///staging-backend"
+    assert PASSWORD not in child_env.values()
 
     captured = capfd.readouterr()
-    for marker in ALL_MARKERS:
+    for marker in (*ALL_MARKERS, PASSWORD):
         assert marker not in captured.out
         assert marker not in captured.err
 
@@ -1095,18 +1250,26 @@ def test_shell_backend_mismatch_refuses(cli_store, monkeypatch, tmp_path, stub, 
 # ---------------------------------------------------------------------------
 
 
-def test_login_runs_pulumi_login_with_the_resolved_url(
+def test_login_runs_pulumi_login_with_the_url_via_env_not_argv(
     cli_store, monkeypatch, tmp_path, stub
 ):
+    """The URL reaches `pulumi login` as `PULUMI_BACKEND_URL`, never as a
+    positional argument -- some backend forms (`postgres://user:pass@host/db`)
+    can carry a plaintext password in the URL itself, and argv is visible in
+    `ps` for the life of the call."""
     seed_profile(cli_store, "staging", backend_url="file:///staging-backend")
-    dump = tmp_path / "argv.json"
-    monkeypatch.setenv("STUB_DUMP_ARGV_TO", str(dump))
+    argv_dump = tmp_path / "argv.json"
+    env_dump = tmp_path / "env.json"
+    monkeypatch.setenv("STUB_DUMP_ARGV_TO", str(argv_dump))
+    monkeypatch.setenv("STUB_DUMP_ENV_TO", str(env_dump))
     fake_pulumi(monkeypatch, stub)
 
     code = main(["login", "--profile", "staging"])
 
     assert code == 0
-    assert json.loads(dump.read_text()) == ["login", "file:///staging-backend"]
+    assert json.loads(argv_dump.read_text()) == ["login"]
+    child_env = json.loads(env_dump.read_text())
+    assert child_env[PULUMI_BACKEND_URL] == "file:///staging-backend"
 
 
 def test_login_never_opens_the_credentials_store(cli_store, monkeypatch, tmp_path, stub):
@@ -1128,16 +1291,59 @@ def test_login_composes_the_component_form(cli_store, monkeypatch, tmp_path, stu
         cli_store,
         '[profile.staging]\nbucket = "placeholder-bucket"\nregion = "placeholder-region"\n',
     )
-    dump = tmp_path / "argv.json"
-    monkeypatch.setenv("STUB_DUMP_ARGV_TO", str(dump))
+    dump = tmp_path / "env.json"
+    monkeypatch.setenv("STUB_DUMP_ENV_TO", str(dump))
     fake_pulumi(monkeypatch, stub)
 
     code = main(["login", "--profile", "staging"])
 
     assert code == 0
-    argv = json.loads(dump.read_text())
-    assert argv[0] == "login"
-    assert argv[1] == "s3://placeholder-bucket?region=placeholder-region"
+    child_env = json.loads(dump.read_text())
+    assert child_env[PULUMI_BACKEND_URL] == "s3://placeholder-bucket?region=placeholder-region"
+
+
+def test_login_scrubs_the_store_password_from_pulumis_environment(
+    cli_store, monkeypatch, tmp_path, stub
+):
+    """`login` never needs the store password -- it never opens the
+    credentials store -- but it must not hand one along to `pulumi` anyway,
+    for the same reason `exec`/`shell` scrub it."""
+    seed_profile(cli_store, "staging", backend_url="file:///staging-backend")
+    monkeypatch.setenv(ENV_STORE_PASSWORD, PASSWORD)
+    dump = tmp_path / "env.json"
+    monkeypatch.setenv("STUB_DUMP_ENV_TO", str(dump))
+    fake_pulumi(monkeypatch, stub)
+
+    code = main(["login", "--profile", "staging"])
+
+    assert code == 0
+    child_env = json.loads(dump.read_text())
+    assert ENV_STORE_PASSWORD not in child_env
+    assert PASSWORD not in child_env.values()
+
+
+def test_login_never_puts_a_userinfo_bearing_url_in_argv_or_stderr(
+    cli_store, monkeypatch, tmp_path, stub, capsys
+):
+    """A `postgres://user:password@host/db` profile -- a form
+    `pulumi login --help` documents -- must never put its password where
+    `ps` or a printed message could show it."""
+    secret_url = "postgres://dbuser:super-secret-password@db.invalid:5432/state"
+    seed_profile(cli_store, "staging", backend_url=secret_url)
+    argv_dump = tmp_path / "argv.json"
+    monkeypatch.setenv("STUB_DUMP_ARGV_TO", str(argv_dump))
+    fake_pulumi(monkeypatch, stub)
+
+    code = main(["login", "--profile", "staging"])
+
+    assert code == 0
+    argv = json.loads(argv_dump.read_text())
+    assert argv == ["login"]
+    for text in argv:
+        assert "super-secret-password" not in text
+    captured = capsys.readouterr()
+    assert "super-secret-password" not in captured.out
+    assert "super-secret-password" not in captured.err
 
 
 def test_login_reports_a_missing_pulumi_executable(cli_store, monkeypatch, capsys):

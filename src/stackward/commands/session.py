@@ -8,13 +8,21 @@ are read from the environment of *every subsequent* `pulumi` process -- `up`,
 read therefore breaks a plain `pulumi up` outright: `exec` is what makes the
 store usable in practice, not an optional convenience layered on top of it.
 
-**Secrets exist only in the child's environment.** `exec` and `shell` decrypt
-a profile, build one `dict` holding the caller's own environment plus four
-names, and hand it to `subprocess.run` as `env=`. Nothing here writes a
-credential to disk, logs one, or lets one reach `argv` -- the values travel
-from the sealed store into the child's environment block and nowhere else.
-Every error path in this module names a profile, a key, a file or a backend
-URL, and never a credential value.
+**Secrets exist only in the child's environment -- and only the right ones.**
+`exec` and `shell` decrypt a profile, build one `dict` holding the caller's
+own environment plus four names, and hand it to `subprocess.run` as `env=`.
+Nothing here writes a credential to disk, logs one, or lets one reach `argv`.
+But "the caller's own environment" is not handed through unfiltered:
+`STACKWARD_PASSWORD` -- the *store* password, which unlocks every profile,
+not just the one being run with -- is scrubbed from every child's
+environment, `login`'s included, by `_environ_without_store_password`. A
+review of this module found the gap concretely: in the single-command form
+`STACKWARD_PASSWORD=x stackward exec -- pulumi up`, the user's intent is
+unambiguously "stackward only", and without scrubbing it, arbitrary
+caller-supplied code would inherit a secret wider in scope than the one it
+was actually invoked to receive. Every error path in this module names a
+profile, a key, a file or a redacted backend URL, and never a credential
+value.
 
 **`shell` inherits, it does not replace.** Both `exec` and `shell` overlay
 exactly four names onto a *copy* of the caller's own environment
@@ -48,7 +56,26 @@ to write the URL verbatim to `<PULUMI_HOME>/credentials.json`'s `current`
 field with no network access at all for a `file://` backend. This module
 therefore reads that field directly. `PULUMI_HOME` (default `~/.pulumi`) is
 Pulumi's own documented override, not knowledge about any particular
-deployment of it.
+deployment of it. `PULUMI_BACKEND_URL`, when already present in *this*
+process's own environment, is checked first and wins over the persisted
+file: Pulumi's own CLI honours that variable over a stored login (`exec`
+relies on exactly this to override `login`'s persisted state for a single
+child), so a stray `PULUMI_BACKEND_URL` a user has exported into their shell
+is what a bare `pulumi` command would actually use -- and is therefore what
+the guard must compare against, not the file underneath it.
+
+**A backend URL is never put in argv, and is redacted wherever it is
+printed.** Most schemes (`s3://`, `gs://`, `azblob://`, `file://`) carry no
+secret, but `pulumi login --help` documents `postgres://user:password@host/db`
+as a supported backend form, and Global Constraint 3 names `argv` visibility
+explicitly. `login` therefore sets `PULUMI_BACKEND_URL` in `pulumi login`'s
+environment and invokes it with **no** positional URL argument, rather than
+`pulumi login <url>` -- verified, empirically, that a bare `pulumi login`
+with only `PULUMI_BACKEND_URL` set logs in identically for a `file://`
+backend, with no network access. The backend guard's mismatch message still
+names both URLs (that is the point of it), but through `_redact_url`, which
+replaces `user:pass@` with `<redacted>@` wherever it appears in a printed
+backend URL.
 
 **The store password is never read from `sys.stdin`.** `exec` decrypts a
 profile before handing the *child's* stdin, stdout and stderr through
@@ -71,6 +98,15 @@ that negative number to `sys.exit` gets reduced modulo 256 at the OS boundary
 and no longer identifies the signal. `_exit_status` converts it to the
 `128 + signal` form a POSIX shell's own `$?` would report, which is the one
 representation `sys.exit` can carry through intact.
+
+**A `Ctrl-C` while the child is running prints no traceback.** CPython
+re-raises `SIGINT` as `KeyboardInterrupt`, which `fail_closed` does not catch
+(it inherits from `BaseException`, not `Exception`) -- an uncaught one
+already exits 130 by Python's own default, so the exit status was never
+wrong, but reaching the top of the process uncaught also prints a traceback,
+which reads as a crash on `stackward exec -- pulumi up`'s single most common
+interrupt path. `_run_child` catches it around the `subprocess.run` call and
+returns `_exit_status(-signal.SIGINT)` -- the same 130, with nothing printed.
 """
 
 from __future__ import annotations
@@ -79,7 +115,9 @@ import argparse
 import getpass
 import json
 import os
+import re
 import shutil
+import signal
 import subprocess
 import sys
 from collections.abc import Mapping
@@ -220,19 +258,56 @@ def _pulumi_home() -> Path:
     return Path(home) if home else Path.home() / ".pulumi"
 
 
-def _current_backend() -> str | None:
-    """Pulumi's persisted backend URL, read directly from
-    `<PULUMI_HOME>/credentials.json`'s `current` field -- never by shelling
-    out to `pulumi`, which (see the module docstring) contacts the backend
-    itself even for a read-only status query.
+# Matches the userinfo segment of a URL -- `scheme://user[:pass]@` -- so it
+# can be replaced wherever a backend URL is printed. A regex over the raw
+# string rather than a full URL parse: `backend_url` is passed through
+# verbatim and is never validated as a well-formed URL elsewhere in this
+# codebase, and this needs to redact whatever shape actually shows up, not
+# only the shapes a stricter parser would accept. `[^/@]*` is what confines
+# the match to the first `@` -- the userinfo segment cannot itself contain an
+# unencoded `/` or `@` -- so a later `@` in a path or query string is left
+# alone.
+_USERINFO = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@]*@")
 
-    Returns `None` only for the legitimate "never logged in" state: the file
-    does not exist, or exists but does not yet have a `current` entry. Any
-    other failure to read or parse it raises `SessionError` -- an unreadable
-    or malformed credentials file must not be silently treated as "nothing to
-    guard against", which is exactly the fail-open behaviour the backend guard
-    exists to prevent.
+
+def _redact_url(url: str) -> str:
+    """`url`, with any `user[:pass]@` userinfo replaced by `<redacted>@`.
+
+    Most backend schemes (`s3://`, `gs://`, `azblob://`, `file://`) never
+    carry a secret in the URL itself, but `pulumi login --help` documents
+    `postgres://user:password@host/db` as a supported backend form that
+    does. This is the one function everywhere a backend URL is printed
+    passes through, so that scheme's password is never one of the values
+    that ends up on screen -- see the module docstring.
     """
+    return _USERINFO.sub(r"\1<redacted>@", url, count=1)
+
+
+def _current_backend() -> str | None:
+    """What a bare `pulumi` invocation -- one not run through this module's
+    own `exec`/`shell`, and so not handed `PULUMI_BACKEND_URL` by them --
+    would use as its backend right now.
+
+    Checks *this* process's own `PULUMI_BACKEND_URL` first: Pulumi's CLI
+    honours that variable over a persisted login, so a value a user has
+    already exported into their shell is what a stray `pulumi` command would
+    actually use, and is exactly the drift the guard exists to catch (see
+    the module docstring). Only when that is unset does this fall back to
+    `<PULUMI_HOME>/credentials.json`'s `current` field -- read directly,
+    never by shelling out to `pulumi`, which (see the module docstring)
+    contacts the backend itself even for a read-only status query.
+
+    Returns `None` only for the legitimate "nothing else says otherwise"
+    state: no `PULUMI_BACKEND_URL`, and either no credentials file or one
+    with no `current` entry yet. Any other failure to read or parse the file
+    raises `SessionError` -- an unreadable or malformed credentials file must
+    not be silently treated as "nothing to guard against", which is exactly
+    the fail-open behaviour the backend guard exists to prevent.
+    """
+    from_env = os.environ.get(PULUMI_BACKEND_URL)
+    if from_env:
+        return from_env
+
     path = _pulumi_home() / "credentials.json"
     try:
         raw = path.read_bytes()
@@ -260,15 +335,17 @@ def _current_backend() -> str | None:
 
 def _check_backend_guard(resolved_url: str) -> None:
     """Refuse when Pulumi's persisted backend does not match `resolved_url`,
-    naming both. Never logged into anything at all is not a mismatch -- it is
-    an absence, and there is nothing yet for `resolved_url` to conflict with;
-    `stackward login` (or a first `exec`/`shell`) is how it gets set."""
+    naming both (redacted -- see `_redact_url`). Never logged into anything
+    at all is not a mismatch -- it is an absence, and there is nothing yet
+    for `resolved_url` to conflict with; `stackward login` (or a first
+    `exec`/`shell`) is how it gets set."""
     current = _current_backend()
     if current is not None and current != resolved_url:
         raise SessionError(
             "backend mismatch: this profile resolves to backend "
-            f"{resolved_url!r}, but pulumi is currently logged in to "
-            f"{current!r}. Run `stackward login` for this profile first."
+            f"{_redact_url(resolved_url)!r}, but pulumi is currently logged "
+            f"in to {_redact_url(current)!r}. Run `stackward login` for "
+            "this profile first."
         )
 
 
@@ -325,13 +402,28 @@ def _require_credential_names(credentials: Mapping[str, str], profile: str) -> N
         )
 
 
-def _child_env(credentials: Mapping[str, str], backend_url: str) -> dict[str, str]:
-    """The caller's own environment, plus exactly the four session names.
+def _environ_without_store_password() -> dict[str, str]:
+    """A copy of the caller's own environment with `STACKWARD_PASSWORD`
+    removed.
 
-    A copy of `os.environ`, never `os.environ` itself -- overlaying onto the
-    real mapping would leak the four names into every subsequent call in this
-    same process, including this one's own `fail_closed` error path."""
+    Shared by `_child_env` (`exec`/`shell`) and `login`'s own child
+    environment. The store password unlocks *every* profile in the store,
+    while what either command hands to a child is scoped to one profile
+    (`exec`/`shell`) or to nothing secret at all (`login`) -- inheriting it
+    into arbitrary caller-supplied code, or even into `pulumi` itself, widens
+    that scope for no reason any of the three commands need. A copy, never
+    `os.environ` itself: mutating the real mapping here would affect every
+    later call in this same process.
+    """
     env = dict(os.environ)
+    env.pop(ENV_STORE_PASSWORD, None)
+    return env
+
+
+def _child_env(credentials: Mapping[str, str], backend_url: str) -> dict[str, str]:
+    """The caller's own environment, minus the store password, plus exactly
+    the four session names."""
+    env = _environ_without_store_password()
     for name in CREDENTIAL_NAMES:
         env[name] = credentials[name]
     env[PULUMI_BACKEND_URL] = backend_url
@@ -386,47 +478,79 @@ def _run_child(command: list[str], env: dict[str, str] | None = None) -> int:
     return its translated exit status.
 
     `env=None` means "inherit the caller's environment unchanged", the same
-    meaning `subprocess.run` itself gives it -- used by `login`, which injects
-    nothing. `exec`/`shell` always pass an explicit environment built by
-    `_child_env`.
+    meaning `subprocess.run` itself gives it. No current caller in this
+    module actually relies on that default -- `login` passes an explicit
+    environment too now, with `STACKWARD_PASSWORD` scrubbed even though
+    `pulumi login` never needs it, for the same reason `exec`/`shell` do --
+    but it is kept as `_run_child`'s own general-purpose meaning rather than
+    coupled to what today's callers happen to do.
 
     A missing executable is reported by name (never by the full command line,
     which could hold an argument value, though never a credential -- those
     never reach argv at all) and mapped to exit code 2, the same "could not
     run" code every other refusal in this module uses.
+
+    A `Ctrl-C` reaching this process while the child runs surfaces here as
+    `KeyboardInterrupt` (CPython's own re-raising of `SIGINT`) rather than as
+    a return code `subprocess` reports -- `fail_closed` does not catch it
+    (`BaseException`, not `Exception`), so left alone it would propagate to
+    the top of the process and print a traceback before Python's own default
+    handling exits 130. Caught here and translated the same way a
+    signal-killed child is, for the same exit status with nothing printed.
     """
     try:
         completed = subprocess.run(command, env=env)
     except OSError as exc:
         print(f"error: cannot run {command[0]!r}: {exc}", file=sys.stderr)
         return 2
+    except KeyboardInterrupt:
+        return _exit_status(-signal.SIGINT)
     return _exit_status(completed.returncode)
+
+
+def _report(exc: Exception) -> int:
+    """Print `exc`'s message as `error: ...` on stderr and return exit code
+    2 -- the "could not run" code every pre-flight refusal in `cmd_login`,
+    `cmd_exec` and `cmd_shell` uses. `exc` must be one of `_KNOWN_ERRORS`:
+    none of those ever carry a credential value in their message, which is
+    not a property of `Exception` in general -- an unanticipated exception
+    is `fail_closed`'s job, not this function's."""
+    print(f"error: {exc}", file=sys.stderr)
+    return 2
 
 
 @fail_closed
 def cmd_login(args: argparse.Namespace) -> int:
     """Entry point for `stackward login`.
 
-    Resolves the profile's backend URL and runs `pulumi login <url>`. Never
-    opens the credentials store -- a profile can be logged into before its
-    credentials have been set at all (`store.py`'s own R3) -- and never
-    subject to the backend guard, which exists to protect the commands that
-    run with a profile's credentials live in the environment; `login` is the
-    command that *sets* what the guard checks against, so gating it on
-    itself would make switching profiles impossible.
+    Resolves the profile's backend URL and runs `pulumi login` with it set
+    as `PULUMI_BACKEND_URL` in the child's environment -- never as a
+    positional argument. `pulumi login --help` documents
+    `postgres://user:password@host/db` as a supported backend form, and an
+    argv value is visible in `ps` for the life of the call; verified,
+    empirically, that a bare `pulumi login` (no positional URL) honours
+    `PULUMI_BACKEND_URL` identically to the positional form, for a `file://`
+    backend with no network access. Never opens the credentials store -- a
+    profile can be logged into before its credentials have been set at all
+    (`store.py`'s own R3) -- and never subject to the backend guard, which
+    exists to protect the commands that run with a profile's credentials
+    live in the environment; `login` is the command that *sets* what the
+    guard checks against, so gating it on itself would make switching
+    profiles impossible.
     """
     try:
         profile = _resolve_profile(args.profile)
         url = _compose_backend_url(profile)
     except _KNOWN_ERRORS as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+        return _report(exc)
 
     pulumi = shutil.which("pulumi")
     if pulumi is None:
         print("error: pulumi executable not found on PATH", file=sys.stderr)
         return 2
-    return _run_child([pulumi, "login", url])
+    env = _environ_without_store_password()
+    env[PULUMI_BACKEND_URL] = url
+    return _run_child([pulumi, "login"], env)
 
 
 @fail_closed
@@ -448,8 +572,7 @@ def cmd_exec(args: argparse.Namespace) -> int:
     try:
         env = _prepare_env(args.profile)
     except _KNOWN_ERRORS as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+        return _report(exc)
 
     return _run_child(args.argv, env)
 
@@ -466,7 +589,6 @@ def cmd_shell(args: argparse.Namespace) -> int:
     try:
         env = _prepare_env(args.profile)
     except _KNOWN_ERRORS as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
+        return _report(exc)
 
     return _run_child([shell_path], env)
