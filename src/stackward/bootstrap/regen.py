@@ -108,6 +108,47 @@ def _is_root_model(model: type) -> bool:
     return isinstance(model, type) and issubclass(model, RootModel)
 
 
+def _declares_fields(klass: type) -> bool:
+    """Does `klass` declare fields of its own?
+
+    True when it carries at least one annotation of its own whose name does
+    not start with an underscore. That is pydantic's own rule, not an
+    approximation of it: an underscore-prefixed annotated name is a *private
+    attribute*, which pydantic never collects as a field, so it can never
+    carry a mark under this tool's convention either.
+
+    The distinction is what separates a structure from a scalar without
+    enumerating either. A pydantic dataclass, a `TypedDict`, a `NamedTuple`
+    and a plain annotated mixin all declare public annotations; `str`, an
+    `Enum`, `Decimal`, `UUID`, `datetime` and `abc.ABC` declare none, and
+    pydantic's own scalar wrappers (`AnyUrl`, `SecretStr`) declare only
+    private ones. Refusing that second group would make the rule unusable —
+    "narrow the annotation" is not even available for `AnyUrl`.
+
+    Read from `__dict__` rather than the attribute: since Python 3.10,
+    `klass.__annotations__` lazily *creates* an empty dict on a class that
+    has none, and on some builtins raises instead.
+
+    Known conservative case, stated rather than hidden: a class whose only
+    annotations are `ClassVar` declares no fields to pydantic but does to
+    this rule, so it refuses. That fails closed with an actionable message,
+    and detecting `ClassVar` through a possibly-stringised annotation would
+    be a guess where this is a fact.
+    """
+    annotations = klass.__dict__.get("__annotations__")
+    if not annotations:
+        return False
+    return any(not name.startswith("_") for name in annotations)
+
+
+def _declares_fields_anywhere(klass: type) -> bool:
+    """`_declares_fields` over the whole MRO — a class inherits its shape."""
+    for base in getattr(klass, "__mro__", (klass,)):
+        if base is not object and _declares_fields(base):
+            return True
+    return False
+
+
 def _model_id(model: type) -> str:
     """`module:QualName` — stable, readable, and meaningful in a diff of the
     committed artifact, which synthetic indices would not be."""
@@ -151,7 +192,15 @@ def _may_hold_model(annotation: Any) -> bool:
         # `Callable[[A], B]` carries its parameter types in a list.
         return any(_may_hold_model(item) for item in annotation)
     if isinstance(annotation, type):
-        return False
+        # The last branch, and the one a blanket `False` gets catastrophically
+        # wrong. A pydantic dataclass, a `TypedDict` and a `NamedTuple` are
+        # none of the things tested above — not a `BaseModel`, no
+        # `get_origin`, not a bare container — so they all arrive here, and
+        # answering "no" would drop every marked field inside them from the
+        # graph with no refusal: the whole category silently uncovered. Only a
+        # class that declares no fields of its own anywhere in its MRO is a
+        # leaf; see `_declares_fields`.
+        return _declares_fields_anywhere(annotation)
     return True
 
 
@@ -194,6 +243,14 @@ class _GraphBuilder:
 
     def _fields(self, model: type, model_id: str) -> dict[str, dict[str, Any]]:
         fields: dict[str, dict[str, Any]] = {}
+        # Every key any field could appear under, whether or not that field
+        # ends up emitted. Tracked separately from `fields` because an entry
+        # is only stored when it says something (see below): keying the
+        # collision check on `fields` alone made it order-dependent — an
+        # unmarked scalar never claimed its key, so a later marked field
+        # aliased to that name took it silently, while the same two fields
+        # declared in the other order refused.
+        claimed: set[str] = set()
         marked = self.is_secret(model)
         for name, info in model.model_fields.items():
             where = f"{model_id}.{name}"
@@ -205,15 +262,18 @@ class _GraphBuilder:
                 # refuse a declaration that is already complete.
                 entry["secret"] = True
             else:
-                child = self._resolve(info.annotation, where, model_id)
+                child = self._resolve(
+                    info.annotation, where, model_id, info.annotation
+                )
                 if child is not None:
                     entry["child"] = child
             for key in _data_keys(name, info, where):
-                if key in fields:
+                if key in claimed:
                     raise Unwalkable(
                         f"{where}: data key {key!r} is claimed by more than one "
                         "field; give the fields distinct names or aliases"
                     )
+                claimed.add(key)
                 if entry:
                     # A field with neither a mark nor a model beneath it is
                     # omitted rather than written as `{}`: the matcher treats
@@ -225,7 +285,7 @@ class _GraphBuilder:
         return fields
 
     def _resolve(
-        self, annotation: Any, where: str, model_id: str
+        self, annotation: Any, where: str, model_id: str, written: Any
     ) -> dict[str, Any] | None:
         """One annotation, as a graph node — or `None` when nothing beneath it
         is a declared model, which is the common case and is written as the
@@ -245,7 +305,7 @@ class _GraphBuilder:
                 # `Optional[X]` / `X | None`: one real member, so there is
                 # exactly one thing to walk. `None` itself is not a mapping
                 # and has nothing beneath it.
-                return self._resolve(present[0], where, model_id)
+                return self._resolve(present[0], where, model_id, written)
             if any(_may_hold_model(member) for member in present):
                 raise Unwalkable(
                     f"{where}: a union of more than one type cannot be walked, "
@@ -254,10 +314,10 @@ class _GraphBuilder:
                 )
             return None
         if origin is list and len(args) == 1:
-            item = self._resolve(args[0], where, model_id)
+            item = self._resolve(args[0], where, model_id, written)
             return None if item is None else {"kind": "list", "item": item}
         if origin is dict and len(args) == 2 and _strip_annotated(args[0]) is str:
-            value = self._resolve(args[1], where, model_id)
+            value = self._resolve(args[1], where, model_id, written)
             return None if value is None else {"kind": "dict", "value": value}
 
         if _may_hold_model(annotation):
@@ -267,7 +327,8 @@ class _GraphBuilder:
             # -- and first adoption of this tool is exactly when several of
             # these arrive at once.
             raise Unwalkable(
-                f"{where}: annotation {_describe(annotation)} may hold a "
+                f"{where}: annotation {_describe(written)}"
+                f"{_at(written, annotation)} may hold a "
                 f"declared model, and {model_id} cannot be walked through it. "
                 "Walkable forms are a model, list[X], dict[str, X] and "
                 "Optional[X]. Three ways forward: narrow the annotation to one "
@@ -292,6 +353,19 @@ def _describe(annotation: Any) -> str:
     if isinstance(annotation, type):
         return getattr(annotation, "__qualname__", None) or repr(annotation)
     return repr(annotation)
+
+
+def _at(written: Any, offending: Any) -> str:
+    """` (at X)`, when the part that refused is not the whole annotation.
+
+    The message has to name the annotation as the reader *wrote* it —
+    `dict[str, Any]` — or they are sent looking for a line that says `Any`
+    and does not exist. Naming the offending part as well keeps the precision
+    that made the inner-only message tempting.
+    """
+    if written is offending:
+        return ""
+    return f" (at {_describe(offending)})"
 
 
 def _data_keys(name: str, info: Any, where: str) -> list[str]:
@@ -444,6 +518,14 @@ def _annotated_aliases(model: type) -> list[Any]:
     return found
 
 
+def _inside(source: Any, repo_root: Path) -> bool:
+    try:
+        Path(source).resolve().relative_to(repo_root)
+    except ValueError:
+        return False
+    return True
+
+
 def _collect_sources(
     classes: list[type], extra_objects: list[Any], repo_root: Path
 ) -> tuple[list[str], list[str]]:
@@ -454,7 +536,12 @@ def _collect_sources(
 
     - the **MRO** of every reachable model, so a mark inherited from a base
       class in another file is recorded. `getsourcefile(cls)` alone gives
-      only the subclass's own file, which is the case this closes.
+      only the subclass's own file, which is the case this closes. The walk
+      is *not* restricted to `BaseModel` subclasses: pydantic collects a
+      marked field from a plain `class Mixin:` into
+      `Root(Mixin, BaseModel).model_fields`, so a filter keyed on
+      `issubclass(base, BaseModel)` takes the mark and discards the file it
+      came from.
     - **identity** of every `Annotated` alias used by those models, matched
       against the globals of every imported module. An alias is a module-level
       object, and the annotation resolves to that very object, so the module
@@ -464,7 +551,12 @@ def _collect_sources(
     `pydantic.BaseModel` itself is excluded from the MRO walk. Including it
     would make pydantic an out-of-repo contributor for *every* repository,
     and so make a tracked lockfile a universal precondition, for no signal:
-    the marks this tool reads are its own convention, not pydantic's.
+    the marks this tool reads are its own convention, not pydantic's. Every
+    *other* base is recorded when it is repo-local (free — the blob id is in
+    the index already) and, when it is not, only if it declares fields of its
+    own. Without that second condition `class Config(BaseModel, ABC)` would
+    record `abc` and reimpose the very lockfile precondition the `BaseModel`
+    exclusion exists to avoid.
 
     A module with no `__file__` (a builtin, a namespace package, this program
     itself) is skipped: there is nothing to record a blob id for. That is a
@@ -478,23 +570,35 @@ def _collect_sources(
     def record(source: Any, module_name: str) -> None:
         if not source:
             return
-        path = Path(source).resolve()
-        try:
-            path.relative_to(repo_root)
-        except ValueError:
+        if _inside(source, repo_root):
+            files.add(str(Path(source).resolve()))
+        else:
             external.add(module_name)
-            return
-        files.add(str(path))
 
     for model in classes:
         for base in model.__mro__:
-            if base is BaseModel or not issubclass(base, BaseModel):
+            if base is object or base is BaseModel:
                 continue
             try:
                 source = inspect.getsourcefile(base)
-            except TypeError:
+            except (TypeError, OSError):
+                # TypeError for a builtin; OSError ("source code not
+                # available") for a class whose module has no file at all.
                 source = None
-            record(source, base.__module__)
+            if source is None:
+                continue
+            if _inside(source, repo_root):
+                # Repo-local: recorded unconditionally. A blob id for a file
+                # already in the index costs nothing, and a base that declares
+                # no field today is one edit away from declaring a marked one.
+                record(source, base.__module__)
+            elif _declares_fields(base):
+                # Out of the repository: recorded only when it actually
+                # declares fields, because recording one makes a tracked
+                # lockfile a precondition for generating at all. That is why
+                # this cannot simply be "every base except object" —
+                # `class Config(BaseModel, ABC)` would pin `abc`.
+                external.add(base.__module__)
 
     wanted = {id(obj) for model in classes for obj in _annotated_aliases(model)}
     wanted.update(id(obj) for obj in extra_objects)

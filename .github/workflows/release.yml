@@ -88,6 +88,17 @@ jobs:
           ./dist/stackward/stackward doctor | tee doctor.txt
           grep -q "^model walker    regen.py readable" doctor.txt
 
+          # The other half of that arrangement: `regen.py` ships as data
+          # precisely so nothing imports it and pydantic stays test-only. If it
+          # ever became an import, the bundle would still build, doctor would
+          # still pass, and the only visible symptom would be a fatter
+          # download — so the absence has to be asserted, not assumed.
+          if find dist -iname '*pydantic*' -print -quit | grep -q .; then
+            echo "::error::pydantic was bundled; it is a test-only dependency" >&2
+            find dist -iname '*pydantic*' | head -20 >&2
+            exit 1
+          fi
+
       - name: Sign for macOS
         if: runner.os == 'macOS'
         # Ad-hoc signature. Not notarisation, but enough that arm64 will load a

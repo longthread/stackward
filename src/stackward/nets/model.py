@@ -97,11 +97,22 @@ ARTIFACT_PATH = ".stackward/declared-secrets.json"
 # say how to clear itself is a fail-closed error someone disables.
 REGEN_COMMAND = "stackward sync-declared-secrets"
 
-# Bumped when the artifact's shape changes. An unrecognised version is a hard
-# refusal, not a best-effort parse: a newer generator's graph read by an older
-# matcher would be silently under-walked, which is the one failure mode this
-# net exists to prevent.
-ARTIFACT_VERSION = 1
+# Bumped when the artifact's shape changes **or when the generator's coverage
+# does**. An unrecognised version is a hard refusal, not a best-effort parse,
+# and the refusal has to run in both directions: a newer generator's graph read
+# by an older matcher would be under-walked, and an older generator's graph read
+# by a newer matcher is under-*covered* — internally consistent, fresh against
+# every source it records, and quietly describing less than the repository
+# declares.
+#
+# That second direction is why this is 2 rather than 1. Version 1's generator
+# answered "this cannot hold a model" for any class it did not recognise, so a
+# pydantic dataclass, a `TypedDict` or a `NamedTuple` holding a marked field
+# left the graph with no refusal. Fixing the generator does nothing for an
+# artifact already committed by the old one — nothing in it is stale — so the
+# version is what forces every repository to regenerate once, and the refusal
+# names the command that does it.
+ARTIFACT_VERSION = 2
 
 # The document key holding a Pulumi stack's configuration. Findings are
 # rendered from the document root (`config.<namespace>.<...>`) so that a path
@@ -493,8 +504,12 @@ def _report(
 # --------------------------------------------------------------------------
 
 
-def run_git(args: list[str], *, cwd: Path | None = None) -> bytes:
+def run_git(args: list[str]) -> bytes:
     """Run `git <args>` and return stdout, raising `ModelNetError` on failure.
+
+    Runs in the current working directory; every invocation that must be
+    anchored to the repository passes `-C <root>` explicitly rather than
+    through a parameter here, so there is one way it is done rather than two.
 
     Shared with `commands.sync_declared` so that both sides of the artifact —
     the writer resolving blob ids and the reader verifying them — use one
@@ -504,12 +519,7 @@ def run_git(args: list[str], *, cwd: Path | None = None) -> bytes:
     produced blob content to leak.
     """
     try:
-        proc = subprocess.run(
-            ["git", *args],
-            capture_output=True,
-            check=False,
-            cwd=None if cwd is None else str(cwd),
-        )
+        proc = subprocess.run(["git", *args], capture_output=True, check=False)
     except OSError as exc:
         raise ModelNetError(f"cannot run git {' '.join(args)}: {exc}") from exc
     if proc.returncode != 0:
@@ -635,6 +645,36 @@ def verify_sources(root: Path, sources: dict[str, str]) -> None:
             )
 
 
+def _verify_roots(net: ModelNet, check: CheckConfig) -> None:
+    """The artifact must start from exactly the namespaces the policy declares.
+
+    A second, independent guard on the same drift the recorded blob id of
+    `.stackward.toml` catches — and it needs no blob id at all, so it still
+    holds if that file is somehow not among the sources. A namespace declared
+    in `check.stack_models` with no root in the artifact is not a smaller
+    answer; it is *no* answer for that namespace, silently.
+
+    **Key sets only.** A model id is `module:QualName` while the config names
+    `module:Class`, and those diverge for a nested class — comparing values
+    would refuse a correct artifact.
+    """
+    declared = set(check.stack_models)
+    present = set(net.roots)
+    if declared == present:
+        return
+    missing = sorted(declared - present)
+    extra = sorted(present - declared)
+    detail = []
+    if missing:
+        detail.append(f"declares {missing} that it does not cover")
+    if extra:
+        detail.append(f"covers {extra} that it no longer declares")
+    raise ModelNetError(
+        f"{ARTIFACT_PATH} is stale: this repository {' and '.join(detail)}; "
+        f"regenerate with: {REGEN_COMMAND}"
+    )
+
+
 def load_model_net(check: CheckConfig) -> ModelNet | None:
     """The model net for this repository, or `None` when it is switched off.
 
@@ -653,4 +693,5 @@ def load_model_net(check: CheckConfig) -> ModelNet | None:
     root = repo_toplevel()
     net, sources = parse_net(read_artifact_from_index(root))
     verify_sources(root, sources)
+    _verify_roots(net, check)
     return net

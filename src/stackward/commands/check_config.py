@@ -111,9 +111,7 @@ def fail_closed(
     return wrapped
 
 
-def scan_file(
-    path: Path, check: CheckConfig, net: ModelNet | None = None
-) -> list[str]:
+def scan_file(path: Path, check: CheckConfig, net: ModelNet | None) -> list[str]:
     """Thin file-path wrapper over both nets, unioned.
 
     Reads `path` from the working tree and parses it as YAML before handing
@@ -125,7 +123,12 @@ def scan_file(
     temp file to get there.
 
     `net` is `None` when the repository declares `model_net = "none"`, or
-    has no `[check]` policy at all; the heuristic net always runs. The two
+    has no `[check]` policy at all; the heuristic net always runs. It has no
+    default, deliberately: a caller that simply forgot it would silently get
+    the heuristic net alone, which is the whole failure this parameter
+    exists to prevent. `pre_commit._scan_staged_config` takes it the same
+    way, and that already paid for itself — a test stub with the old
+    signature failed loudly rather than quietly scanning with one net. The two
     result lists are unioned through a set, because both nets can name the
     same leaf — a field marked `secret` whose key is also called `password`
     is the ordinary case, not a corner one — and a finding printed twice

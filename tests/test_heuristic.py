@@ -309,20 +309,20 @@ def write_yaml(tmp_path, name: str, text: str):
 
 def test_scan_file_returns_no_findings_for_a_clean_file(tmp_path):
     path = write_yaml(tmp_path, "Pulumi.dev.yaml", "name: myproject\nruntime: nodejs\n")
-    assert scan_file(path, CheckConfig()) == []
+    assert scan_file(path, CheckConfig(), None) == []
 
 
 def test_scan_file_finds_a_plaintext_credential(tmp_path):
     path = write_yaml(
         tmp_path, "Pulumi.dev.yaml", "config:\n  myproject:dbPassword: hunter2\n"
     )
-    assert scan_file(path, CheckConfig()) == ["config.myproject:dbPassword"]
+    assert scan_file(path, CheckConfig(), None) == ["config.myproject:dbPassword"]
 
 
 def test_scan_file_raises_check_error_on_invalid_yaml(tmp_path):
     path = write_yaml(tmp_path, "Pulumi.dev.yaml", "key: [unclosed\n")
     with pytest.raises(CheckError):
-        scan_file(path, CheckConfig())
+        scan_file(path, CheckConfig(), None)
 
 
 def test_invalid_yaml_error_never_prints_a_credential_shaped_value(tmp_path):
@@ -338,7 +338,7 @@ def test_invalid_yaml_error_never_prints_a_credential_shaped_value(tmp_path):
         "config:\n  myproject:dbPassword: hunter2: not-valid-yaml\n",
     )
     with pytest.raises(CheckError) as exc_info:
-        scan_file(path, CheckConfig())
+        scan_file(path, CheckConfig(), None)
     assert "hunter2" not in str(exc_info.value)
 
 
@@ -352,7 +352,7 @@ def test_invalid_yaml_bad_escape_error_redacts_the_leaked_character(tmp_path):
     does not."""
     path = write_yaml(tmp_path, "Pulumi.leak.yaml", 'password: "hunter\\2ok"\n')
     with pytest.raises(CheckError) as exc_info:
-        scan_file(path, CheckConfig())
+        scan_file(path, CheckConfig(), None)
     message = str(exc_info.value)
     assert "'2'" not in message
     assert "hunter" not in message
@@ -371,7 +371,7 @@ def test_invalid_yaml_reserved_leading_character_error_redacts_the_leaked_charac
     "found character %r that cannot start any token"."""
     path = write_yaml(tmp_path, "Pulumi.leak.yaml", "password: `s3cr3tPass99\n")
     with pytest.raises(CheckError) as exc_info:
-        scan_file(path, CheckConfig())
+        scan_file(path, CheckConfig(), None)
     message = str(exc_info.value)
     assert "'`'" not in message
     assert "s3cr3tPass99" not in message
@@ -391,7 +391,7 @@ def test_scan_file_redacts_an_apostrophe_that_flips_reprs_delimiter(tmp_path):
     not just a synthetic exception."""
     path = write_yaml(tmp_path, "Pulumi.leak.yaml", "password: \"s3cr3t\\'value\"\n")
     with pytest.raises(CheckError) as exc_info:
-        scan_file(path, CheckConfig())
+        scan_file(path, CheckConfig(), None)
     message = str(exc_info.value)
     assert "'" not in message
     assert "s3cr3t" not in message
@@ -438,12 +438,12 @@ def test_yaml_error_redaction_removes_any_percent_r_reserved_character(trigger_c
 def test_scan_file_raises_check_error_on_non_mapping_document(tmp_path):
     path = write_yaml(tmp_path, "Pulumi.dev.yaml", "- a\n- b\n")
     with pytest.raises(CheckError):
-        scan_file(path, CheckConfig())
+        scan_file(path, CheckConfig(), None)
 
 
 def test_scan_file_raises_check_error_on_missing_file(tmp_path):
     with pytest.raises(CheckError):
-        scan_file(tmp_path / "does-not-exist.yaml", CheckConfig())
+        scan_file(tmp_path / "does-not-exist.yaml", CheckConfig(), None)
 
 
 def test_check_config_exits_0_when_clean(tmp_path, capsys):

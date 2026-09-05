@@ -207,8 +207,18 @@ def _lockfile_sources(root: Path) -> dict[str, str]:
     return index_blob_ids(root, candidates)
 
 
-def build_artifact(root: Path, result: dict[str, object]) -> dict[str, object]:
+def build_artifact(
+    root: Path, result: dict[str, object], config_path: Path
+) -> dict[str, object]:
     """Assemble the artifact, refusing anything that would leave it unverifiable.
+
+    `config_path` is `.stackward.toml`, and it is a source like any other:
+    `check.stack_models` supplies the artifact's `roots` and
+    `check.declared_paths_fn` decides which fields are marked at all, so it
+    decides part of the content as surely as a model file does. Leaving it
+    out meant a namespace could be added to the policy, staged, and committed
+    with the artifact untouched — the artifact then has no root for it, the
+    namespace is skipped, and the gate reports clean.
 
     Two refusals matter more than they look:
 
@@ -223,7 +233,10 @@ def build_artifact(root: Path, result: dict[str, object]) -> dict[str, object]:
     regeneration, so a self-reference would make every artifact stale the
     moment it was written.
     """
-    files = _relative_sources(root, [str(item) for item in result.get("files", [])])
+    files = _relative_sources(
+        root,
+        [str(item) for item in result.get("files", [])] + [str(config_path)],
+    )
     external = sorted({str(item) for item in result.get("external", [])})
 
     tracked = index_blob_ids(root, files) if files else {}
@@ -299,7 +312,7 @@ def sync(root: Path, config_path: Path, config: Config) -> Path:
             "declared_paths_fn": config.check.declared_paths_fn,
         },
     )
-    artifact = build_artifact(root, result)
+    artifact = build_artifact(root, result, config_path)
 
     target = root / ARTIFACT_PATH
     target.parent.mkdir(parents=True, exist_ok=True)

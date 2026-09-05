@@ -22,6 +22,7 @@ Every model here is synthetic and named for its role in the test.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import subprocess
 import sys
@@ -31,8 +32,11 @@ from pathlib import Path
 import pytest
 
 from stackward import cli as cli_module
+from stackward.nets import model as model_module
 from stackward.bootstrap import generator_source
 from stackward.cli import cmd_doctor
+from stackward.commands import check_config as check_config_module
+from stackward.commands import pre_commit as pre_commit_module
 from stackward.cli import main
 from stackward.commands.sync_declared import SyncError, build_artifact, serialise
 from stackward.config import CheckConfig
@@ -313,11 +317,34 @@ def parse_should_fail(payload) -> str:
     return str(excinfo.value)
 
 
-def test_an_unsupported_artifact_version_is_refused():
+@pytest.mark.parametrize("version", [ARTIFACT_VERSION + 1, ARTIFACT_VERSION - 1])
+def test_an_artifact_version_this_matcher_does_not_read_is_refused(version):
+    """Both directions refuse, and the older one is the one that matters in
+    practice: an artifact written by a previous generator is fresh against
+    every source it records and internally consistent, while quietly covering
+    less than the repository declares. Only the version can say so."""
     message = parse_should_fail(
-        {"version": ARTIFACT_VERSION + 1, "models": {}, "roots": {}, "sources": {"a": "b"}}
+        {"version": version, "models": {}, "roots": {}, "sources": {"a": "b"}}
     )
     assert "unsupported version" in message
+    assert "sync-declared-secrets" in message
+
+
+def test_an_artifact_written_by_the_version_1_generator_is_refused():
+    """The literal version, pinned rather than expressed relative to the
+    constant -- a test written as `ARTIFACT_VERSION - 1` moves with the
+    constant and would pass just as well if the bump were reverted.
+
+    Version 1's generator answered "this cannot hold a model" for any class it
+    did not recognise, so a pydantic dataclass or `TypedDict` holding a marked
+    field left the graph with no refusal. Such an artifact is fresh against
+    every source it records and internally consistent; nothing but the version
+    can say it covers less than the repository declares.
+    """
+    message = parse_should_fail(
+        {"version": 1, "models": {}, "roots": {}, "sources": {"a": "b"}}
+    )
+    assert "unsupported version 1" in message
     assert "sync-declared-secrets" in message
 
 
@@ -467,6 +494,20 @@ HEURISTIC_BLIND_MODEL = """
         binding: str = Field(default="", json_schema_extra={"secret": True})
         plain: str = ""
         children: list[Root] = []
+"""
+
+# Two independently declarable roots, for the tests about what happens when
+# `.stackward.toml` names a namespace the artifact does not cover.
+TWO_MODELS = """
+    from pydantic import BaseModel, Field
+
+
+    class Root(BaseModel):
+        binding: str = Field(default="", json_schema_extra={"secret": True})
+
+
+    class Other(Root):
+        pass
 """
 
 # A credential the heuristic net cannot reach: an unremarkable key name, at a
@@ -734,6 +775,364 @@ def test_an_unwalkable_annotation_is_refused_rather_than_silently_skipped(
     assert "declared:Root.peer" in capsys.readouterr().err
 
 
+# A class whose fields the walk cannot reach, in each of the three shapes a
+# repository actually writes one. None is a `BaseModel` subclass, none has a
+# `get_origin`, and none is a bare container -- so each reaches the very last
+# branch of `_may_hold_model`, which is where a blanket "no" would let a
+# marked field leave the graph with no refusal at all.
+STRUCTURED_LEAF = {
+    "pydantic_dataclass": """
+        from pydantic import Field
+        from pydantic.dataclasses import dataclass
+
+
+        @dataclass
+        class Peer:
+            handshake: str = Field(default="", json_schema_extra={"secret": True})
+    """,
+    "typed_dict": """
+        from typing import Annotated, TypedDict
+
+        from pydantic import Field
+
+
+        class Peer(TypedDict):
+            handshake: Annotated[str, Field(json_schema_extra={"secret": True})]
+    """,
+    "named_tuple": """
+        from typing import NamedTuple
+
+
+        class Peer(NamedTuple):
+            handshake: str = ""
+    """,
+}
+# A plain annotated class is deliberately absent: pydantic refuses to build a
+# model with such a field at all (`PydanticSchemaGenerationError`), so the walk
+# never sees it. It still fails closed -- with pydantic's message rather than
+# this tool's -- which is why the rule in `_declares_fields_anywhere` is stated
+# as a property rather than as this list.
+
+
+@pytest.mark.parametrize("shape", sorted(STRUCTURED_LEAF))
+def test_a_class_whose_fields_cannot_be_walked_is_refused(
+    shape, repo, monkeypatch, capsys
+):
+    """The last branch of the walkability question must not answer "no".
+
+    None of these is a `BaseModel`, a parameterised generic or a bare
+    container, so each falls through every earlier branch to the final one.
+    Answering "no" there emits an *empty* model and the field vanishes from
+    the graph silently -- the whole category, not one annotation -- which is
+    R1 inverted: an unanswerable question answered "no".
+    """
+    write(
+        repo,
+        "peers.py",
+        textwrap.dedent(STRUCTURED_LEAF[shape]),
+    )
+    write(
+        repo,
+        "declared.py",
+        """
+        from pydantic import BaseModel
+
+        from peers import Peer
+
+
+        class Root(BaseModel):
+            peer: Peer
+        """,
+    )
+    declare(repo)
+    git(repo, "add", "-A")
+    assert sync(repo, monkeypatch) == 2
+    assert not (repo / ARTIFACT_PATH).exists()
+    assert "declared:Root.peer" in capsys.readouterr().err
+
+
+def test_a_scalar_class_is_still_a_leaf(repo, monkeypatch, capsys):
+    """The other side of the same rule, and the reason it is about *public*
+    annotations rather than any annotations at all.
+
+    `Enum`, `Decimal`, `UUID` and `datetime` declare nothing; pydantic's own
+    scalar wrappers declare only underscore-prefixed private attributes, which
+    pydantic itself does not collect as fields. Refusing these would make the
+    rule unusable, and the remedy for them ("narrow the annotation") does not
+    even exist.
+    """
+    write(
+        repo,
+        "declared.py",
+        """
+        import datetime
+        import decimal
+        import enum
+        import uuid
+
+        from pydantic import AnyUrl, BaseModel, SecretStr
+
+
+        class Mode(enum.Enum):
+            FAST = "fast"
+
+
+        class Root(BaseModel):
+            mode: Mode = Mode.FAST
+            amount: decimal.Decimal = decimal.Decimal(0)
+            ident: uuid.UUID = uuid.UUID(int=0)
+            when: datetime.datetime = datetime.datetime(2000, 1, 1)
+            endpoint: AnyUrl = AnyUrl("https://example.invalid")
+            hidden: SecretStr = SecretStr("")
+        """,
+    )
+    declare(repo)
+    git(repo, "add", "-A")
+    written = sync_and_commit(repo, monkeypatch, capsys)
+    assert written["models"]["declared:Root"] == {}
+
+
+def test_an_out_of_repo_base_declaring_no_fields_needs_no_lockfile(
+    repo, monkeypatch, capsys
+):
+    """The shortcut the MRO fix must not take.
+
+    Recording *every* base except `object` and `BaseModel` would make
+    `class Config(BaseModel, ABC)` record `abc` as an out-of-repo contributor
+    and turn a tracked lockfile into a universal precondition -- the exact
+    cost the `BaseModel` exclusion exists to avoid. `ABC` declares no fields,
+    so it contributes nothing and is not recorded. No lockfile exists in this
+    repository, so generation would refuse if it were.
+    """
+    write(
+        repo,
+        "declared.py",
+        """
+        from abc import ABC
+
+        from pydantic import BaseModel, Field
+
+
+        class Root(BaseModel, ABC):
+            binding: str = Field(default="", json_schema_extra={"secret": True})
+        """,
+    )
+    declare(repo)
+    git(repo, "add", "-A")
+    written = sync_and_commit(repo, monkeypatch, capsys)
+    assert set(written["sources"]) == {"declared.py", ".stackward.toml"}
+
+
+# The same two colliding fields in both declaration orders. `plain` is an
+# unmarked scalar, which emits no entry of its own; `token` is marked and
+# aliased onto that same data key.
+KEY_COLLISION = {
+    "unmarked_field_first": """
+        from pydantic import BaseModel, Field
+
+
+        class Root(BaseModel):
+            plain: str = ""
+            token: str = Field(
+                default="", alias="plain", json_schema_extra={"secret": True}
+            )
+    """,
+    "aliased_field_first": """
+        from pydantic import BaseModel, Field
+
+
+        class Root(BaseModel):
+            token: str = Field(
+                default="", alias="plain", json_schema_extra={"secret": True}
+            )
+            plain: str = ""
+    """,
+}
+
+
+@pytest.mark.parametrize("order", sorted(KEY_COLLISION))
+def test_a_data_key_claimed_by_two_fields_is_refused_in_either_order(
+    order, repo, monkeypatch, capsys
+):
+    """The refusal must not depend on declaration order.
+
+    An unmarked scalar emits no entry, so a check keyed on *emitted* entries
+    never saw it claim its key: with the unmarked field first, the marked one
+    took that key silently, while the same two fields written the other way
+    round did refuse. Both orders are asserted, because either alone passes
+    against the order-dependent version.
+    """
+    write(repo, "declared.py", textwrap.dedent(KEY_COLLISION[order]))
+    declare(repo)
+    git(repo, "add", "-A")
+    assert sync(repo, monkeypatch) == 2
+    assert "claimed by more than one field" in capsys.readouterr().err
+
+
+def test_a_mark_inherited_from_a_plain_mixin_records_the_mixins_file(
+    repo, monkeypatch, capsys
+):
+    """pydantic collects a marked field from a base that is not itself a
+    `BaseModel`, so a source filter keyed on `issubclass(base, BaseModel)`
+    takes the mark and discards the file it came from. The mixin is tracked
+    and already contributing when the artifact is written, so this is not the
+    "newly added file" boundary -- the MRO walk sees it and must record it.
+    """
+    write(
+        repo,
+        "mixin_mod.py",
+        """
+        from pydantic import Field
+
+
+        class Marks:
+            binding: str = Field(default="", json_schema_extra={"secret": True})
+        """,
+    )
+    write(
+        repo,
+        "declared.py",
+        """
+        from pydantic import BaseModel
+
+        from mixin_mod import Marks
+
+
+        class Root(Marks, BaseModel):
+            plain: str = ""
+        """,
+    )
+    declare(repo)
+    git(repo, "add", "-A")
+    written = sync_and_commit(repo, monkeypatch, capsys)
+    assert written["models"]["declared:Root"]["binding"] == {"secret": True}
+    assert "mixin_mod.py" in written["sources"]
+
+
+def test_editing_a_plain_mixin_makes_the_artifact_stale(repo, monkeypatch, capsys):
+    """The consequence of the test above, and the thing that actually fails
+    open without it: a mark changing in the mixin with no refusal."""
+    write(
+        repo,
+        "mixin_mod.py",
+        """
+        from pydantic import Field
+
+
+        class Marks:
+            binding: str = Field(default="", json_schema_extra={"secret": True})
+        """,
+    )
+    write(
+        repo,
+        "declared.py",
+        """
+        from pydantic import BaseModel
+
+        from mixin_mod import Marks
+
+
+        class Root(Marks, BaseModel):
+            plain: str = ""
+        """,
+    )
+    declare(repo)
+    git(repo, "add", "-A")
+    sync_and_commit(repo, monkeypatch, capsys)
+    write(
+        repo,
+        "mixin_mod.py",
+        """
+        from pydantic import Field
+
+
+        class Marks:
+            binding: str = Field(default="", json_schema_extra={"secret": True})
+            added_later: str = Field(default="", json_schema_extra={"secret": True})
+        """,
+    )
+    write(repo, "Pulumi.dev.yaml", "config:\n  app:app:\n    added_later: leaked\n")
+    git(repo, "add", "-A")
+
+    assert check(repo, monkeypatch) == 2
+    assert "mixin_mod.py has changed" in capsys.readouterr().err
+
+
+def test_the_repository_config_is_a_recorded_source(repo, monkeypatch, capsys):
+    """`.stackward.toml` supplies `roots` and `declared_paths_fn`, so it
+    decides part of the artifact's content as surely as any model file does.
+    Leaving it out means a declaration can be added to it and never checked.
+    """
+    write(repo, "declared.py", RECURSIVE_MODEL)
+    declare(repo)
+    git(repo, "add", "-A")
+    written = sync_and_commit(repo, monkeypatch, capsys)
+    assert ".stackward.toml" in written["sources"]
+
+
+def test_adding_a_namespace_to_the_config_makes_the_artifact_stale(
+    repo, monkeypatch, capsys
+):
+    """The fail-open the recorded config file closes: a second namespace
+    declared in `.stackward.toml` and staged, with the artifact untouched, so
+    the namespace is simply skipped and its credential is never looked at."""
+    write(repo, "declared.py", TWO_MODELS)
+    declare(repo)
+    git(repo, "add", "-A")
+    sync_and_commit(repo, monkeypatch, capsys)
+
+    write(
+        repo,
+        ".stackward.toml",
+        f"""
+        python = "{sys.executable}"
+
+        [check]
+        model_net = "artifact"
+        stack_models = {{ "app:app" = "declared:Root", "app:other" = "declared:Other" }}
+        """,
+    )
+    write(repo, "Pulumi.dev.yaml", "config:\n  app:other:\n    binding: leaked\n")
+    git(repo, "add", "-A")
+
+    assert check(repo, monkeypatch) == 2
+    captured = capsys.readouterr()
+    assert "sync-declared-secrets" in captured.err
+    # Nothing reported: before the fix this exited 0, having silently skipped
+    # the namespace the policy declared and the artifact did not cover.
+    assert captured.out == ""
+
+
+def test_a_root_the_config_declares_and_the_artifact_lacks_is_refused(
+    repo, monkeypatch, capsys
+):
+    """The second, independent guard on the same class of drift, needing no
+    blob id: the namespaces the artifact starts from must be exactly the ones
+    the policy declares. Key sets only -- a model id is `module:QualName` and
+    diverges from the config's `module:Class` target for a nested class."""
+    net, _sources = parse_net(
+        {
+            "version": ARTIFACT_VERSION,
+            "models": {"declared:Root": {"token": {"secret": True}}},
+            "roots": {"app:app": "declared:Root"},
+            "sources": {"declared.py": "0" * 40},
+        }
+    )
+    monkeypatch.setattr(model_module, "repo_toplevel", lambda: repo)
+    monkeypatch.setattr(model_module, "read_artifact_from_index", lambda _root: {})
+    monkeypatch.setattr(model_module, "parse_net", lambda _payload: (net, {}))
+    monkeypatch.setattr(model_module, "verify_sources", lambda _root, _sources: None)
+
+    with pytest.raises(ModelNetError) as excinfo:
+        model_module.load_model_net(
+            CheckConfig(
+                model_net="artifact",
+                stack_models={"app:app": "declared:Root", "app:other": "declared:Other"},
+            )
+        )
+    assert "app:other" in str(excinfo.value)
+
+
 def test_a_root_model_is_refused_rather_than_covering_nothing(
     repo, monkeypatch, capsys
 ):
@@ -813,7 +1212,10 @@ def test_a_refusal_names_the_field_the_class_the_annotation_and_the_way_out(
     error = capsys.readouterr().err
     assert "settings" in error                    # the field
     assert "declared:Root" in error               # the class
-    assert "Any" in error                         # the annotation
+    # The annotation *as written*. Asserting only that "Any" appears would
+    # pass against a message that reported the inner type alone and sent the
+    # reader looking for a line saying `Any`, which their source does not have.
+    assert "dict[str, " in error and "Any]" in error
     assert "narrow the annotation" in error       # remedy 1
     assert "json_schema_extra" in error           # remedy 2
     assert "declared_paths_fn" in error           # remedy 3
@@ -889,9 +1291,16 @@ def test_a_graph_the_matcher_could_not_read_is_refused_before_it_is_written(
                 "files": [str(repo / "declared.py")],
                 "external": [],
             },
+            repo / ".stackward.toml",
         )
     assert "not readable" in str(excinfo.value)
     assert "undefined model" in str(excinfo.value)
+
+
+def CONFIG(repo: Path) -> Path:
+    """`.stackward.toml`, which `build_artifact` records as a source like any
+    other -- see `test_the_repository_config_is_a_recorded_source`."""
+    return repo / ".stackward.toml"
 
 
 def external_result(repo: Path) -> dict:
@@ -911,9 +1320,10 @@ def test_an_out_of_repo_contributor_is_pinned_by_the_dependency_lockfile(repo):
     the index holds."""
     write(repo, "declared.py", RECURSIVE_MODEL)
     write(repo, "uv.lock", "# a lockfile\n")
+    declare(repo)
     git(repo, "add", "-A")
 
-    sources = build_artifact(repo, external_result(repo))["sources"]
+    sources = build_artifact(repo, external_result(repo), CONFIG(repo))["sources"]
     assert "uv.lock" in sources
     # Recorded by blob id, exactly like every other source.
     expected = git(repo, "rev-parse", ":uv.lock").stdout.strip()
@@ -926,9 +1336,10 @@ def test_every_tracked_lockfile_is_recorded_not_only_the_first(repo):
     write(repo, "declared.py", RECURSIVE_MODEL)
     write(repo, "uv.lock", "# a lockfile\n")
     write(repo, "requirements.txt", "somepackage==1.0\n")
+    declare(repo)
     git(repo, "add", "-A")
 
-    sources = build_artifact(repo, external_result(repo))["sources"]
+    sources = build_artifact(repo, external_result(repo), CONFIG(repo))["sources"]
     assert "uv.lock" in sources
     assert "requirements.txt" in sources
 
@@ -939,10 +1350,11 @@ def test_an_untracked_lockfile_does_not_pin_an_out_of_repo_contributor(repo):
     did."""
     write(repo, "declared.py", RECURSIVE_MODEL)
     write(repo, "uv.lock", "# a lockfile\n")
-    git(repo, "add", "declared.py")  # the lockfile is deliberately left out
+    declare(repo)
+    git(repo, "add", "declared.py", ".stackward.toml")  # lockfile left out
 
     with pytest.raises(SyncError) as excinfo:
-        build_artifact(repo, external_result(repo))
+        build_artifact(repo, external_result(repo), CONFIG(repo))
     assert "outside.package.conventions" in str(excinfo.value)
 
 
@@ -950,10 +1362,11 @@ def test_an_out_of_repo_contributor_with_no_lockfile_is_refused(repo):
     """There would be nothing at all pinning that module's identity, so the
     artifact could never be found stale on account of it."""
     write(repo, "declared.py", RECURSIVE_MODEL)
+    declare(repo)
     git(repo, "add", "-A")
 
     with pytest.raises(SyncError) as excinfo:
-        build_artifact(repo, external_result(repo))
+        build_artifact(repo, external_result(repo), CONFIG(repo))
     message = str(excinfo.value)
     assert "outside.package.conventions" in message
     assert "uv.lock" in message  # the message names what it looked for
@@ -964,13 +1377,15 @@ def test_no_lockfile_is_recorded_when_nothing_came_from_outside_the_repo(repo):
     marks are all its own has no dependency to pin."""
     write(repo, "declared.py", RECURSIVE_MODEL)
     write(repo, "uv.lock", "# a lockfile\n")
+    declare(repo)
     git(repo, "add", "-A")
 
     sources = build_artifact(
         repo,
         {"roots": {}, "models": {}, "files": [str(repo / "declared.py")], "external": []},
+        CONFIG(repo),
     )["sources"]
-    assert sources == {"declared.py": sources["declared.py"]}
+    assert set(sources) == {"declared.py", ".stackward.toml"}
 
 
 def test_an_untracked_contributing_file_is_refused(repo, monkeypatch, capsys):
@@ -1447,6 +1862,24 @@ def test_stackward_never_imports_pydantic():
         check=True,
     )
     assert proc.stdout.strip() == "False"
+
+
+@pytest.mark.parametrize(
+    "entry_point",
+    [check_config_module.scan_file, pre_commit_module._scan_staged_config],
+)
+def test_neither_scan_entry_point_makes_the_model_net_optional(entry_point):
+    """`net` must have no default on either scanner.
+
+    A default would make the model net silently opt-in: a future caller that
+    simply forgot the argument would scan with the heuristic net alone and
+    report clean, which is the failure this whole net exists to prevent. The
+    property is a signature, so it is asserted as one -- there is no
+    behaviour to observe, because the whole point is what happens to a call
+    site that does not yet exist.
+    """
+    parameter = inspect.signature(entry_point).parameters["net"]
+    assert parameter.default is inspect.Parameter.empty
 
 
 def test_the_gate_path_reaches_no_credential_code():
