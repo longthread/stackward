@@ -31,7 +31,7 @@ import pytest
 
 from stackward.bootstrap import generator_source
 from stackward.cli import main
-from stackward.commands.sync_declared import serialise
+from stackward.commands.sync_declared import SyncError, build_artifact, serialise
 from stackward.config import CheckConfig
 from stackward.nets.heuristic import DocumentError
 from stackward.nets.model import (
@@ -81,7 +81,10 @@ SELF_REFERENTIAL = build_net(
             "token": {"secret": True},
             "plain": {},
             "children": {
-                "child": {"kind": "list", "item": {"kind": "model", "model": "declared:Node"}}
+                "child": {
+                    "kind": "list",
+                    "item": {"kind": "model", "model": "declared:Node"},
+                }
             },
         }
     },
@@ -346,12 +349,13 @@ def test_an_artifact_with_no_sources_is_refused():
 
 
 def test_a_parsed_graph_keeps_the_child_node_shapes():
+    SELF = {"kind": "model", "model": "declared:Root"}
     net = build_net(
         models={
             "declared:Root": {
-                "a": {"child": {"kind": "model", "model": "declared:Root"}},
-                "b": {"child": {"kind": "list", "item": {"kind": "model", "model": "declared:Root"}}},
-                "c": {"child": {"kind": "dict", "value": {"kind": "model", "model": "declared:Root"}}},
+                "a": {"child": SELF},
+                "b": {"child": {"kind": "list", "item": SELF}},
+                "c": {"child": {"kind": "dict", "value": SELF}},
             }
         },
         roots={},
@@ -545,7 +549,17 @@ def test_a_base_class_in_another_module_is_recorded_as_a_source(
             handed_down: str = Field(default="", json_schema_extra={"secret": True})
         """,
     )
-    write(repo, "declared.py", "from ancestry import Ancestor\n\n\nclass Root(Ancestor):\n    own: str = ''\n")
+    write(
+        repo,
+        "declared.py",
+        """
+        from ancestry import Ancestor
+
+
+        class Root(Ancestor):
+            own: str = ""
+        """,
+    )
     declare(repo)
     git(repo, "add", "-A")
     written = sync_and_commit(repo, monkeypatch, capsys)
@@ -765,6 +779,31 @@ def test_an_annotation_that_cannot_hold_a_model_is_a_leaf(repo, monkeypatch, cap
     git(repo, "add", "-A")
     written = sync_and_commit(repo, monkeypatch, capsys)
     assert written["models"]["declared:Root"] == {}
+
+
+def test_a_graph_the_matcher_could_not_read_is_refused_before_it_is_written(
+    repo, monkeypatch, capsys
+):
+    """The generator and the matcher are two halves of one schema running in
+    two processes. Reading the artifact back through the matcher's own parser
+    before writing it turns a drift between them into a failure where it was
+    introduced, rather than a refusal in someone else's repository later."""
+    write(repo, "declared.py", RECURSIVE_MODEL)
+    declare(repo)
+    git(repo, "add", "-A")
+    monkeypatch.chdir(repo)
+    with pytest.raises(SyncError) as excinfo:
+        build_artifact(
+            repo,
+            {
+                "roots": {"app:app": "declared:NeverDefined"},
+                "models": {},
+                "files": [str(repo / "declared.py")],
+                "external": [],
+            },
+        )
+    assert "not readable" in str(excinfo.value)
+    assert "undefined model" in str(excinfo.value)
 
 
 def test_an_untracked_contributing_file_is_refused(repo, monkeypatch, capsys):
@@ -1122,6 +1161,29 @@ def test_stackward_never_imports_pydantic():
         check=True,
     )
     assert proc.stdout.strip() == "False"
+
+
+def test_the_gate_path_reaches_no_credential_code():
+    """`check-config` and `pre-commit` must never reach the credential store
+    or `cryptography`, so a commit cannot be blocked by an expired session or
+    a missing native extension. This net added an import to the gate path, so
+    the property is worth asserting rather than assuming — checked in a
+    subprocess, since this test process has imported half the tool already.
+    """
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; import stackward.commands.check_config; "
+            "import stackward.commands.pre_commit; "
+            "print(sorted(m for m in ('cryptography', 'stackward.store') "
+            "if m in sys.modules))",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert proc.stdout.strip() == "[]"
 
 
 def test_the_generator_is_read_through_the_accessor_the_shipped_code_uses():

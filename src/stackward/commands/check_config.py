@@ -37,7 +37,12 @@ import yaml
 
 from ..config import CheckConfig, ConfigError, find_repo_config, load_config
 from ..nets.heuristic import DocumentError, find_plaintext_credentials
-from ..nets.model import ModelNet, ModelNetError, find_declared_credentials, load_model_net
+from ..nets.model import (
+    ModelNet,
+    ModelNetError,
+    find_declared_credentials,
+    load_model_net,
+)
 
 # Matches a repr-quoted fragment the way PyYAML's `%r` interpolation
 # produces one — e.g. `'2'`, `` '`' ``, `'id001'`. Python's `repr()` flips

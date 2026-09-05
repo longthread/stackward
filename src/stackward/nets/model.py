@@ -530,7 +530,12 @@ def repo_toplevel() -> Path:
         raise ModelNetError(f"repository path is not valid UTF-8: {exc}") from exc
     if not text:
         raise ModelNetError("git did not report a repository root")
-    return Path(text)
+    # Resolved, because callers compare it against `Path(...).resolve()` of a
+    # source file to decide whether that file is inside the repository. On a
+    # platform where the repository sits under a symlinked directory, git's
+    # own answer and a resolved module path are two different strings for one
+    # directory, and the comparison would fail for every file.
+    return Path(text).resolve()
 
 
 def index_blob_ids(root: Path, paths: list[str]) -> dict[str, str]:

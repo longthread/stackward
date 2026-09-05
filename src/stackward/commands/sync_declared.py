@@ -49,6 +49,7 @@ from ..nets.model import (
     ARTIFACT_VERSION,
     ModelNetError,
     index_blob_ids,
+    parse_net,
     repo_toplevel,
 )
 from ..store import atomic_write
@@ -252,12 +253,23 @@ def build_artifact(root: Path, result: dict[str, object]) -> dict[str, object]:
             "recorded to check for staleness"
         )
 
-    return {
+    artifact = {
         "version": ARTIFACT_VERSION,
         "roots": result.get("roots", {}),
         "models": result.get("models", {}),
         "sources": sources,
     }
+    # Read it back with the matcher's own parser before writing it. The
+    # generator and the matcher are the two halves of one schema, and they run
+    # in different processes under different interpreters — so nothing else
+    # would notice them drifting apart until the next commit, in someone
+    # else's repository, as a refusal they did not cause. Checking here turns
+    # that into a failure at the moment it is introduced.
+    try:
+        parse_net(artifact)
+    except ModelNetError as exc:
+        raise SyncError(f"the generated artifact is not readable: {exc}") from exc
+    return artifact
 
 
 def serialise(artifact: dict[str, object]) -> bytes:
@@ -275,8 +287,8 @@ def sync(root: Path, config_path: Path, config: Config) -> Path:
     """Generate and write the artifact. Returns the path written."""
     if not config.check.stack_models:
         raise SyncError(
-            f"{config_path}: check.stack_models is empty; there is nothing to "
-            "walk. Declare a model, or set check.model_net = \"none\""
+            f"{config_path}: check.stack_models is empty; there is nothing "
+            'to walk. Declare a model, or set check.model_net = "none"'
         )
 
     result = run_generator(
