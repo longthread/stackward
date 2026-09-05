@@ -79,9 +79,12 @@ def cheap_kdf(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def no_real_pulumi_state(monkeypatch, tmp_path):
-    """Point `PULUMI_HOME` at an empty, per-test directory so no test in this
-    file can read or depend on this machine's real `~/.pulumi`."""
+    """Point `PULUMI_HOME` at an empty, per-test directory, and clear
+    `PULUMI_BACKEND_URL`, so no test in this file can read or depend on this
+    machine's real Pulumi state -- `_current_backend()` consults both, in
+    that order, once `PULUMI_BACKEND_URL` is set."""
     monkeypatch.setenv("PULUMI_HOME", str(tmp_path / "pulumi-home"))
+    monkeypatch.delenv(PULUMI_BACKEND_URL, raising=False)
 
 
 @pytest.fixture
@@ -462,11 +465,12 @@ def test_current_backend_prefers_an_exported_env_var_over_the_persisted_file(
 def test_current_backend_falls_back_to_the_file_when_the_env_var_is_absent(
     monkeypatch, tmp_path
 ):
+    # PULUMI_BACKEND_URL is already absent -- the autouse `no_real_pulumi_state`
+    # fixture clears it for every test in this file.
     home = tmp_path / "ph"
     home.mkdir()
     monkeypatch.setenv("PULUMI_HOME", str(home))
     (home / "credentials.json").write_text(json.dumps({"current": "file:///from-the-file"}))
-    monkeypatch.delenv(PULUMI_BACKEND_URL, raising=False)
     assert session._current_backend() == "file:///from-the-file"
 
 
@@ -564,7 +568,12 @@ def test_extra_names_beyond_the_three_required_are_accepted():
     session._require_credential_names(extra, "p")  # must not raise
 
 
-def test_child_env_overlays_exactly_four_names_on_a_copy_of_the_parent():
+def test_child_env_overlays_exactly_four_names_on_a_copy_of_the_parent(monkeypatch):
+    # Injected, not merely assumed absent: this is the exact non-interactive
+    # path (`STACKWARD_PASSWORD=x stackward exec -- ...`) the scrubbing
+    # protects, and a difference-based assertion that never puts the name in
+    # the parent to begin with cannot tell "scrubbed" from "was never there".
+    monkeypatch.setenv(ENV_STORE_PASSWORD, PASSWORD)
     parent_before = dict(os.environ)
     env = session._child_env(FULL_CREDENTIALS, "file:///backend")
 
@@ -578,13 +587,16 @@ def test_child_env_overlays_exactly_four_names_on_a_copy_of_the_parent():
         PULUMI_CONFIG_PASSPHRASE,
         PULUMI_BACKEND_URL,
     }
-    assert parent_keys - child_keys == set()  # nothing dropped
-    for key in parent_keys:
+    # The one name that must be *dropped*, not merely left alone.
+    assert parent_keys - child_keys == {ENV_STORE_PASSWORD}
+    assert ENV_STORE_PASSWORD not in env
+    for key in parent_keys - {ENV_STORE_PASSWORD}:
         assert env[key] == parent_before[key]  # nothing else changed
     assert env[AWS_ACCESS_KEY_ID] == MARKER_KEY
     assert env[AWS_SECRET_ACCESS_KEY] == MARKER_SECRET
     assert env[PULUMI_CONFIG_PASSPHRASE] == MARKER_PASSPHRASE
     assert env[PULUMI_BACKEND_URL] == "file:///backend"
+    assert PASSWORD not in env.values()
 
 
 # ---------------------------------------------------------------------------
