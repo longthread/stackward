@@ -113,7 +113,7 @@ def find_plaintext_credentials(document: Any, check: CheckConfig) -> list[str]:
         allowed_references=frozenset(check.allowed_references),
         findings=[],
     )
-    _walk(document, [], False, ctx)
+    _walk(document, [], False, frozenset({id(document)}), ctx)
     return sorted(ctx.findings)
 
 
@@ -137,6 +137,7 @@ def _walk(
     node: Any,
     path: list[str | int],
     ancestor_sensitive: bool,
+    visiting: frozenset[int],
     ctx: _ScanContext,
 ) -> None:
     """Recurse through `node`, appending a rendered path to `ctx.findings`
@@ -149,6 +150,19 @@ def _walk(
     checked separately in `_check_leaf`. It only ever turns true going
     down and is never cleared, so a sensitive key's entire subtree stays
     sensitive to the bottom.
+
+    `visiting` holds `id()` of every container currently open on *this*
+    descent path — the call stack, not a global "already scanned" set. A
+    YAML anchor/alias pair (`credential: &x\\n  b: *x\\n`) makes a dict or
+    list contain itself: `safe_load` permits it, and revisiting it would
+    recurse forever, each cycle producing a longer, distinct rendered path
+    (a depth cap would only delay the crash, not avoid it, and would also
+    have to pick an arbitrary limit). A container whose `id()` is already
+    in `visiting` is such a cycle and is skipped rather than walked. This
+    must be scoped to the current path, not "every id ever seen": two
+    *different*, non-cyclic branches legitimately sharing one object via
+    two YAML anchors (no alias pointing back at an ancestor) must each
+    still be walked at their own path.
     """
     if isinstance(node, dict):
         for raw_key, value in node.items():
@@ -159,17 +173,27 @@ def _walk(
             key = raw_key if isinstance(raw_key, str) else str(raw_key)
             child_path = [*path, key]
             if isinstance(value, (dict, list)):
+                if id(value) in visiting:
+                    continue
                 key_is_sensitive = _matches_sensitive_key(
                     key, ctx.check.sensitive_keys
                 ) or key in ctx.check.sensitive_parents
-                _walk(value, child_path, ancestor_sensitive or key_is_sensitive, ctx)
+                _walk(
+                    value,
+                    child_path,
+                    ancestor_sensitive or key_is_sensitive,
+                    visiting | {id(value)},
+                    ctx,
+                )
             else:
                 _check_leaf(node, key, value, child_path, ancestor_sensitive, ctx)
     elif isinstance(node, list):
         for index, value in enumerate(node):
             child_path = [*path, index]
             if isinstance(value, (dict, list)):
-                _walk(value, child_path, ancestor_sensitive, ctx)
+                if id(value) in visiting:
+                    continue
+                _walk(value, child_path, ancestor_sensitive, visiting | {id(value)}, ctx)
             else:
                 _check_leaf(None, None, value, child_path, ancestor_sensitive, ctx)
 

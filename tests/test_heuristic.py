@@ -127,6 +127,54 @@ def test_propagation_does_not_leak_to_a_sibling_non_sensitive_mapping():
     assert find_plaintext_credentials(document, CheckConfig()) == ["credential.a"]
 
 
+def test_propagation_does_not_leak_to_a_sibling_non_sensitive_mapping_reversed_order():
+    """Same document as above with insertion order reversed. `_walk`
+    computes each key's contribution fresh from the `ancestor_sensitive`
+    value it was called with, never by mutating a variable shared across
+    loop iterations — so this must pass regardless of which sibling a dict
+    happens to iterate first. A bug that leaked sensitivity across sibling
+    branches via shared mutable state, instead of a fresh value per
+    branch, could otherwise hide behind dict ordering."""
+    document = {
+        "unrelated": {"b": "not-flagged-by-this-policy"},
+        "credential": {"a": "leaked-plaintext"},
+    }
+    assert find_plaintext_credentials(document, CheckConfig()) == ["credential.a"]
+
+
+def test_self_referential_mapping_terminates_instead_of_recursing_forever():
+    """A YAML anchor/alias pair like `credential: &x\\n  b: *x\\n` produces
+    a dict that contains itself. Without a cycle guard, `_walk` recurses
+    forever — each cycle produces a longer, distinct rendered path, so a
+    depth cap would only delay the crash, not avoid it."""
+    cyclic: dict = {"b": None}
+    cyclic["b"] = cyclic
+    document = {"credential": cyclic}
+    assert find_plaintext_credentials(document, CheckConfig()) == []
+
+
+def test_self_referential_sequence_terminates_instead_of_recursing_forever():
+    """The same cycle, one level further down inside a list rather than a
+    dict."""
+    cyclic: list = ["placeholder"]
+    cyclic[0] = cyclic
+    document = {"credential": cyclic}
+    assert find_plaintext_credentials(document, CheckConfig()) == []
+
+
+def test_shared_non_cyclic_object_is_scanned_at_each_occurrence():
+    """Two YAML anchors pointing at the same (non-cyclic) mapping from two
+    unrelated branches is not a cycle — the cycle guard is scoped to the
+    current descent path, not "every id ever seen", so both occurrences
+    must still be scanned at their own distinct path."""
+    shared = {"password": "leaked-plaintext"}
+    document = {"copy1": shared, "copy2": shared}
+    assert find_plaintext_credentials(document, CheckConfig()) == [
+        "copy1.password",
+        "copy2.password",
+    ]
+
+
 def test_none_and_empty_string_pass():
     document = {"password": None, "token": ""}
     assert find_plaintext_credentials(document, CheckConfig()) == []
@@ -213,6 +261,23 @@ def test_scan_file_raises_check_error_on_invalid_yaml(tmp_path):
         scan_file(path, CheckConfig())
 
 
+def test_invalid_yaml_error_never_prints_a_credential_shaped_value(tmp_path):
+    """`MarkedYAMLError.__str__` includes a source-line snippet via PyYAML's
+    `Mark.get_snippet()` — an unescaped colon in a value (entirely
+    plausible for a real password) produces a parse error whose default
+    message would otherwise embed that value verbatim. This is the one
+    file in the whole system expected to contain a credential, so the
+    reported message must never include it."""
+    path = write_yaml(
+        tmp_path,
+        "Pulumi.leak.yaml",
+        "config:\n  myproject:dbPassword: hunter2: not-valid-yaml\n",
+    )
+    with pytest.raises(CheckError) as exc_info:
+        scan_file(path, CheckConfig())
+    assert "hunter2" not in str(exc_info.value)
+
+
 def test_scan_file_raises_check_error_on_non_mapping_document(tmp_path):
     path = write_yaml(tmp_path, "Pulumi.dev.yaml", "- a\n- b\n")
     with pytest.raises(CheckError):
@@ -273,3 +338,45 @@ def test_check_config_exits_2_with_no_files_given():
     with pytest.raises(SystemExit) as exit_info:
         main(["check-config"])
     assert exit_info.value.code == 2
+
+
+def test_check_config_exits_2_on_non_utf8_file(tmp_path, capsys):
+    """`Path.read_text()` raises `UnicodeDecodeError` for a file that is
+    not valid UTF-8 — not an `OSError`, and previously uncaught, which
+    would exit 1 (Python's default for an uncaught exception): the code
+    reserved exclusively for "a credential was found". A file this command
+    never finished reading is a could-not-run failure, not a finding."""
+    path = tmp_path / "Pulumi.dev.yaml"
+    path.write_bytes(b"password: \xff\xfe not valid utf8\n")
+    assert main(["check-config", str(path)]) == 2
+    assert capsys.readouterr().out == ""
+
+
+def test_check_config_exits_2_on_unanticipated_scan_error(tmp_path, monkeypatch, capsys):
+    """Any exception a per-file scan raises other than `CheckError` must
+    still map to exit 2, not propagate and exit 1 (Python's default for an
+    uncaught exception) — regardless of what raised it. Simulated here
+    with a directly-injected failure rather than relying on a specific
+    trigger, so this test does not duplicate the self-referential-YAML or
+    non-UTF8 regressions covered elsewhere."""
+    path = write_yaml(tmp_path, "Pulumi.dev.yaml", "name: myproject\n")
+
+    def boom(_path, _check):
+        raise RuntimeError("unanticipated failure, not a CheckError")
+
+    monkeypatch.setattr("stackward.commands.check_config.scan_file", boom)
+    assert main(["check-config", str(path)]) == 2
+    assert capsys.readouterr().out == ""
+
+
+def test_check_config_prints_a_real_finding_even_when_another_file_errors(
+    tmp_path, capsys
+):
+    """A parse error on one file must never hide a genuine finding on
+    another: the exit code (2, since a check-could-not-run error always
+    wins) carries the could-not-run signal, but the finding still prints."""
+    good = write_yaml(tmp_path, "good.yaml", 'password: "hunter2"\n')
+    broken = write_yaml(tmp_path, "broken.yaml", "key: [unclosed\n")
+    assert main(["check-config", str(good), str(broken)]) == 2
+    out = capsys.readouterr().out
+    assert out == f"{good}: plaintext credential at 'password'\n"
