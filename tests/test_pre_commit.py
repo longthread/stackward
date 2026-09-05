@@ -897,9 +897,16 @@ def test_git_runs_under_a_fixed_locale(repo, monkeypatch):
     hardening rather than a live fix here -- but git's diagnostics are
     gettext-marked, and a message quoted verbatim into a `CheckError` should
     read the same in a bug report as it did on the machine that hit it.
-    (`commands.install_hooks._is_tracked` *does* branch on translated text,
-    and is a live bug under a non-English locale; it is not this wave's
-    file.)
+
+    Scope, so this does not become a trap for whoever changes the fixture
+    next: the loop covers every git invocation the command makes, and it
+    holds only because `repo` declares `model_net = "none"`. Under
+    `model_net = "artifact"`, `nets.model.run_git` also runs, and it sets no
+    locale -- a second call site with the same gap, in a file this wave does
+    not own. `commands.install_hooks._is_tracked` is a third, and there it
+    is a live bug rather than hardening: it branches on git's *translated*
+    strings, so under a non-English locale it raises and `hooks install`
+    exits 2 in every repository.
 
     The merge half matters more than the override: git sets `GIT_INDEX_FILE`
     and `GIT_DIR` for a hook process, and passing a bare `env={"LC_ALL":
