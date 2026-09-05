@@ -39,8 +39,8 @@ from stackward.commands.set_secrets import (
     ProjectManifest,
     SetSecretsError,
     _config_path_for_name,
-    _normalize_required,
     _parse_drift_pairs,
+    _parse_required,
     _publish_entries,
     parse_env_file,
     parse_project_manifest,
@@ -256,32 +256,46 @@ def test_substitute_stack_raises_when_no_stack_was_given():
 
 
 # ---------------------------------------------------------------------------
-# `_normalize_required`
+# `_parse_required` -- the one canonical `[required]` shape
 # ---------------------------------------------------------------------------
 
 
-def test_normalize_required_accepts_a_list_of_paths():
-    assert _normalize_required(["a.b", "c.d"], "x") == frozenset({"a.b", "c.d"})
+def test_parse_required_accepts_the_canonical_paths_table():
+    assert _parse_required({"paths": ["a.b", "c.d"]}, "x") == frozenset({"a.b", "c.d"})
 
 
-def test_normalize_required_accepts_a_table_of_paths():
-    assert _normalize_required({"a.b": True, "c.d": "anything"}, "x") == frozenset(
-        {"a.b", "c.d"}
-    )
+def test_parse_required_absent_is_empty():
+    assert _parse_required(None, "x") == frozenset()
 
 
-def test_normalize_required_absent_is_empty():
-    assert _normalize_required(None, "x") == frozenset()
+def test_parse_required_rejects_a_bare_list():
+    """The shape this module used to also accept (`required = [...]`) is now
+    a hard error, not a silently-tolerated alternate spelling."""
+    with pytest.raises(SetSecretsError, match="x"):
+        _parse_required(["a.b", "c.d"], "x")
 
 
-def test_normalize_required_rejects_a_list_of_non_strings():
+def test_parse_required_rejects_a_table_whose_own_keys_are_the_paths():
+    """The other shape this module used to also accept
+    (`[secrets."<dir>".required]` with the paths as the table's own keys) is
+    now a hard error too -- 'paths' is the only recognised key."""
+    with pytest.raises(SetSecretsError, match="a.b"):
+        _parse_required({"a.b": True, "c.d": "anything"}, "x")
+
+
+def test_parse_required_rejects_an_unknown_key_alongside_paths():
+    with pytest.raises(SetSecretsError, match="extra"):
+        _parse_required({"paths": ["a.b"], "extra": "oops"}, "x")
+
+
+def test_parse_required_rejects_a_paths_list_of_non_strings():
     with pytest.raises(SetSecretsError):
-        _normalize_required([1, 2], "x")
+        _parse_required({"paths": [1, 2]}, "x")
 
 
-def test_normalize_required_rejects_other_shapes():
+def test_parse_required_rejects_a_non_table():
     with pytest.raises(SetSecretsError):
-        _normalize_required("a.b", "x")
+        _parse_required("a.b", "x")
 
 
 # ---------------------------------------------------------------------------
@@ -317,11 +331,18 @@ def test_parse_project_manifest_builds_the_secret_table():
     raw = {"secret": {"db.password": "DB_PASSWORD"}}
     manifest = parse_project_manifest(raw, ".")
     assert manifest.secret == {"db.password": "DB_PASSWORD"}
+    assert manifest.plaintext == {}
     assert manifest.required == frozenset()
     assert manifest.drift_pairs == ()
 
 
-def test_parse_project_manifest_rejects_a_malformed_config_path():
+def test_parse_project_manifest_builds_the_plaintext_table():
+    raw = {"plaintext": {"registry.user": "REGISTRY_USER"}}
+    manifest = parse_project_manifest(raw, ".")
+    assert manifest.plaintext == {"registry.user": "REGISTRY_USER"}
+
+
+def test_parse_project_manifest_rejects_a_malformed_config_path_in_secret():
     """`paths.parse` is the one grammar every config path in the manifest is
     validated with -- a key using invalid path syntax must fail here, at load
     time, rather than surfacing later as a `pulumi` invocation error."""
@@ -330,29 +351,53 @@ def test_parse_project_manifest_rejects_a_malformed_config_path():
         parse_project_manifest(raw, ".")
 
 
-def test_parse_project_manifest_does_not_validate_unmanaged_or_plaintext_keys():
+def test_parse_project_manifest_rejects_a_malformed_config_path_in_plaintext():
+    """`plaintext` is published too now, so its keys are validated exactly
+    like `secret`'s."""
+    raw = {"plaintext": {"a[": "SOME_NAME"}}
+    with pytest.raises(SetSecretsError):
+        parse_project_manifest(raw, ".")
+
+
+def test_parse_project_manifest_does_not_validate_unmanaged_keys():
     """`unmanaged` may legitimately hold a wildcard shape that is not a
     `--path` at all -- see the module docstring -- so it must never be run
-    through `paths.parse`."""
+    through `paths.parse`, unlike `secret` and `plaintext`."""
     raw = {
         "secret": {"db.password": "DB_PASSWORD"},
-        "plaintext": {"registry.user": "REGISTRY_USER"},
         "unmanaged": {"legacy.*": "reason, not a logical name"},
     }
     manifest = parse_project_manifest(raw, ".")
     assert manifest.secret == {"db.password": "DB_PASSWORD"}
 
 
-def test_parse_project_manifest_required_path_not_in_secret_raises():
-    raw = {"secret": {"db.password": "DB_PASSWORD"}, "required": ["nonexistent.path"]}
+def test_parse_project_manifest_required_path_not_in_secret_or_plaintext_raises():
+    raw = {
+        "secret": {"db.password": "DB_PASSWORD"},
+        "required": {"paths": ["nonexistent.path"]},
+    }
     with pytest.raises(SetSecretsError, match="nonexistent.path"):
         parse_project_manifest(raw, ".")
 
 
 def test_parse_project_manifest_required_path_in_secret_is_accepted():
-    raw = {"secret": {"db.password": "DB_PASSWORD"}, "required": ["db.password"]}
+    raw = {
+        "secret": {"db.password": "DB_PASSWORD"},
+        "required": {"paths": ["db.password"]},
+    }
     manifest = parse_project_manifest(raw, ".")
     assert manifest.required == frozenset({"db.password"})
+
+
+def test_parse_project_manifest_required_path_in_plaintext_is_accepted():
+    """`required` now ranges over both publishable tables, since both are
+    actually published."""
+    raw = {
+        "plaintext": {"registry.user": "REGISTRY_USER"},
+        "required": {"paths": ["registry.user"]},
+    }
+    manifest = parse_project_manifest(raw, ".")
+    assert manifest.required == frozenset({"registry.user"})
 
 
 def test_parse_project_manifest_secret_value_must_be_a_string():
@@ -554,8 +599,9 @@ def test_dry_run_reports_a_required_unresolved_path_as_a_failure(repo, monkeypat
     write_repo_config(
         repo,
         '[secrets."."]\n'
-        'secret = { "db.password" = "DB_PASSWORD" }\n'
-        'required = ["db.password"]\n',
+        'secret = { "db.password" = "DB_PASSWORD" }\n\n'
+        '[secrets.".".required]\n'
+        'paths = ["db.password"]\n',
     )
     monkeypatch.chdir(repo)
     monkeypatch.delenv("DB_PASSWORD", raising=False)
@@ -595,6 +641,87 @@ def test_value_reaches_the_subprocess_via_stdin_and_never_via_argv(
     captured = capfd.readouterr()
     assert MARKER_DB_PASSWORD not in captured.out
     assert MARKER_DB_PASSWORD not in captured.err
+
+
+def test_a_plaintext_entry_is_published_with_plaintext_and_not_secret(
+    repo, monkeypatch, capfd, stub_pulumi, tmp_path
+):
+    """`plaintext` entries are published too (Ruling 1) -- with
+    `--plaintext`, never `--secret`. Still delivered on stdin: one code path
+    for both tables, per the ruling."""
+    write_repo_config(
+        repo,
+        '[secrets."."]\nplaintext = { "registry.user" = "REGISTRY_USER" }\n',
+    )
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("REGISTRY_USER", "a-plaintext-value")
+    fake_pulumi(monkeypatch, stub_pulumi)
+
+    argv_dump = tmp_path / "argv.log"
+    stdin_dump = tmp_path / "stdin.log"
+    monkeypatch.setenv("STUB_DUMP_ARGV_TO", str(argv_dump))
+    monkeypatch.setenv("STUB_DUMP_STDIN_TO", str(stdin_dump))
+
+    assert main(["set-secrets"]) == 0
+
+    call_argv = json.loads(argv_dump.read_text().splitlines()[0])
+    assert "--plaintext" in call_argv
+    assert "--secret" not in call_argv
+    assert "--path" in call_argv and "registry.user" in call_argv
+
+    assert b"a-plaintext-value" in stdin_dump.read_bytes()
+
+
+def test_a_secret_entry_is_never_published_with_plaintext(
+    repo, monkeypatch, stub_pulumi, tmp_path
+):
+    """The converse of the test above: a `secret`-table entry always carries
+    `--secret` and never `--plaintext`, even now that both tables are
+    published through the same `_pulumi_config_set` code path."""
+    write_repo_config(
+        repo,
+        '[secrets."."]\nsecret = { "db.password" = "DB_PASSWORD" }\n',
+    )
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("DB_PASSWORD", MARKER_DB_PASSWORD)
+    fake_pulumi(monkeypatch, stub_pulumi)
+
+    argv_dump = tmp_path / "argv.log"
+    monkeypatch.setenv("STUB_DUMP_ARGV_TO", str(argv_dump))
+
+    assert main(["set-secrets"]) == 0
+    call_argv = json.loads(argv_dump.read_text().splitlines()[0])
+    assert "--secret" in call_argv
+    assert "--plaintext" not in call_argv
+
+
+def test_secret_and_plaintext_entries_are_both_published_in_one_run(
+    repo, monkeypatch, stub_pulumi, tmp_path
+):
+    """Both tables are live at once, each with its own flag -- not merely
+    that either works in isolation."""
+    write_repo_config(
+        repo,
+        '[secrets."."]\n'
+        'secret = { "db.password" = "DB_PASSWORD" }\n'
+        'plaintext = { "registry.user" = "REGISTRY_USER" }\n',
+    )
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("DB_PASSWORD", MARKER_DB_PASSWORD)
+    monkeypatch.setenv("REGISTRY_USER", "a-plaintext-value")
+    fake_pulumi(monkeypatch, stub_pulumi)
+
+    argv_dump = tmp_path / "argv.log"
+    monkeypatch.setenv("STUB_DUMP_ARGV_TO", str(argv_dump))
+
+    assert main(["set-secrets"]) == 0
+    calls = [json.loads(line) for line in argv_dump.read_text().splitlines()]
+    assert len(calls) == 2
+
+    secret_call = next(c for c in calls if "db.password" in c)
+    plaintext_call = next(c for c in calls if "registry.user" in c)
+    assert "--secret" in secret_call and "--plaintext" not in secret_call
+    assert "--plaintext" in plaintext_call and "--secret" not in plaintext_call
 
 
 def test_stack_flag_is_forwarded_to_pulumi(repo, monkeypatch, capfd, stub_pulumi, tmp_path):
@@ -644,8 +771,9 @@ def test_required_unresolved_path_fails_the_run(repo, monkeypatch, stub_pulumi, 
     write_repo_config(
         repo,
         '[secrets."."]\n'
-        'secret = { "db.password" = "DB_PASSWORD" }\n'
-        'required = ["db.password"]\n',
+        'secret = { "db.password" = "DB_PASSWORD" }\n\n'
+        '[secrets.".".required]\n'
+        'paths = ["db.password"]\n',
     )
     monkeypatch.chdir(repo)
     monkeypatch.delenv("DB_PASSWORD", raising=False)
@@ -654,6 +782,39 @@ def test_required_unresolved_path_fails_the_run(repo, monkeypatch, stub_pulumi, 
     assert main(["set-secrets"]) == 2
     err = capfd.readouterr().err
     assert "db.password" in err
+
+
+def test_a_non_canonical_required_shape_is_rejected_not_silently_ignored(
+    repo, monkeypatch, capfd
+):
+    """Ruling 2: `required = [...]` (the bare-array shape this module used to
+    also accept) is now a hard load-time error -- specifically *not* silently
+    read as "nothing required".
+
+    The exit code alone cannot distinguish "rejected at load time" from "the
+    old shape was quietly tolerated": in this exact manifest the tolerated
+    reading would still end up treating 'db.password' as required (the list
+    happens to contain a valid path), still fail to resolve it, and still
+    exit 2 through the ordinary per-entry failure path -- printing a
+    "summary:" line on the way. A genuine load-time rejection never reaches
+    that loop at all, so *that* absence, not the exit code, is the property
+    this test actually has to prove -- the same trap the brief warns several
+    of this task's tests are prone to.
+    """
+    write_repo_config(
+        repo,
+        '[secrets."."]\n'
+        'secret = { "db.password" = "DB_PASSWORD" }\n'
+        'required = ["db.password"]\n',
+    )
+    monkeypatch.chdir(repo)
+    monkeypatch.delenv("DB_PASSWORD", raising=False)
+
+    assert main(["set-secrets"]) == 2
+    captured = capfd.readouterr()
+    assert "summary:" not in captured.out
+    assert "error:" in captured.err
+    assert "paths" in captured.err
 
 
 def test_a_missing_pulumi_binary_fails_that_entry_and_is_reported(repo, monkeypatch, capfd):

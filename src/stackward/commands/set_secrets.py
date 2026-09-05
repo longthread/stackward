@@ -12,23 +12,30 @@ later files overriding earlier ones) and publishes it. Nothing here decides
 `SecretSource` interface (Task 11's `dotenv`/`env` providers) will register,
 so that interface adapts this module rather than rewriting it.
 
-**Only `[secrets."<dir>"].secret` is ever published.** The manifest's sibling
-tables, `plaintext` and `unmanaged`, share the same `path = name` shape but
-this command does not resolve or act on either: `plaintext` names paths the
-credential-scanning gate should treat as intentionally unencrypted, and
-`unmanaged` names paths this tool does not touch at all. Every requirement
-this module implements — the `--secret` flag, stdin delivery, drift pairing —
-names `secret` specifically; inventing a second `pulumi config set --path`
-form for `plaintext` would be scope this task was not asked for. If that
-reading is wrong, publishing `plaintext` is a small addition to
-`_publish_entries` below, not a redesign.
+**Both `[secrets."<dir>"].secret` and `.plaintext` are published; `unmanaged`
+is not.** The three sibling tables share the same `path = name` shape, but
+they are not interchangeable: the split between `secret` and `plaintext` *is*
+the declaration of whether a value is a credential, and a declared table that
+this command silently never acts on would make that declaration meaningless
+— a manifest author adding a `plaintext` entry with nothing telling them it
+does nothing is exactly the failure mode this project treats as worse than
+either "reject it" or "act on it." `secret` entries are published with
+`pulumi config set --secret --path <path>`; `plaintext` entries with
+`pulumi config set --plaintext --path <path>` — same resolution, same
+skip-if-unset semantics, same delivery on stdin, in `_pulumi_config_set`'s one
+code path (see below). `unmanaged` stays inert: it exists to record a path
+deliberately *not* managed by this tool, together with a reason — a
+"documentation-only" table by design, not an oversight.
 
-**A value never reaches `argv`.** `pulumi config set --secret --path <path>`
-is invoked with the resolved value on **stdin**, never as a positional
-argument — a command line is visible in `ps` and in shell history for the
-life of the call, the same concern Task 7's `login` already had to solve for
-a backend URL. `pulumi config get --path <path>` (drift detection's read) has
-no such argument at all, so it carries no value on either channel.
+**A value never reaches `argv`.** `pulumi config set --secret|--plaintext
+--path <path>` is invoked with the resolved value on **stdin**, never as a
+positional argument — a command line is visible in `ps` and in shell history
+for the life of the call, the same concern Task 7's `login` already had to
+solve for a backend URL. Stdin is used for `plaintext` too, even though its
+values are not confidential: keeping one delivery mechanism for both is
+simpler than forking a second one for the entries that do not strictly need
+it. `pulumi config get --path <path>` (drift detection's read) has no such
+argument at all, so it carries no value on either channel.
 
 **A name whose value is unset is skipped, never cleared.** This module has no
 code path that ever removes a Pulumi config value; it only ever calls
@@ -38,11 +45,13 @@ resolve at all — an environment variable exported as `""` is not a value
 worth publishing, and publishing it would silently clear whatever secret was
 there before, which is exactly the destructive surprise the brief calls out.
 
-**`[required]` promotes "skipped" to "failed".** A path named there — see
-`_normalize_required` for the two shapes this module accepts, and why — must
-resolve to a non-empty value or the run reports a non-zero exit. It does not,
-however, abort the loop: a timeout, a missing `pulumi` binary, and an
-unresolved required path are all the same class of per-entry failure (see
+**`[required]` promotes "skipped" to "failed".** A path named there — under
+`[secrets."<dir>".required]`'s `paths` list, the **one** canonical shape this
+module accepts; see `_parse_required` for why a second, alternate spelling is
+refused rather than tolerated — must resolve to a non-empty value (as either
+a `secret` or a `plaintext` entry) or the run reports a non-zero exit. It
+does not, however, abort the loop: a timeout, a missing `pulumi` binary, and
+an unresolved required path are all the same class of per-entry failure (see
 `_publish_entries`), and every one of them lets every other declared entry
 still get its own chance to be set. A rotation that stops partway and reports
 success would be worse than one that finishes and reports which entries did
@@ -127,14 +136,15 @@ class DriftPair:
 @dataclass(frozen=True)
 class ProjectManifest:
     """One `[secrets."<dir>"]` table, parsed to only what this module acts
-    on: `secret` (config path -> logical name, the only thing ever
-    published), `required` (a subset of `secret`'s paths that must resolve),
-    and `drift_pairs`. `plaintext` and `unmanaged` are read by `config.py`'s
-    shape check and never reach this dataclass at all — see the module
-    docstring for why this command does not act on either.
+    on: `secret` and `plaintext` (each config path -> logical name; both are
+    published, see the module docstring), `required` (a subset of `secret`'s
+    and `plaintext`'s paths that must resolve), and `drift_pairs`.
+    `unmanaged` is read by `config.py`'s shape check and never reaches this
+    dataclass at all — it is documentation-only, by design.
     """
 
     secret: dict[str, str] = field(default_factory=dict)
+    plaintext: dict[str, str] = field(default_factory=dict)
     required: frozenset[str] = frozenset()
     drift_pairs: tuple[DriftPair, ...] = ()
 
@@ -210,26 +220,46 @@ def _parse_path_name_table(raw: Any, where: str) -> dict[str, str]:
     return result
 
 
-def _normalize_required(raw: Any, where: str) -> frozenset[str]:
-    """`required` is accepted as either a list of path strings (`required =
-    ["a.b"]`, the form the brief's own wording — "paths *listed* under
-    `[required]`" — reads most naturally as canonical) or a table whose keys
-    are the paths (`[secrets."<dir>".required]`), so that a manifest author
-    who reaches for a TOML sub-table instead of an array is not met with a
-    parse error over a shape this module can accept for free. Documented as
-    a ruling, not settled by anything in the brief or `config.py`: the list
-    form is what this module's own tests and the manifest examples in this
-    file's docstring use as the one true spelling.
+# The only key `[secrets."<dir>".required]` recognises. A second, alternate
+# spelling of "these paths are required" (a bare `required = [...]` array, or
+# a table whose own keys are the required paths) is deliberately not accepted
+# alongside this one: a manifest format with two shapes for the same thing
+# means a typo in one can silently read as the *other* shape's "nothing
+# required" instead of as an error — an ambiguity a fail-closed check must
+# not have. See `_parse_required`.
+_REQUIRED_KEYS = frozenset({"paths"})
+
+
+def _parse_required(raw: Any, where: str) -> frozenset[str]:
+    """The **one** canonical `[secrets."<dir>".required]` shape: a table with
+    exactly one key, `paths`, holding a list of config-path strings —
+
+        [secrets."<dir>".required]
+        paths = ["a.b", "c.d"]
+
+    Absent entirely is a normal state (nothing required, an empty
+    `frozenset`). Present but any other shape — a bare `required = [...]`
+    array, a table whose own keys are the paths, an unrecognised key inside
+    `[required]` — is a hard `SetSecretsError` naming `where`, never silently
+    reinterpreted as one of the shapes this module used to also accept: this
+    is `config.py`'s own "invalid is never treated as absent" rule, and its
+    own "an unknown key is named and rejected" rule, both carried over here
+    for the same reason they hold there.
     """
     if raw is None:
         return frozenset()
-    if isinstance(raw, list):
-        if not all(isinstance(item, str) for item in raw):
-            raise SetSecretsError(f"{where} must be a list of path strings")
-        return frozenset(raw)
-    if isinstance(raw, dict):
-        return frozenset(raw.keys())
-    raise SetSecretsError(f"{where} must be a list, or a table, of config paths")
+    if not isinstance(raw, dict):
+        raise SetSecretsError(
+            f"{where} must be a table with a 'paths' list, e.g. "
+            f'[{where}]\npaths = ["a.b"]'
+        )
+    unknown = set(raw) - _REQUIRED_KEYS
+    if unknown:
+        raise SetSecretsError(f"unknown key {where}.{sorted(unknown)[0]}")
+    raw_paths = raw.get("paths", [])
+    if not isinstance(raw_paths, list) or not all(isinstance(item, str) for item in raw_paths):
+        raise SetSecretsError(f"{where}.paths must be a list of path strings")
+    return frozenset(raw_paths)
 
 
 def _parse_drift_pairs(raw: Any, where: str) -> tuple[DriftPair, ...]:
@@ -255,36 +285,41 @@ def parse_project_manifest(raw: dict[str, Any], project: str) -> ProjectManifest
     """Build a `ProjectManifest` from `config.secrets[project]`.
 
     Every config path this module will actually publish or forward to
-    `pulumi` is validated with `paths.parse` here, at load time — this is
+    `pulumi` — every key in `secret` and in `plaintext`, since both are
+    published — is validated with `paths.parse` here, at load time; this is
     the one path grammar the whole tool shares (see `paths.py`), and using it
     as the validator is what "do not invent string handling" means in
-    practice. `plaintext` and `unmanaged` keys are never parsed this way:
-    this module never forwards either to `pulumi`, and `unmanaged` keys may
-    legitimately hold a wildcard shape (`"<path>.*"`) that is not a `--path`
-    at all — see the module docstring.
+    practice. `unmanaged` keys are never parsed this way: this module never
+    forwards them to `pulumi`, and they may legitimately hold a wildcard
+    shape (`"<path>.*"`) that is not a `--path` at all — see the module
+    docstring.
     """
     secret = _parse_path_name_table(raw.get("secret"), f"secrets.{project!r}.secret")
-    for path in secret:
-        try:
-            paths.parse(path)
-        except ValueError as exc:
-            raise SetSecretsError(
-                f"secrets.{project!r}.secret: invalid config path {path!r}: {exc}"
-            ) from exc
+    plaintext = _parse_path_name_table(raw.get("plaintext"), f"secrets.{project!r}.plaintext")
+    for table_name, table in (("secret", secret), ("plaintext", plaintext)):
+        for path in table:
+            try:
+                paths.parse(path)
+            except ValueError as exc:
+                raise SetSecretsError(
+                    f"secrets.{project!r}.{table_name}: invalid config path {path!r}: {exc}"
+                ) from exc
 
-    required = _normalize_required(raw.get("required"), f"secrets.{project!r}.required")
-    unknown = required - set(secret)
+    required = _parse_required(raw.get("required"), f"secrets.{project!r}.required")
+    unknown = required - set(secret) - set(plaintext)
     if unknown:
         raise SetSecretsError(
-            f"secrets.{project!r}.required names {sorted(unknown)[0]!r}, which "
-            "is not declared under 'secret'"
+            f"secrets.{project!r}.required.paths names {sorted(unknown)[0]!r}, which "
+            "is not declared under 'secret' or 'plaintext'"
         )
 
     drift_pairs = _parse_drift_pairs(
         raw.get("drift_pairs"), f"secrets.{project!r}.drift_pairs"
     )
 
-    return ProjectManifest(secret=secret, required=required, drift_pairs=drift_pairs)
+    return ProjectManifest(
+        secret=secret, plaintext=plaintext, required=required, drift_pairs=drift_pairs
+    )
 
 
 def select_project(config: Config, repo_root: Path, cwd: Path) -> str:
@@ -407,18 +442,29 @@ def parse_env_file(path: Path) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 
+# The two publishable manifest tables, and the `pulumi config set` flag each
+# one is published with. `_publish_entries` never calls `_pulumi_config_set`
+# with a `mode` outside this mapping's keys.
+_MODE_FLAGS = {"secret": "--secret", "plaintext": "--plaintext"}
+
+
 def _pulumi_config_set(
     pulumi: str,
     path: str,
     value: str,
     *,
-    secret: bool,
+    mode: str,
     stack: str | None,
     timeout: float,
 ) -> None:
-    """`pulumi config set [--secret] --path <path>`, `value` on **stdin** —
-    never as a positional argument, which would put it in `argv` and
-    therefore in `ps` output and shell history for the life of the call.
+    """`pulumi config set --secret|--plaintext --path <path>`, `value` on
+    **stdin** — never as a positional argument, which would put it in `argv`
+    and therefore in `ps` output and shell history for the life of the call.
+    `mode` (`"secret"` or `"plaintext"`, via `_MODE_FLAGS`) picks the flag;
+    the two are mutually exclusive on one invocation, and a `secret` entry is
+    never sent with `--plaintext` or vice versa — each entry carries its own
+    table's mode all the way from `manifest.secret`/`manifest.plaintext`
+    through to this call.
 
     Raises `subprocess.TimeoutExpired` and `OSError` (a missing `pulumi`
     binary, among other things) unchanged, for `_publish_entries` to
@@ -429,10 +475,7 @@ def _pulumi_config_set(
     they are not this module's to vouch for as free of the very value it
     just piped to this process on stdin.
     """
-    args = [pulumi, "config", "set"]
-    if secret:
-        args.append("--secret")
-    args += ["--path", path]
+    args = [pulumi, "config", "set", _MODE_FLAGS[mode], "--path", path]
     if stack:
         args += ["--stack", stack]
     completed = subprocess.run(args, input=value.encode(), timeout=timeout, capture_output=True)
@@ -486,9 +529,10 @@ def _publish_entries(
     dry_run: bool,
     timeout: float,
 ) -> list[EntryOutcome]:
-    """Walk `manifest.secret` in its declared order and resolve, then (unless
-    `dry_run`) publish, each entry — one `EntryOutcome` per entry, regardless
-    of whether it succeeded.
+    """Walk every `secret` entry (in declared order), then every `plaintext`
+    entry (in declared order), resolving and then (unless `dry_run`)
+    publishing each one with its own table's mode — one `EntryOutcome` per
+    entry, regardless of whether it succeeded.
 
     Every failure mode here — an unresolved required path, a `pulumi` timeout,
     a missing `pulumi` binary, a non-zero `pulumi` exit — is recorded on its
@@ -496,13 +540,16 @@ def _publish_entries(
     raising: a half-finished rotation that stops on the first failure and
     exits non-zero has already left every entry after it unset, and reports
     that failure no differently than one that finishes and simply fails to
-    report which entries did not land. The order entries are declared in
-    `manifest.secret` (a `dict`, so insertion order — the order the TOML was
-    written in) is preserved throughout, since it is what makes "the failing
-    entry was in the middle" a meaningful, reproducible scenario to test.
+    report which entries did not land. The order entries are declared within
+    each table (a `dict`, so insertion order — the order the TOML was written
+    in) is preserved throughout, since it is what makes "the failing entry
+    was in the middle" a meaningful, reproducible scenario to test.
     """
+    entries = [(path, name, "secret") for path, name in manifest.secret.items()]
+    entries += [(path, name, "plaintext") for path, name in manifest.plaintext.items()]
+
     outcomes: list[EntryOutcome] = []
-    for path, name in manifest.secret.items():
+    for path, name, mode in entries:
         value = source.resolve(name)
         if not value:
             if path in manifest.required:
@@ -522,7 +569,7 @@ def _publish_entries(
             continue
 
         try:
-            _pulumi_config_set(pulumi, path, value, secret=True, stack=stack, timeout=timeout)
+            _pulumi_config_set(pulumi, path, value, mode=mode, stack=stack, timeout=timeout)
         except subprocess.TimeoutExpired:
             outcomes.append(EntryOutcome(path, name, "failed", "pulumi timed out"))
         except OSError as exc:
