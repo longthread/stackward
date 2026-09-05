@@ -1,0 +1,304 @@
+"""`hooks install`: write the `pre-commit` gate into this repository's git
+hooks directory.
+
+Registered in `cli.build_parser` as `stackward hooks install`, taking no
+arguments -- like `pre-commit` itself, it always operates on the repository
+containing the current working directory.
+
+**The hook body has no logic.** It locates the `stackward` executable and
+execs `stackward pre-commit` -- nothing else. Git does not version hooks, so
+whatever text this command writes into a hook file sits there, unchanged,
+until someone runs this command again; a hook body that duplicated any of
+`commands.pre_commit`'s actual rules would silently drift from that module
+the first time either one changed, in every clone that had installed it
+before the drift. Keeping the hook body to "find the binary, exec it" means
+every fix and every new rule reaches an already-installed hook automatically,
+through the same `stackward` upgrade that would have shipped it anyway --
+nothing about the hook file itself has to change, or even be reinstalled.
+
+**Never hardcode `.git/hooks`.** `core.hooksPath` is routinely redirected --
+by husky, by the `pre-commit` framework, by a org-wide global config -- and a
+directory git does not consult is a *silent* no-op: nothing errors, the
+command reports success, and the next commit with a plaintext credential in
+it sails straight through a gate everyone believes is installed. `_hooks_dir`
+resolves the real location with `git rev-parse --git-path hooks`, exactly
+once, and every other function in this module treats that resolved `Path` as
+the hooks directory rather than reconstructing or assuming it.
+
+**Refuse a tracked hooks directory outright.** Some repositories commit their
+hook *scripts* to a tracked directory (`.githooks/`, say) and point
+`core.hooksPath` at it precisely so every clone gets the same hooks without a
+separate install step. Writing this tool's hook into a directory like that
+would commit a file that `exec`s a `stackward` binary the next clone may not
+have installed at all -- turning a shared convenience into a hook that blocks
+every commit in every clone until someone notices and reverts it. `_is_tracked`
+checks this with `git ls-files --error-unmatch <dir>` (a tracked-directory
+pathspec matches if *any* file under it is tracked; git's ordinary,
+unredirected `.git/hooks` never matches, because paths under `.git/` are not
+part of the repository's tracked namespace at all) and `cmd_install_hooks`
+refuses before writing anything -- printing the reason and pointing at
+chaining from the tracked hook instead of overwriting it.
+
+**Absolute path, with a `PATH` fallback baked into the hook itself.** The
+obvious one-liner, `exec stackward pre-commit`, depends on `stackward` being
+on `PATH` *at the moment git invokes the hook* -- and several everyday commit
+paths (GUI clients, IDEs, cron) run git with a minimal environment that does
+not include the shell profile where `PATH` normally gets extended. `exec`
+against a name that is not found there exits 127, and a hook that exits
+non-zero blocks the commit -- exactly the experience that teaches people to
+reach for `git commit --no-verify` and never look back. `_running_executable`
+embeds the absolute path this command was itself invoked with (see its own
+docstring for why that differs between a frozen build and a console-script
+install), and the hook body it writes still falls back to a `PATH` lookup if
+that embedded path is not executable when the hook actually runs -- covering
+the case where `stackward` moved, or this hook was installed from one clone's
+install layout and is now running against another's.
+
+**A fixed marker line, backup rather than refuse or overwrite.** Some other
+tool, or a human, may already have written a hook at the same path (`husky`,
+`pre-commit`, or a hand-written script). This command must not silently
+destroy that -- but it also must not refuse forever, since re-running this
+command is exactly how the hook body picks up a `stackward` upgrade. The
+answer is the fixed line `_MARKER`: a hook that already carries it was
+written by this command and is safe to overwrite in place (this is what
+makes running the command twice leave exactly one hook, with no growing pile
+of backups); a hook that lacks it is somebody else's and is moved aside to
+`<hook>.backup.<UTC timestamp>` -- never overwritten, never dropped, and
+never a reason to refuse the install outright.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+from .check_config import fail_closed
+
+_HOOK_NAME = "pre-commit"
+
+# Exact line a hook this command wrote always contains, and the sole thing
+# that tells "ours, safe to overwrite in place" apart from "somebody else's,
+# back it up" -- see the module docstring. Never change this text without
+# also handling hooks written by a prior version that still carry the old
+# one; nothing in this codebase (yet) needs that migration.
+_MARKER = "# managed by: stackward hooks install"
+
+
+class InstallError(Exception):
+    """Installation cannot proceed for a reason that is safe to print
+    verbatim: git is missing, the current directory is not inside a git
+    working tree, or a git command genuinely failed. Never raised for a
+    plaintext credential -- this module never reads staged or working-tree
+    *content* at all, only git's own metadata about paths."""
+
+
+def _run_git(args: list[str]) -> str:
+    """Run `git <args>` in the current working directory and return its
+    stdout, stripped of surrounding whitespace.
+
+    Raises `InstallError` for anything that means installation cannot
+    proceed: the `git` executable missing, or the invoked subcommand
+    failing for any git-reported reason (most notably, the current
+    directory not being inside a git working tree at all)."""
+    try:
+        proc = subprocess.run(["git", *args], capture_output=True, text=True, check=False)
+    except OSError as exc:
+        raise InstallError(f"cannot run git {' '.join(args)}: {exc}") from exc
+    if proc.returncode != 0:
+        stderr = proc.stderr.strip()
+        raise InstallError(f"git {' '.join(args)} failed: {stderr}")
+    return proc.stdout.strip()
+
+
+def _hooks_dir() -> Path:
+    """The repository's actual hooks directory -- `git rev-parse --git-path
+    hooks`, resolved to an absolute path, never `.git/hooks` hardcoded. See
+    the module docstring for why a redirected `core.hooksPath` makes that
+    hardcoding a silent no-op rather than a loud failure."""
+    return Path(_run_git(["rev-parse", "--git-path", "hooks"])).resolve()
+
+
+def _is_tracked(path: Path) -> bool:
+    """Whether any file under `path` (already an absolute `Path`) is
+    tracked by git, tested exactly as the brief specifies: `git ls-files
+    --error-unmatch <dir>` -- a directory pathspec matches if git tracks
+    anything underneath it. Passing the pre-resolved absolute path, rather
+    than a relative one, keeps this correct regardless of what the current
+    working directory happens to be. Git's own `.git/hooks`, unredirected,
+    never matches: paths under `.git/` are not part of the tracked
+    namespace at all, so this reliably distinguishes that default location
+    from a `core.hooksPath` deliberately pointed at a tracked directory."""
+    proc = subprocess.run(
+        ["git", "ls-files", "--error-unmatch", str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.returncode == 0
+
+
+def _running_executable() -> str:
+    """Absolute path to the running `stackward`, embedded verbatim as the
+    hook body's primary way of finding the binary (the `PATH` lookup in
+    `_hook_body` is only the runtime fallback).
+
+    A frozen PyInstaller build's `sys.executable` *is* the compiled
+    `stackward` binary -- the same fact `cli.cmd_doctor` already reports
+    via `getattr(sys, "frozen", False)`. For an ordinary source or
+    console-script install, `sys.executable` is the Python interpreter
+    instead, which a bare `exec` cannot usefully invoke on its own; there,
+    `sys.argv[0]` is normally the console-script file itself -- an
+    executable file with its own shebang -- and resolving it to an
+    absolute path is what actually names the command that is running.
+
+    `sys.argv[0]` is not always that, though: invoked as `python -m
+    stackward`, it resolves to `.../stackward/__main__.py`, a plain
+    source file with no shebang and no execute bit -- embedding it would
+    make the hook silently fall through to its own `PATH` fallback on
+    every single run, which is exactly the dependency this whole scheme
+    exists to avoid relying on (see the module docstring). Checked with
+    `os.access(..., os.X_OK)` rather than assumed, and resolved with
+    `shutil.which("stackward")` when it fails: on a normal install that
+    finds the very console script `sys.argv[0]` would have pointed to
+    when invoked the usual way.
+    """
+    if getattr(sys, "frozen", False):
+        return sys.executable
+    argv0 = Path(sys.argv[0]).resolve()
+    if argv0.is_file() and os.access(argv0, os.X_OK):
+        return str(argv0)
+    found = shutil.which("stackward")
+    return found if found is not None else str(argv0)
+
+
+def _hook_body(executable_path: str) -> str:
+    """The full text of the hook file: the marker, an edit-me-not notice,
+    and nothing that decides anything about a commit. `executable_path` is
+    embedded as a single-quoted, shell-escaped literal (safe even if it
+    contains a space) rather than interpolated into a double-quoted
+    string, which would let a `$`, backtick, or backslash in the path be
+    reinterpreted by the shell instead of taken literally.
+    """
+    quoted = "'" + executable_path.replace("'", "'\\''") + "'"
+    return (
+        "#!/bin/sh\n"
+        f"{_MARKER}\n"
+        "# Installed by `stackward hooks install` -- do not edit this file by\n"
+        "# hand; re-run that command instead (it is safe to run again, and\n"
+        "# picks up a newer stackward automatically). Everything this hook\n"
+        "# actually decides lives in `stackward pre-commit`, not here -- a\n"
+        "# rule added or fixed there reaches every clone through a normal\n"
+        "# stackward upgrade, with no change to this file at all.\n"
+        "set -eu\n"
+        "\n"
+        f"STACKWARD={quoted}\n"
+        'if [ ! -x "$STACKWARD" ]; then\n'
+        '    STACKWARD="$(command -v stackward 2>/dev/null || true)"\n'
+        "fi\n"
+        'if [ -z "$STACKWARD" ]; then\n'
+        '    echo "stackward: could not find the stackward executable" >&2\n'
+        '    echo "  (checked the path recorded at install time, then PATH)" >&2\n'
+        "    exit 1\n"
+        "fi\n"
+        "\n"
+        'exec "$STACKWARD" pre-commit\n'
+    )
+
+
+def _is_stackward_hook(path: Path) -> bool:
+    """Whether the file at `path` is a hook this command wrote -- i.e.
+    carries `_MARKER` on a line of its own. Never raises: an unreadable or
+    binary existing file simply is not recognised as ours, which is the
+    correct, safe answer either way -- it gets backed up rather than
+    mistaken for a hook this command can overwrite in place."""
+    try:
+        content = path.read_text()
+    except OSError:
+        return False
+    return any(line.strip() == _MARKER for line in content.splitlines())
+
+
+def _backup_path(hook_path: Path) -> Path:
+    """`<hook>.backup.<UTC timestamp>`, microsecond-resolution so two
+    installs in the same repository within the same second cannot collide
+    and silently overwrite one backup with another."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
+    return hook_path.with_name(f"{hook_path.name}.backup.{stamp}")
+
+
+def _install_hook(hooks_dir: Path, executable_path: str) -> Path | None:
+    """Write the `pre-commit` hook into `hooks_dir`, creating the directory
+    if it does not yet exist (a `core.hooksPath` redirected to a directory
+    nothing has populated yet, most notably).
+
+    Returns the path an existing *foreign* hook was backed up to, or
+    `None` when there was nothing to back up -- either no hook was present,
+    or the one present already carried `_MARKER` and was simply overwritten
+    in place. That distinction is what makes installing twice leave exactly
+    one hook and create no second backup: the second run finds its own
+    marker on the first run's hook and overwrites it directly, rather than
+    backing it up as if it were foreign.
+
+    Always `chmod 0o755` after writing, explicitly -- never assumed from a
+    default `open()` mode, which a restrictive umask could leave non-
+    executable, and never inherited from a prior file at the same path.
+    """
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    hook_path = hooks_dir / _HOOK_NAME
+
+    backup_path: Path | None = None
+    if hook_path.exists() or hook_path.is_symlink():
+        if not _is_stackward_hook(hook_path):
+            backup_path = _backup_path(hook_path)
+            hook_path.rename(backup_path)
+
+    hook_path.write_text(_hook_body(executable_path))
+    hook_path.chmod(0o755)
+    return backup_path
+
+
+@fail_closed
+def cmd_install_hooks(_args: argparse.Namespace) -> int:
+    """Entry point for `stackward hooks install`.
+
+    Exit codes: **0** installed (fresh, updated in place, or an existing
+    foreign hook backed up first); **1** refused because the resolved hooks
+    directory is tracked by git (see the module docstring for why writing
+    there is unsafe); **2** could not even determine where to install --
+    `git` missing, or the current directory not inside a git working tree.
+    Reusing `check_config.fail_closed` here for the same reason it wraps
+    `cmd_check_config` and `cmd_pre_commit`: an unanticipated exception
+    must not fall through to Python's own default exit code of 1, which
+    this tool reserves for a specific, different meaning everywhere else it
+    appears.
+    """
+    try:
+        hooks_dir = _hooks_dir()
+    except InstallError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if _is_tracked(hooks_dir):
+        print(f"error: hooks directory is tracked by git: {hooks_dir}", file=sys.stderr)
+        print(
+            "Installing here would commit a hook that execs a stackward binary "
+            "other clones may not have, blocking their commits. Chain from the "
+            "tracked hook instead: have it invoke `stackward pre-commit` itself "
+            "(with the same PATH fallback this command would have used) rather "
+            "than letting this command overwrite it.",
+            file=sys.stderr,
+        )
+        return 1
+
+    executable = _running_executable()
+    hook_path = hooks_dir / _HOOK_NAME
+    backup_path = _install_hook(hooks_dir, executable)
+    if backup_path is not None:
+        print(f"Existing hook backed up to {backup_path}")
+    print(f"Installed pre-commit hook -> {hook_path}")
+    return 0

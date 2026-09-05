@@ -18,6 +18,7 @@ from pathlib import Path
 
 from . import __version__
 from .commands.check_config import cmd_check_config
+from .commands.install_hooks import cmd_install_hooks
 from .commands.pre_commit import cmd_pre_commit
 from .config import find_repo_config
 
@@ -125,6 +126,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="check staged content for a plaintext credential (git hook body)",
     )
     pre_commit.set_defaults(func=cmd_pre_commit)
+
+    hooks = sub.add_parser("hooks", help="manage this repository's git hooks")
+    hooks_sub = hooks.add_subparsers(dest="hooks_command", metavar="<command>")
+    hooks_install = hooks_sub.add_parser(
+        "install", help="install the pre-commit gate into this repository's hooks"
+    )
+    hooks_install.set_defaults(func=cmd_install_hooks)
 
     return parser
 
