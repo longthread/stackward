@@ -1,0 +1,62 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # The floor is what the shipped binary bundles; the ceiling catches
+        # deprecations early.
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - run: uv sync --python ${{ matrix.python-version }}
+
+      - run: uv run pytest -q
+
+      - name: Runtime dependencies must stay minimal
+        # This tool runs in a pre-commit hook and ships as a bundled binary, so
+        # every runtime dependency is paid for on every commit and has to be
+        # frozen correctly on every platform. Guard the floor rather than
+        # trusting review to notice an import creeping in.
+        #
+        # Direct dependencies only. The transitive set is not the right thing to
+        # pin here: it moves when an upstream project changes its own
+        # requirements, which would turn this into a recurring false alarm.
+        run: |
+          set -euo pipefail
+          python3 - <<'EOF'
+          import re, sys, tomllib
+
+          ALLOWED = {"pyyaml", "cryptography"}
+
+          with open("pyproject.toml", "rb") as handle:
+              declared = tomllib.load(handle)["project"]["dependencies"]
+
+          names = {re.split(r"[\[<>=!~;\s]", spec, 1)[0].strip().lower() for spec in declared}
+          print("Direct runtime dependencies:", ", ".join(sorted(names)))
+
+          if names - ALLOWED:
+              print(
+                  "::error::New runtime dependency: "
+                  + ", ".join(sorted(names - ALLOWED))
+                  + ". Adding one is a deliberate decision — it is bundled into every"
+                  " release and imported on every commit. Update ALLOWED here in the"
+                  " same change.",
+                  file=sys.stderr,
+              )
+              raise SystemExit(1)
+          EOF

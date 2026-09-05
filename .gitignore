@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+*.egg-info/
+
+# Build artefacts
+build/
+dist/
+*.spec
+
+# Never commit a Pulumi state export: it carries every resource's inputs,
+# credentials included. This tool's own fixtures must be synthetic.
+state.json
+*.stack-export.json
+
+# Local credential material has no business in a checkout, least of all this one
+.env
+.env.*
+!.env.example

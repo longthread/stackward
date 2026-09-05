@@ -1,0 +1,79 @@
+# Refuse any commit that mentions the environment this tool was extracted from.
+#
+# The denylist is NOT stored in this repository, deliberately. A list of terms
+# that must never appear is itself a disclosure of every one of them — and in a
+# public repo it would be published in the first commit and preserved in the
+# history forever. It lives in the NEUTRALITY_DENYLIST secret instead.
+#
+# The worktree is not enough either. Git history is public and permanent, so a
+# term that was committed and later edited out is still exposed. Both are
+# checked.
+name: neutrality
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  denylist:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # history is part of the public surface
+
+      - name: Check worktree and history
+        env:
+          DENYLIST: ${{ secrets.NEUTRALITY_DENYLIST }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.fork }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${DENYLIST}" ]; then
+            if [ "${IS_FORK}" = "true" ]; then
+              echo "::warning::Denylist secret is unavailable to fork pull requests." \
+                   "A maintainer must review this change for environment-specific" \
+                   "references by hand before merging."
+              exit 0
+            fi
+            echo "::error::NEUTRALITY_DENYLIST is not set. Refusing to pass a check" \
+                 "that did not run." >&2
+            exit 1
+          fi
+
+          # Written outside the workspace so it can never be committed by a
+          # later step, and removed on exit either way.
+          LIST="$(mktemp)"
+          trap 'rm -f "$LIST"' EXIT
+          printf '%s\n' "${DENYLIST}" | grep -v '^[[:space:]]*$' > "$LIST"
+          echo "Checking against $(wc -l < "$LIST") denied terms."
+
+          # Report locations only, never the matching text: printing the match
+          # would disclose the term the denylist exists to keep private.
+          fail=0
+
+          if git grep -I -i -n -F -f "$LIST" -- . > /tmp/hits 2>/dev/null; then
+            echo "::error::Denied term found in the working tree:"
+            cut -d: -f1,2 /tmp/hits | sort -u | sed 's/^/  /'
+            fail=1
+          fi
+
+          if git grep -I -i -l -F -f "$LIST" $(git rev-list --all) > /tmp/histhits 2>/dev/null; then
+            echo "::error::Denied term found in committed history. Editing it out is" \
+                 "not sufficient — history is public. This needs a fresh repository."
+            sort -u /tmp/histhits | sed 's/^/  /'
+            fail=1
+          fi
+
+          if git log --all --format='%H %s%n%b' | grep -I -i -q -F -f "$LIST"; then
+            echo "::error::Denied term found in a commit message."
+            fail=1
+          fi
+
+          rm -f /tmp/hits /tmp/histhits
+          if [ "$fail" -ne 0 ]; then exit 1; fi
+          echo "Clean: no denied term in the worktree, history, or commit messages."

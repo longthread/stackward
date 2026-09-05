@@ -1,0 +1,109 @@
+"""Command dispatch.
+
+v0.1.0 deliberately ships only `--version` and `doctor`. The point of this
+release is to prove the distribution path — build, sign, publish, download,
+install, run — while it is still cheap to change. Features land on top of a
+distribution mechanism that is already known to work, not the other way round.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import platform
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+from . import __version__
+
+# Commands that must keep working even when a repo demands a newer stackward
+# than the one installed. Without this exemption the upgrade instruction would
+# itself be blocked by the check that prints it.
+VERSION_CHECK_EXEMPT = frozenset({"doctor", "self-update"})
+
+CONFIG_FILENAME = ".stackward.toml"
+
+
+def config_home() -> Path:
+    """Where profiles and credentials live. XDG, with the usual fallback."""
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".config"
+    return base / "stackward"
+
+
+def find_repo_config(start: Path | None = None) -> Path | None:
+    """Nearest .stackward.toml at or above `start`, stopping at the repo root.
+
+    Returns None rather than falling back to a default: a tool that guesses
+    which backend it is talking to is worse than one that refuses.
+    """
+    current = (start or Path.cwd()).resolve()
+    for candidate in [current, *current.parents]:
+        config = candidate / CONFIG_FILENAME
+        if config.is_file():
+            return config
+        if (candidate / ".git").exists():
+            break
+    return None
+
+
+def _tool_version(name: str) -> str:
+    """Report an external tool's version, or why it cannot be used."""
+    path = shutil.which(name)
+    if path is None:
+        return "not found on PATH"
+    try:
+        proc = subprocess.run(
+            [name, "--version"], capture_output=True, text=True, timeout=10
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return f"{path} (unusable: {exc})"
+    first = (proc.stdout or proc.stderr).strip().splitlines()
+    return f"{first[0] if first else '?'}  [{path}]"
+
+
+def cmd_doctor(_args: argparse.Namespace) -> int:
+    """Report what stackward can see. Never prints a credential value."""
+    config = find_repo_config()
+    home = config_home()
+
+    print(f"stackward       {__version__}")
+    print(f"python          {platform.python_version()} ({sys.platform})")
+    print(f"executable      {sys.executable}")
+    print(f"frozen binary   {getattr(sys, 'frozen', False)}")
+    print()
+    print(f"config home     {home}{'' if home.is_dir() else '  (not created yet)'}")
+    print(f"repo config     {config or 'none found — commands needing one will refuse'}")
+    print()
+    print(f"pulumi          {_tool_version('pulumi')}")
+    print(f"git             {_tool_version('git')}")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="stackward",
+        description=__doc__.splitlines()[0],
+    )
+    parser.add_argument("--version", action="version", version=f"stackward {__version__}")
+    sub = parser.add_subparsers(dest="command", metavar="<command>")
+
+    doctor = sub.add_parser("doctor", help="report resolved configuration and environment")
+    doctor.set_defaults(func=cmd_doctor)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return 2
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

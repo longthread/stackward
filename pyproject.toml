@@ -1,0 +1,44 @@
+[project]
+name = "stackward"
+version = "0.1.0"
+description = "Operations toolkit for Pulumi DIY-backend stacks: credential gate, profile-scoped secrets, git hooks."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+
+# Deliberately minimal, and it must stay that way.
+#
+# This tool runs inside a pre-commit hook, so every dependency is paid for on
+# every commit. It also ships as a self-contained binary, so every dependency is
+# something PyInstaller has to bundle correctly on every platform.
+#
+# In particular: never depend on the Pulumi SDK. `stackward` shells out to the
+# `pulumi` binary, the same way it shells out to `git`. Importing the SDK would
+# pull in grpcio and friends for no benefit.
+dependencies = [
+    "pyyaml>=6.0",
+    "cryptography>=42.0",
+]
+
+[project.scripts]
+stackward = "stackward.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    # Test-only. The model walker is exercised against synthetic models; the
+    # shipped binary neither imports nor bundles pydantic.
+    "pydantic>=2.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+# Explicit, rather than letting the backend guess. Auto-detection is how a
+# stray top-level directory ends up shipped inside a wheel.
+[tool.hatch.build.targets.wheel]
+packages = ["src/stackward"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
