@@ -18,6 +18,7 @@ from pathlib import Path
 
 from . import __version__
 from .commands.check_config import cmd_check_config
+from .commands.check_passphrase import cmd_check_passphrase
 from .commands.install_hooks import cmd_install_hooks
 from .commands.pre_commit import cmd_pre_commit
 from .commands.session import cmd_exec, cmd_login, cmd_shell
@@ -165,6 +166,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="report what would be set without running pulumi",
     )
     set_secrets.set_defaults(func=cmd_set_secrets)
+
+    check_passphrase = sub.add_parser(
+        "check-passphrase",
+        help="prove a passphrase decrypts one or more stacks (never as an argument)",
+    )
+    check_passphrase.add_argument("stacks", nargs="+", metavar="STACK")
+    check_passphrase.set_defaults(func=cmd_check_passphrase)
 
     return parser
 
