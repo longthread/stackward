@@ -14,7 +14,7 @@ import yaml
 
 from stackward.cli import main
 from stackward.commands import check_config as check_config_module
-from stackward.commands.check_config import CheckError, scan_file
+from stackward.commands.check_config import CheckError, fail_closed, scan_file
 from stackward.config import CheckConfig
 from stackward.nets.heuristic import DocumentError, find_plaintext_credentials
 
@@ -257,6 +257,46 @@ def test_empty_document_raises():
 
 
 # ---------------------------------------------------------------------------
+# fail_closed — the outer boundary shared by check-config and pre-commit.
+# ---------------------------------------------------------------------------
+
+
+def test_fail_closed_converts_an_unhandled_exception_to_exit_2(capsys):
+    """The property `fail_closed` exists for, isolated from either
+    command: an exception the wrapped function does not itself catch
+    becomes exit 2, never left to propagate (which would exit 1 by
+    Python's own default — the code reserved for "a credential was
+    found")."""
+
+    @fail_closed
+    def boom(_args):
+        raise OSError("simulated failure unrelated to any file's content")
+
+    assert boom(None) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "OSError" in captured.err
+    # Only the exception's type name is reported, never its own text —
+    # the same reasoning `describe_yaml_error` uses for never trusting
+    # `str(exc)`: an unanticipated exception's message is not something
+    # this boundary can vouch for as free of file content.
+    assert "simulated failure unrelated to any file's content" not in captured.err
+
+
+def test_fail_closed_does_not_interfere_with_a_normal_return(capsys):
+    """A wrapped function that returns normally is unaffected — the
+    decorator only ever intervenes on an exception."""
+
+    @fail_closed
+    def clean(_args):
+        print("normal output")
+        return 0
+
+    assert clean(None) == 0
+    assert "normal output" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
 # scan_file / check-config — the file-path wrapper and the CLI it backs.
 # ---------------------------------------------------------------------------
 
@@ -484,6 +524,31 @@ def test_check_config_exits_2_on_unanticipated_scan_error(tmp_path, monkeypatch,
     monkeypatch.setattr("stackward.commands.check_config.scan_file", boom)
     assert main(["check-config", str(path)]) == 2
     assert capsys.readouterr().out == ""
+
+
+def test_check_config_exits_2_when_policy_loading_raises_an_unexpected_error(
+    tmp_path, monkeypatch, capsys
+):
+    """A bare exception from policy loading -- not `ConfigError`, which
+    `cmd_check_config`'s own `except ConfigError` already handles -- must
+    not escape uncaught. Concretely: `find_repo_config` walks upward
+    through parent directories with plain `.is_file()`/`.exists()` calls
+    and no try/except of its own, so a `PermissionError` on a
+    non-traversable parent would surface as a bare `OSError`. Without the
+    `@fail_closed` decorator on `cmd_check_config`, that would propagate
+    out of `main()` entirely and exit 1 by Python's own default --
+    misreporting "credential found" for an invocation that never got as
+    far as loading policy, let alone scanning a file."""
+    path = write_yaml(tmp_path, "Pulumi.dev.yaml", "name: myproject\n")
+
+    def boom():
+        raise OSError("simulated permission error walking parent directories")
+
+    monkeypatch.setattr("stackward.commands.check_config.find_repo_config", boom)
+    assert main(["check-config", str(path)]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "OSError" in captured.err
 
 
 def test_check_config_prints_a_real_finding_even_when_another_file_errors(

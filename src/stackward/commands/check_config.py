@@ -11,8 +11,10 @@ reads the same way this one does: "the gate did not get to answer".
 from __future__ import annotations
 
 import argparse
+import functools
 import re
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 import yaml
@@ -40,6 +42,51 @@ class CheckError(Exception):
     non-mapping document, an unmerged index entry, a git command that
     failed) — one exception type for one meaning, not a second class that
     would have to be kept consistent with this one by hand."""
+
+
+def fail_closed(
+    command: Callable[[argparse.Namespace], int],
+) -> Callable[[argparse.Namespace], int]:
+    """Wrap a command entry point so any exception it does not already
+    handle itself becomes exit code 2, never left to propagate.
+
+    Both `cmd_check_config` and `cmd_pre_commit` already wrap each
+    per-file scan individually — see either function's own per-file
+    `except CheckError` / catch-all `except Exception` pair — but that
+    only protects the scan step itself. Policy loading
+    (`_load_check_policy`, built on `find_repo_config`/`load_config`) and,
+    in `pre_commit`, the staged-file listing (`_staged_paths`) both run
+    *outside* that loop, each guarded only by `except ConfigError` or
+    `except CheckError` respectively. A review of this module found the
+    gap concretely: `find_repo_config` walks upward through parent
+    directories with bare `.is_file()`/`.exists()` calls and no
+    try/except of its own, so a `PermissionError` on a non-traversable
+    parent surfaces as a plain `OSError` — neither `ConfigError` nor
+    `CheckError` — which would otherwise escape both commands uncaught
+    and exit 1 by Python's own default: the code this tool reserves
+    exclusively for "a credential was found", misreporting exactly that
+    for an invocation that never got far enough to check anything.
+
+    This decorator is the outer boundary that catches precisely what the
+    inner, per-file guards do not, from one definition shared by both
+    commands rather than two independently-maintained copies of the same
+    try/except (or, worse, three or more scattered call-site patches that
+    would leave the next command built this way exposed by default).
+    Never prints `str(exc)` — the exception type only — for the same
+    reason `describe_yaml_error` never echoes `str(exc)` on a YAML error:
+    an unanticipated exception's text is not something this boundary can
+    vouch for as free of file content.
+    """
+
+    @functools.wraps(command)
+    def wrapped(args: argparse.Namespace) -> int:
+        try:
+            return command(args)
+        except Exception as exc:  # noqa: BLE001 - the fail-closed boundary itself
+            print(f"error: could not run ({type(exc).__name__})", file=sys.stderr)
+            return 2
+
+    return wrapped
 
 
 def scan_file(path: Path, check: CheckConfig) -> list[str]:
@@ -134,6 +181,7 @@ def _load_check_policy() -> CheckConfig:
     return load_config(config_path).check
 
 
+@fail_closed
 def cmd_check_config(args: argparse.Namespace) -> int:
     """Entry point for `stackward check-config FILE...`.
 
@@ -156,6 +204,12 @@ def cmd_check_config(args: argparse.Namespace) -> int:
     `str(exc)`, for the same reason `describe_yaml_error` avoids it: an
     unanticipated exception's text is not something this module can vouch
     for as free of file content.
+
+    That per-file guard only covers the scan loop. Anything policy-loading
+    raises other than `ConfigError` — this function's own `except
+    ConfigError` below only catches that one type — is caught instead by
+    the `@fail_closed` decorator wrapping this function, for the same
+    "never exit 1 for a reason other than a real finding" guarantee.
     """
     try:
         check = _load_check_policy()

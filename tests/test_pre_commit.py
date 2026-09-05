@@ -154,6 +154,58 @@ def test_diff_filter_without_r_would_have_missed_the_renamed_file(repo, monkeypa
 
 
 # ---------------------------------------------------------------------------
+# T matters too: converting an already-tracked stack config into a
+# symlink stages as a type-change (`T`), which `ACMR` alone excludes just
+# as it excludes an unmerged path -- ruled during review as a genuine
+# fail-open gap in the brief's own literal `--diff-filter=ACMR`, closed by
+# adding `T`.
+# ---------------------------------------------------------------------------
+
+
+def test_tracked_config_replaced_by_a_symlink_exits_2_not_0(repo, monkeypatch, capsys):
+    """A symlink's staged "content" (via `git show ":<path>"`) is its
+    target path, not YAML -- so once the type-change is actually seen by
+    the scan, it fails closed (exit 2) rather than passing as clean or
+    silently vanishing from the listing entirely."""
+    write(repo, "Pulumi.dev.yaml", "name: myproject\n")
+    stage(repo, "Pulumi.dev.yaml")
+    _git(repo, "commit", "-q", "-m", "add config")
+
+    (repo / "Pulumi.dev.yaml").unlink()
+    (repo / "Pulumi.dev.yaml").symlink_to("/etc/hostname")
+    stage(repo, "Pulumi.dev.yaml")
+
+    # Prove the premise: git really did record this as a type-change, not
+    # a plain modify.
+    status = _git(repo, "diff", "--cached", "--name-status").stdout
+    assert status.startswith("T")
+
+    assert run_pre_commit(repo, monkeypatch) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "Pulumi.dev.yaml" in captured.err
+
+
+def test_diff_filter_without_t_would_have_missed_the_symlinked_config(repo, monkeypatch):
+    """Direct proof of why `T` is in the filter: with it excluded, a
+    tracked stack config converted to a symlink is invisible to the
+    staged-file listing -- exactly the way an unmerged path is invisible
+    to a filter that omits `U` -- so the commit would exit 0 instead of
+    ever reaching the scan that would refuse it."""
+    write(repo, "Pulumi.dev.yaml", "name: myproject\n")
+    stage(repo, "Pulumi.dev.yaml")
+    _git(repo, "commit", "-q", "-m", "add config")
+
+    (repo / "Pulumi.dev.yaml").unlink()
+    (repo / "Pulumi.dev.yaml").symlink_to("/etc/hostname")
+    stage(repo, "Pulumi.dev.yaml")
+
+    monkeypatch.chdir(repo)
+    assert pre_commit_module._staged_paths("ACMR") == []
+    assert pre_commit_module._staged_paths("ACMRT") == ["Pulumi.dev.yaml"]
+
+
+# ---------------------------------------------------------------------------
 # Pulumi state exports: refused outright, before any content check.
 # ---------------------------------------------------------------------------
 
@@ -434,6 +486,30 @@ def test_unanticipated_scan_exception_exits_2_not_1(repo, monkeypatch, capsys):
     assert captured.out == ""
     assert "Pulumi.dev.yaml" in captured.err
     assert "RuntimeError" in captured.err
+
+
+def test_policy_load_failure_exits_2_not_1(repo, monkeypatch, capsys):
+    """A bare exception from policy loading -- not `ConfigError`, which
+    `_load_check_policy`'s own caller already handles -- must not escape
+    `cmd_pre_commit` uncaught. Concretely: `find_repo_config` walks
+    upward through parent directories with plain `.is_file()`/`.exists()`
+    calls and no try/except of its own, so a `PermissionError` on a
+    non-traversable parent would surface as a bare `OSError`. Without the
+    `@fail_closed` decorator on `cmd_pre_commit`, that would propagate
+    out of `main()` entirely and exit 1 by Python's own default --
+    misreporting "credential found" for an invocation that never got as
+    far as loading policy, let alone scanning a file."""
+    write(repo, "Pulumi.dev.yaml", "name: myproject\n")
+    stage(repo, "Pulumi.dev.yaml")
+
+    def boom():
+        raise OSError("simulated permission error walking parent directories")
+
+    monkeypatch.setattr(pre_commit_module, "find_repo_config", boom)
+    assert run_pre_commit(repo, monkeypatch) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "OSError" in captured.err
 
 
 def test_a_real_finding_still_prints_even_when_another_file_errors(

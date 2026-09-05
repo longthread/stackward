@@ -63,7 +63,7 @@ import yaml
 
 from ..config import CheckConfig, ConfigError, find_repo_config, load_config
 from ..nets.heuristic import DocumentError, find_plaintext_credentials
-from .check_config import CheckError, describe_yaml_error
+from .check_config import CheckError, describe_yaml_error, fail_closed
 
 _STATE_EXPORT_NAME = "state.json"
 _STATE_EXPORT_SUFFIX = ".stack-export.json"
@@ -106,15 +106,25 @@ def _staged_paths(diff_filter: str) -> list[str]:
     path containing a space, a newline, or a non-ASCII byte, which would
     corrupt exactly the paths this command exists to protect.
 
-    Called with `"ACMR"` for the files actually being committed (`R`
-    matters: a rename plus an edit stages as `R`, and a filter that
-    omitted it would let that change bypass every check below) and,
-    separately, with `"U"` to find anything unmerged. Deliberately never
-    called with the two combined (`"ACMRU"`): an unmerged path must be
-    caught by the dedicated check in `cmd_pre_commit` and refused before
-    anything else runs, not folded into the "files to scan" list, where
-    finding it there could be mistaken for having already decided what to
-    do with it.
+    Called with `"ACMRT"` for the files actually being committed, and
+    separately with `"U"` to find anything unmerged.
+
+    `R` matters: a rename plus an edit stages as `R`, and a filter that
+    omitted it would let that change bypass every check below. `T`
+    (type-change) matters for the same reason, discovered in review of
+    the brief's own literal `"ACMR"`: converting an *already-tracked*
+    `Pulumi.<stack>.yaml` into a symlink stages as `T`, not `A`/`M`/`R` --
+    without `T`, that file would vanish from this listing exactly the way
+    an unmerged path does, and the credential scan below would never see
+    it at all. A *new* symlink stages as `A`, which `"ACMRT"` already
+    covered even before `T` was added; `T` closes the gap for a symlink
+    replacing a file git was already tracking as ordinary content.
+
+    Deliberately never called combined with `"U"` (`"ACMRTU"`): an
+    unmerged path must be caught by the dedicated check in
+    `cmd_pre_commit` and refused before anything else runs, not folded
+    into the "files to scan" list, where finding it there could be
+    mistaken for having already decided what to do with it.
     """
     raw = _run_git(
         ["diff", "--cached", "--name-only", "-z", f"--diff-filter={diff_filter}"]
@@ -217,6 +227,7 @@ def _load_check_policy() -> CheckConfig:
     return load_config(config_path).check
 
 
+@fail_closed
 def cmd_pre_commit(_args: argparse.Namespace) -> int:
     """Entry point for `stackward pre-commit` -- the hook body's whole job.
 
@@ -231,22 +242,31 @@ def cmd_pre_commit(_args: argparse.Namespace) -> int:
     or an unanticipated exception. Python's own default for an uncaught
     exception is exit 1, which here would misreport "a credential was
     found" for a file this command never actually finished evaluating --
-    every per-file scan below is wrapped accordingly.
+    every per-file scan below is wrapped accordingly, and the `@fail_closed`
+    decorator above is the outer boundary that catches anything else this
+    function does not: policy loading (`_load_check_policy`) and the
+    staged-file listing (`_staged_paths`) both run *outside* the per-file
+    loop, guarded only by `except ConfigError` / `except CheckError`
+    respectively, so a different, unanticipated exception from either --
+    a bare `OSError` from `find_repo_config` walking through an
+    unreadable parent directory, say -- needs `@fail_closed` to avoid
+    escaping uncaught and exiting 1 by Python's own default.
 
     Checks run in this fixed order, each a hard gate before the next:
 
     1. Unmerged index entries. Not a content check at all -- a
        precondition on whether the index can be trusted enough to read.
-       `--diff-filter=ACMR`, used for everything below, silently *excludes*
-       unmerged paths (git reports them as bare status `U`, which matches
-       neither `A`, `C`, `M` nor `R`), so without this dedicated check an
-       unmerged file would never reach either check below and this command
-       would report "clean" for a commit git itself already refuses to
-       allow. Checked for *any* unmerged path, not only ones that look
-       like a stack config or state export: git's own refusal to commit
-       ("Committing is not possible because you have unmerged files") is
-       likewise unconditional on which path is unmerged, and this command
-       can be invoked directly, bypassing that refusal.
+       `--diff-filter=ACMRT`, used for everything below, silently
+       *excludes* unmerged paths (git reports them as bare status `U`,
+       which matches none of `A`, `C`, `M`, `R`, `T`), so without this
+       dedicated check an unmerged file would never reach either check
+       below and this command would report "clean" for a commit git
+       itself already refuses to allow. Checked for *any* unmerged path,
+       not only ones that look like a stack config or state export: git's
+       own refusal to commit ("Committing is not possible because you
+       have unmerged files") is likewise unconditional on which path is
+       unmerged, and this command can be invoked directly, bypassing that
+       refusal.
     2. Staged Pulumi state exports (`state.json`, `*.stack-export.json`) --
        refused outright, before the credential scan below even starts.
     3. The heuristic net, over every staged `Pulumi.<stack>.yaml`.
@@ -266,7 +286,7 @@ def cmd_pre_commit(_args: argparse.Namespace) -> int:
         return 2
 
     try:
-        staged = _staged_paths("ACMR")
+        staged = _staged_paths("ACMRT")
     except CheckError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
