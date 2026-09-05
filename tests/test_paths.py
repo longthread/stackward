@@ -7,6 +7,12 @@ import pytest
 
 from stackward.paths import parse, render
 
+# Spelled out via concatenation rather than string literals with `\\` runs,
+# so the number of actual backslash characters in each fixture is unambiguous
+# at the call site.
+BACKSLASH = "\\"
+TWO_BACKSLASHES = BACKSLASH * 2
+
 # Canonical texts: render(parse(x)) must reproduce x exactly. Every entry
 # here is already in the form `render` would itself produce.
 CANONICAL_TEXTS = [
@@ -20,6 +26,7 @@ CANONICAL_TEXTS = [
     "a.1",
     "[0]",
     "a[0][1]",
+    '["a\\\\b"]',  # a literal backslash, doubled
 ]
 
 # Segment lists: parse(render(y)) must reproduce y exactly. Includes forms
@@ -40,6 +47,9 @@ SEGMENT_LISTS: list[list[str | int]] = [
     ["a", 0, "b"],  # dot must be restored after a bracket
     ["a", 0, 1],  # two indices in a row, no dot between brackets
     ["a", 0, "b.c"],  # a quoted bracket right after another bracket
+    ["a" + BACKSLASH + "b"],  # one backslash, no other reason to quote
+    ["a." + BACKSLASH],  # quoted for the dot, then ends in one backslash
+    ["a." + TWO_BACKSLASHES],  # quoted for the dot, then ends in two backslashes
 ]
 
 
@@ -172,3 +182,48 @@ def test_render_rejects_negative_index():
 def test_render_rejects_empty_segment_list():
     with pytest.raises(ValueError):
         render([])
+
+
+def test_backslash_alone_is_quoted_and_escaped_as_double_backslash():
+    """A key with no dot/bracket/quote but containing `\\` still has to be
+    quoted — `\\` is only safe to leave bare if it never means anything
+    special, and it does mean something special once it appears inside a
+    quoted key elsewhere."""
+    segments = ["a" + BACKSLASH + "b"]
+    text = render(segments)
+    assert text == '["a\\\\b"]'
+    assert parse(text) == segments
+
+
+def test_quoted_key_ending_in_one_literal_backslash_round_trips():
+    """Regression: escaping only `"` (never `\\`) let a trailing backslash
+    merge with the closing delimiter's quote on decode, so a key quoted for
+    an unrelated reason (here, the dot) that also ends in `\\` failed to
+    round-trip — `parse(render(y))` raised instead of reproducing `y`."""
+    segments = ["a." + BACKSLASH]
+    assert parse(render(segments)) == segments
+
+
+def test_quoted_key_ending_in_two_literal_backslashes_round_trips():
+    segments = ["a." + TWO_BACKSLASHES]
+    assert parse(render(segments)) == segments
+
+
+def test_leading_zero_in_list_index_is_rejected_as_malformed():
+    """`render` never produces "01" for index 1; tolerating it on parse would
+    give the same index two silently-equivalent spellings."""
+    with pytest.raises(ValueError) as exc_info:
+        parse("a[01]")
+    message = str(exc_info.value)
+    assert "position 2" in message
+    assert "a[01]" not in message
+
+
+def test_invalid_escape_sequence_raises_value_error_naming_the_position():
+    """A `\\` inside a quoted key that isn't followed by `"` or `\\` is
+    malformed, not a literal backslash silently passed through."""
+    with pytest.raises(ValueError) as exc_info:
+        parse('a["b\\nc"]')
+    message = str(exc_info.value)
+    assert "position 4" in message  # the stray backslash itself
+    assert "b\\nc" not in message

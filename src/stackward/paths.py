@@ -1,14 +1,15 @@
 """The one config-path grammar, shared by findings, manifests and matching.
 
 Pulumi's `--path` syntax is dotted segments (`a.b`), `[n]` for a list index,
-and `["..."]` for a key that cannot be written bare — one containing `.`, `[`,
-`]` or `"`, or the empty string. Everything downstream (the finding a scan
-prints, the key a manifest stores, the walk that matches config data against
-policy) needs to agree on exactly this representation; if the gate and the
-matcher each grew their own path formatter, a key that round-trips through one
-and not the other would silently stop matching. So there is exactly one
-`parse`/`render` pair, here, and nothing else in the tool writes a path by
-hand.
+and `["..."]` for a key that cannot be written bare — one containing a dot,
+a bracket, a double quote, a backslash, or the empty string. Inside the
+quotes, a literal double quote or backslash is escaped by prefixing it with
+a backslash. Everything downstream (the finding a scan prints, the key a
+manifest stores, the walk that matches config data against policy) needs to
+agree on exactly this representation; if the gate and the matcher each grew
+their own path formatter, a key that round-trips through one and not the
+other would silently stop matching. So there is exactly one `parse`/`render`
+pair, here, and nothing else in the tool writes a path by hand.
 
 The one property that has to hold, in both directions:
 
@@ -25,8 +26,12 @@ never has to coerce.
 from __future__ import annotations
 
 # Characters that cannot appear in a bare or dotted segment. A key containing
-# any of these, or the empty string, must be written `["..."]`.
-_NEEDS_QUOTING = frozenset('.[]"')
+# any of these, or the empty string, must be written `["..."]`. `\` is in
+# this set *because* it is the escape prefix inside a bracketed key — once
+# backslash means something inside brackets, a bare/dotted key containing one
+# has to go through the same quoted-and-escaped regime, not a bare one where
+# the same character would mean something else (itself, literally).
+_NEEDS_QUOTING = frozenset('.[]"\\')
 
 
 def _needs_quoting(key: str) -> bool:
@@ -59,7 +64,10 @@ def render(segments: list[str | int]) -> str:
                 )
             parts.append(f"[{segment}]")
         elif _needs_quoting(segment):
-            parts.append('["{}"]'.format(segment.replace('"', '\\"')))
+            # Escape `\` before `"` — reversing the order would double-escape
+            # a backslash that a prior `"` -> `\"` pass had just inserted.
+            escaped = segment.replace("\\", "\\\\").replace('"', '\\"')
+            parts.append(f'["{escaped}"]')
         elif index == 0:
             parts.append(segment)
         else:
@@ -94,10 +102,19 @@ def _scan_bracket(text: str, pos: int) -> tuple[str | int, int]:
         closed = False
         while pos < len(text):
             char = text[pos]
-            if char == "\\" and pos + 1 < len(text) and text[pos + 1] == '"':
-                chars.append('"')
-                pos += 2
-                continue
+            if char == "\\":
+                # The only two valid escapes: `\"` for a literal quote and
+                # `\\` for a literal backslash. Anything else after a `\`
+                # (including end of string) is malformed, not "an unescaped
+                # backslash" — a lone `\` right before the closing `"` would
+                # otherwise be indistinguishable from an escaped quote.
+                if pos + 1 < len(text) and text[pos + 1] in "\\\"":
+                    chars.append(text[pos + 1])
+                    pos += 2
+                    continue
+                raise ValueError(
+                    f"malformed path at position {pos}: invalid escape sequence"
+                )
             if char == '"':
                 closed = True
                 pos += 1
@@ -120,7 +137,12 @@ def _scan_bracket(text: str, pos: int) -> tuple[str | int, int]:
     if pos >= len(text):
         raise ValueError(f"malformed path at position {start}: unterminated '[' bracket")
     content = text[digits_start:pos]
-    if not content or any(char not in "0123456789" for char in content):
+    # A leading zero (other than "0" itself) is rejected rather than
+    # tolerated: `render` never produces one, and accepting "01" as a second,
+    # silently-equivalent spelling of index 1 is exactly the kind of leniency
+    # this grammar exists to avoid.
+    has_leading_zero = len(content) > 1 and content[0] == "0"
+    if not content or has_leading_zero or any(char not in "0123456789" for char in content):
         raise ValueError(f"malformed path at position {digits_start}: invalid list index")
     return int(content), pos + 1
 
