@@ -87,12 +87,18 @@ import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .. import paths
 from ..config import Config, ConfigError, find_repo_config, load_config
 from ..store import warn_if_permissive
 from .check_config import fail_closed
+
+if TYPE_CHECKING:
+    # Never imported at runtime -- see `_build_secret_source`'s own
+    # docstring, and `providers/__init__.py`'s, on why provider modules stay
+    # off this module's own top level.
+    from ..providers import SecretSource
 
 # How long any single `pulumi` invocation (a `config set` or a `config get`)
 # is allowed to run before this module gives up on it and reports that one
@@ -415,6 +421,59 @@ def resolve_source_files(config: Config, repo_root: Path, stack: str | None) -> 
     return resolved
 
 
+_SECRET_SOURCE_PROVIDERS = frozenset({"dotenv", "env", "command"})
+
+
+def _build_secret_source(
+    config: Config, repo_root: Path, stack: str | None
+) -> "SecretSource":
+    """The `SecretSource` `[secrets.source].provider` selects (`"dotenv"`
+    when the table or the key is absent, preserving today's environment-
+    then-files behaviour unchanged).
+
+    Provider modules are imported here, function-locally -- never at this
+    module's own top level -- for the same reason `session.
+    _build_credential_store` does it the same way: `cli.py` imports this
+    module unconditionally, so a module-scope import here would put a
+    provider on every `stackward` invocation's import graph, `check-config`
+    and `pre-commit` included -- see `providers/__init__.py`'s module
+    docstring. A caller that never calls this function -- every gate-path
+    command -- never triggers any of these imports.
+    """
+    source = config.secrets.get("source", {})
+    if not isinstance(source, dict):
+        raise SetSecretsError("secrets.source must be a table")
+
+    provider = source.get("provider", "dotenv")
+    if not isinstance(provider, str):
+        raise SetSecretsError("secrets.source.provider must be a string")
+
+    if provider == "dotenv":
+        from ..providers.dotenv import DotenvSecretSource
+
+        files = resolve_source_files(config, repo_root, stack)
+        return DotenvSecretSource(os.environ, files)
+    if provider == "env":
+        from ..providers.env import EnvSecretSource
+
+        return EnvSecretSource(os.environ)
+    if provider == "command":
+        from ..providers.command import CommandSecretSource
+
+        command = source.get("command")
+        if not isinstance(command, list) or not command or not all(
+            isinstance(item, str) for item in command
+        ):
+            raise SetSecretsError(
+                "secrets.source.command must be a non-empty list of strings"
+            )
+        return CommandSecretSource(command)
+    raise SetSecretsError(
+        f"secrets.source.provider must be one of {sorted(_SECRET_SOURCE_PROVIDERS)!r}, "
+        f"got {provider!r}"
+    )
+
+
 def parse_env_file(path: Path) -> dict[str, str]:
     """Parse one `KEY=VALUE` file: blank lines and `#` comments are ignored, a
     leading `export ` is stripped from the key side, and exactly one matched
@@ -547,7 +606,7 @@ def _pulumi_config_get(
 
 def _publish_entries(
     manifest: ProjectManifest,
-    source: LocalSecretSource,
+    source: "SecretSource",
     *,
     pulumi: str | None,
     stack: str | None,
@@ -559,23 +618,36 @@ def _publish_entries(
     publishing each one with its own table's mode — one `EntryOutcome` per
     entry, regardless of whether it succeeded.
 
-    Every failure mode here — an unresolved required path, a `pulumi` timeout,
-    a missing `pulumi` binary, a non-zero `pulumi` exit — is recorded on its
-    own `EntryOutcome` and the loop continues to the next entry rather than
-    raising: a half-finished rotation that stops on the first failure and
-    exits non-zero has already left every entry after it unset, and reports
-    that failure no differently than one that finishes and simply fails to
+    Every failure mode here — an unresolved required path, a provider that
+    could not resolve a name at all, a `pulumi` timeout, a missing `pulumi`
+    binary, a non-zero `pulumi` exit — is recorded on its own `EntryOutcome`
+    and the loop continues to the next entry rather than raising: a
+    half-finished rotation that stops on the first failure and exits
+    non-zero has already left every entry after it unset, and reports that
+    failure no differently than one that finishes and simply fails to
     report which entries did not land. The order entries are declared within
     each table (a `dict`, so insertion order — the order the TOML was written
     in) is preserved throughout, since it is what makes "the failing entry
     was in the middle" a meaningful, reproducible scenario to test.
+
+    A `source.resolve(name)` that raises `ProviderError` is a `failed`
+    outcome, never folded into `skipped` — an unresolved name and a provider
+    that could not answer are different facts (see `providers/__init__.py`),
+    and treating the second as the first would silently skip a secret the
+    operator believes their remote store actually holds.
     """
+    from ..providers import ProviderError  # local: see `_build_secret_source`
+
     entries = [(path, name, "secret") for path, name in manifest.secret.items()]
     entries += [(path, name, "plaintext") for path, name in manifest.plaintext.items()]
 
     outcomes: list[EntryOutcome] = []
     for path, name, mode in entries:
-        value = source.resolve(name)
+        try:
+            value = source.resolve(name)
+        except ProviderError as exc:
+            outcomes.append(EntryOutcome(path, name, "failed", f"provider error: {exc}"))
+            continue
         if not value:
             if path in manifest.required:
                 outcomes.append(EntryOutcome(path, name, "failed", "required but unresolved"))
@@ -620,7 +692,7 @@ def _config_path_for_name(entries: dict[str, str], name: str) -> str | None:
 
 def _check_drift(
     manifest: ProjectManifest,
-    source: LocalSecretSource,
+    source: "SecretSource",
     *,
     pulumi: str | None,
     stack: str | None,
@@ -630,9 +702,22 @@ def _check_drift(
     value and published `managed` value disagree — see the module docstring
     for exactly which states are silent on purpose. Never called under
     `--dry-run`: drift detection reads `pulumi config get`, which is a real
-    invocation, and dry-run's contract is to run nothing at all."""
+    invocation, and dry-run's contract is to run nothing at all.
+
+    A provider that raises resolving `bootstrap` is reported as a warning,
+    the same channel every other drift issue uses, rather than folded into
+    the silent "nothing to compare" state a `None`/`""` bootstrap value gets
+    — the three silent states this function's docstring names are all
+    legitimate absences, and a provider failure is not one of them (see
+    `providers/__init__.py`). It does not change this command's exit code:
+    drift detection has never affected the exit code (only `_publish_entries`'
+    outcomes do), and a provider failure resolving `bootstrap` here is no
+    exception to that.
+    """
     if pulumi is None:
         return
+    from ..providers import ProviderError  # local: see `_build_secret_source`
+
     # `secret` and `plaintext` are guaranteed disjoint by
     # `parse_project_manifest`, so this merge cannot silently drop or shadow
     # an entry from either side -- `managed` may name a path in either table,
@@ -644,7 +729,15 @@ def _check_drift(
     # dict, raising `AttributeError` rather than evaluating the pair at all.
     published_entries = {**manifest.secret, **manifest.plaintext}
     for pair in manifest.drift_pairs:
-        bootstrap_value = source.resolve(pair.bootstrap)
+        try:
+            bootstrap_value = source.resolve(pair.bootstrap)
+        except ProviderError as exc:
+            print(
+                f"warning: drift pair {pair.bootstrap!r}/{pair.managed!r}: "
+                f"could not resolve {pair.bootstrap!r}: {exc}",
+                file=sys.stderr,
+            )
+            continue
         if not bootstrap_value:
             continue
 
@@ -699,9 +792,7 @@ def cmd_set_secrets(args: argparse.Namespace) -> int:
         repo_root = config_path.parent
         project = select_project(config, repo_root, Path.cwd())
         manifest = parse_project_manifest(config.secrets[project], project)
-        files = resolve_source_files(config, repo_root, args.stack)
-        file_values = [parse_env_file(f) for f in files if f.exists()]
-        source = LocalSecretSource(os.environ, file_values)
+        source = _build_secret_source(config, repo_root, args.stack)
     except (ConfigError, SetSecretsError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

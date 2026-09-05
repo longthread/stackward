@@ -139,6 +139,26 @@ class EmptyPasswordError(CryptoError):
     reasoning `store.select_profile` applies to an empty `STACKWARD_PROFILE`."""
 
 
+class EncodingError(CryptoError):
+    """A password or associated-data string cannot be encoded as UTF-8: it
+    contains a lone surrogate.
+
+    `os.environ` decodes a byte sequence that was never valid UTF-8 using
+    Python's `surrogateescape` error handler rather than raising, so a
+    provider that reads a store password (`STACKWARD_PASSWORD`) or any other
+    value out of the process environment can hand this module a string that
+    round-trips through `str` but cannot be re-encoded. Without this,
+    `_normalise`'s `str.encode("utf-8")` — and the identical `aad.encode
+    ("utf-8")` in `seal`/`unseal` — raise a bare `UnicodeEncodeError`,
+    letting it escape past every `except CryptoError` this codebase's
+    docstrings promise stays fail-closed. Found by review while auditing
+    Task 6's store ahead of Task 11 feeding it environment-sourced values;
+    confirmed empirically that the failure is here, in the raw encode of an
+    unescaped string, and not in `seal_json`'s `json.dumps(...,
+    ensure_ascii=True)` output, which escapes a lone surrogate to plain
+    ASCII (`\\udc80`) and therefore encodes without error."""
+
+
 def _normalise(password: str) -> bytes:
     """NFC-normalise and encode, refusing a password that is not one.
 
@@ -149,7 +169,15 @@ def _normalise(password: str) -> bytes:
     """
     if not password.strip():
         raise EmptyPasswordError("a password is required")
-    return unicodedata.normalize("NFC", password).encode("utf-8")
+    normalised = unicodedata.normalize("NFC", password)
+    try:
+        return normalised.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        # See `EncodingError`: reachable for a password read out of the
+        # process environment that was never valid UTF-8 to begin with.
+        raise EncodingError(
+            "password contains a character that cannot be encoded as UTF-8"
+        ) from exc
 
 
 def describe_value(value: Any) -> str:
@@ -239,6 +267,20 @@ def _derive(password: str, salt: bytes, params: dict[str, int]) -> bytes:
         ) from exc
 
 
+def _encode_aad(aad: str) -> bytes:
+    """`aad.encode("utf-8")`, with a lone surrogate mapped to `EncodingError`
+    rather than a bare `UnicodeEncodeError` — see `EncodingError`. Every
+    caller in this codebase passes a profile name or a fixed literal, both
+    already restricted to safe charsets, but this module has no way to see
+    a future caller that does not, and the encode is one line either way."""
+    try:
+        return aad.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise EncodingError(
+            "associated data contains a character that cannot be encoded as UTF-8"
+        ) from exc
+
+
 def seal(plaintext: bytes, password: str, aad: str) -> dict[str, Any]:
     """Encrypt `plaintext` under `password`, binding `aad` into the tag.
 
@@ -257,7 +299,7 @@ def seal(plaintext: bytes, password: str, aad: str) -> dict[str, Any]:
         "lanes": ARGON2ID_LANES,
     }
     key = _derive(password, salt, params)
-    ciphertext = AESGCM(key).encrypt(nonce, plaintext, aad.encode("utf-8"))
+    ciphertext = AESGCM(key).encrypt(nonce, plaintext, _encode_aad(aad))
     return {
         "v": ENVELOPE_VERSION,
         "kdf": {"name": KDF_NAME, **params},
@@ -314,7 +356,7 @@ def unseal(envelope: Any, password: str, aad: str) -> bytes:
 
     key = _derive(password, salt, params)
     try:
-        return AESGCM(key).decrypt(nonce, ciphertext, aad.encode("utf-8"))
+        return AESGCM(key).decrypt(nonce, ciphertext, _encode_aad(aad))
     except InvalidTag as exc:
         raise DecryptionError(
             "could not decrypt: wrong password, or the sealed data does not "
@@ -329,12 +371,23 @@ def seal_json(payload: Any, password: str, aad: str) -> dict[str, Any]:
     on the order a dict happened to be built in — the length of the ciphertext
     already leaks the size of the payload, and there is no reason to let its
     construction order leak too.
+
+    `json.dumps`'s default `ensure_ascii=True` already escapes a lone
+    surrogate in `payload` to plain ASCII (`\\udc80`, six literal
+    characters), so the `.encode("utf-8")` below cannot itself raise on one —
+    confirmed empirically, not assumed. The `try` stays anyway, as a second
+    line of defence at the one call in this module a future change to
+    `ensure_ascii` or `separators` could put back in `_normalise`'s
+    situation, and because the cost of guarding an unreachable line here is
+    one `except` clause.
     """
-    return seal(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"),
-        password,
-        aad,
-    )
+    try:
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise EncodingError(
+            "payload contains a character that cannot be encoded as UTF-8"
+        ) from exc
+    return seal(encoded, password, aad)
 
 
 def unseal_json(envelope: Any, password: str, aad: str) -> Any:

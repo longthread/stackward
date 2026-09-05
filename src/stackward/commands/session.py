@@ -122,6 +122,7 @@ import subprocess
 import sys
 from collections.abc import Mapping
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import quote, urlencode
 
 from ..config import ConfigError, find_repo_config, load_config
@@ -129,10 +130,16 @@ from ..store import (
     Profile,
     StoreError,
     load_store_config,
-    resolve_credentials,
     select_profile,
 )
 from .check_config import fail_closed
+
+if TYPE_CHECKING:
+    # Never imported at runtime -- see `_build_credential_store`'s own
+    # docstring on why provider modules stay off this module's own top
+    # level. `TYPE_CHECKING` is always `False` when this file actually runs,
+    # so this line never touches `sys.modules`.
+    from ..providers import CredentialStore
 
 # Read once, never printed: the non-interactive escape hatch for `exec`/
 # `shell` in an environment with no controlling terminal (CI, most notably).
@@ -430,12 +437,59 @@ def _child_env(credentials: Mapping[str, str], backend_url: str) -> dict[str, st
     return env
 
 
+def _build_credential_store(
+    profile: Profile, *, directory: Path | None
+) -> "CredentialStore":
+    """The `CredentialStore` `profile.credentials`'s `provider` selects
+    (`"file"` when the table or the key is absent, preserving today's
+    behaviour unchanged).
+
+    Provider modules are imported here, function-locally -- never at this
+    module's own top level -- for the reason `providers/__init__.py`'s
+    module docstring states: `cli.py` imports this module unconditionally,
+    so a module-scope import here would put a provider on every
+    `stackward` invocation's import graph, `check-config` and `pre-commit`
+    included, which is exactly what the gate-path invariant forbids. A
+    caller that never calls this function -- which is every gate-path
+    command -- never triggers any of these imports.
+
+    `"file"` reads the store password now, at the same point `_prepare_env`
+    always has -- after the backend guard, never before it (see
+    `test_prepare_env_checks_the_backend_guard_before_reading_a_password`).
+    Only `"file"` needs one; `"env"` and `"command"` never prompt.
+    """
+    provider = profile.credentials.get("provider", "file")
+    if provider == "file":
+        from ..providers.file import FileCredentialStore
+
+        return FileCredentialStore(_read_store_password(), directory=directory)
+    if provider == "env":
+        from ..providers.env import EnvCredentialStore
+
+        return EnvCredentialStore(CREDENTIAL_NAMES)
+    if provider == "command":
+        from ..providers.command import CommandCredentialStore
+
+        command = profile.credentials.get("command")
+        if not isinstance(command, list) or not command or not all(
+            isinstance(item, str) for item in command
+        ):
+            raise SessionError(
+                f"profile {profile.name!r}: credentials provider 'command' needs "
+                "a non-empty 'command' list of strings"
+            )
+        return CommandCredentialStore(command)
+    raise SessionError(
+        f"profile {profile.name!r}: unknown credentials provider {provider!r}"
+    )
+
+
 def _prepare_env(
     explicit_profile: str | None, *, directory: Path | None = None
 ) -> dict[str, str]:
-    """Resolve the profile, enforce the backend guard, decrypt its
-    credentials and return the exact environment `exec`/`shell` must run
-    their child in.
+    """Resolve the profile, enforce the backend guard, resolve its
+    credentials through whichever `CredentialStore` its `provider` selects,
+    and return the exact environment `exec`/`shell` must run their child in.
 
     Raises `StoreError`, `ConfigError` or `SessionError` and returns nothing
     partial: every step that can fail runs before `_child_env` builds
@@ -445,8 +499,19 @@ def _prepare_env(
     profile = _resolve_profile(explicit_profile, directory=directory)
     url = _compose_backend_url(profile)
     _check_backend_guard(url)
-    password = _read_store_password()
-    credentials = resolve_credentials(profile.name, password, directory=directory)
+    credential_store = _build_credential_store(profile, directory=directory)
+
+    from ..providers import ProviderError  # local: see `_build_credential_store`
+
+    try:
+        credentials = credential_store.resolve(profile.name)
+    except ProviderError as exc:
+        # `file` never raises this -- `store.StoreError` propagates
+        # unchanged, per `providers.file`'s own docstring -- so this branch
+        # is reachable only for a provider (`command`, or a future one) that
+        # actually failed, never for `file`'s existing, already-tested
+        # error paths.
+        raise SessionError(str(exc)) from exc
     _require_credential_names(credentials, profile.name)
     return _child_env(credentials, url)
 

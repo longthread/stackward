@@ -103,7 +103,9 @@ VERIFIER_PLAINTEXT = "stackward credential store"
 _PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 _TOP_LEVEL_KEYS = frozenset({"default_profile", "profile"})
-_PROFILE_KEYS = frozenset({"backend_url", "bucket", "prefix", "endpoint", "region"})
+_PROFILE_KEYS = frozenset(
+    {"backend_url", "bucket", "prefix", "endpoint", "region", "credentials"}
+)
 _COMPONENT_KEYS = ("bucket", "prefix", "endpoint", "region")
 
 
@@ -147,6 +149,16 @@ class Profile:
     expects is knowledge about Pulumi, not about profiles, and it belongs with
     the command that runs `pulumi login`. This module carries the components as
     structured data and stops there.
+
+    `credentials` is the raw, otherwise-unvalidated `[profile.<name>.
+    credentials]` table -- `provider` (a string, defaulting to `"file"` when
+    the table or the key is absent) and whatever else a chosen provider
+    needs (a remote provider's `command`, say). This module validates only
+    that the table exists and that `provider`, if present, is a string; it
+    does not know which providers exist any more than `config.py`'s
+    `_build_secrets` knows what `[secrets.*]` means -- that is
+    `providers/__init__.py`'s vocabulary, not this one's, and this module
+    does not import it (see that package's own module docstring for why).
     """
 
     name: str
@@ -155,6 +167,7 @@ class Profile:
     prefix: str | None = None
     endpoint: str | None = None
     region: str | None = None
+    credentials: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def has_components(self) -> bool:
@@ -325,6 +338,26 @@ def _require_str(table: Mapping[str, Any], key: str, where: str) -> str | None:
     return value
 
 
+def _build_credentials_table(raw: Any, where: str) -> Mapping[str, Any]:
+    """Shape only: a table, with `provider` a string if present at all.
+
+    Everything else in the table (a remote provider's `command`, say) is
+    passed through unexamined, for the same reason `config._build_secrets`
+    defers `[secrets.*]`'s interior to the module that knows its semantics:
+    this one does not know which providers exist, and inventing a whitelist
+    here would either reject a provider this module has never heard of or
+    have to be kept in step with `providers/__init__.py` by hand.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise StoreError(f"{where}.credentials must be a table")
+    provider = raw.get("provider")
+    if provider is not None and not isinstance(provider, str):
+        raise StoreError(f"{where}.credentials.provider must be a string")
+    return raw
+
+
 def _build_profile(name: str, raw: Any) -> Profile:
     if not isinstance(raw, dict):
         raise StoreError(f"profile.{name} must be a table")
@@ -341,6 +374,7 @@ def _build_profile(name: str, raw: Any) -> Profile:
         prefix=_require_str(raw, "prefix", where),
         endpoint=_require_str(raw, "endpoint", where),
         region=_require_str(raw, "region", where),
+        credentials=_build_credentials_table(raw.get("credentials"), where),
     )
 
     # Exactly one form. Both would leave two answers to "which backend?" with

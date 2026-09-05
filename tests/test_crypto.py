@@ -350,3 +350,92 @@ def test_a_backend_that_cannot_do_argon2id_fails_closed_as_a_crypto_error(monkey
     monkeypatch.setattr(crypto, "Argon2id", unsupported)
     with pytest.raises(CryptoError):
         seal(MARKER, PASSWORD, AAD)
+
+
+# ---------------------------------------------------------------------------
+# A lone surrogate — reachable once a provider feeds this module a password
+# read out of `os.environ`, which Python decodes with `surrogateescape`
+# rather than raising. See `EncodingError`.
+# ---------------------------------------------------------------------------
+
+# One low surrogate `os.environ` would actually produce for a byte that was
+# never valid UTF-8 (`os.fsdecode(b"\x80")`, on a POSIX filesystem encoding) —
+# not an arbitrary codepoint picked for the shape alone.
+SURROGATE_PASSWORD = "before\udc80after"
+
+
+def test_a_lone_surrogate_password_fails_as_a_crypto_error_not_a_bare_one():
+    """`_normalise`'s `str.encode("utf-8")` is not JSON-escaped the way a
+    `seal_json` payload is, so a password containing a lone surrogate must
+    raise `EncodingError` (a `CryptoError`), not let Python's own
+    `UnicodeEncodeError` escape past every `except CryptoError` boundary in
+    `store.py`."""
+    with pytest.raises(crypto.EncodingError):
+        seal(MARKER, SURROGATE_PASSWORD, AAD)
+
+
+def test_encoding_error_is_a_crypto_error():
+    """`pytest.raises(crypto.EncodingError)` above proves the *specific*
+    type; this proves the property those tests actually rely on for
+    `store.py`'s `except CryptoError` boundaries to see it at all -- the
+    same distinction `test_an_absent_password_is_refused_as_a_crypto_error`
+    draws for `EmptyPasswordError`."""
+    assert issubclass(crypto.EncodingError, CryptoError)
+
+
+def test_a_lone_surrogate_password_fails_closed_on_unseal_too():
+    """`_derive` — and therefore `_normalise` — sits under `unseal` as well
+    as `seal`; the guard must hold on the read path, not only the write
+    path a review first flagged this on."""
+    envelope = seal(MARKER, PASSWORD, AAD)
+    with pytest.raises(crypto.EncodingError):
+        unseal(envelope, SURROGATE_PASSWORD, AAD)
+
+
+def test_a_lone_surrogate_password_without_the_guard_would_raise_a_bare_unicode_error():
+    """Proves the failure this guard exists for is real, not hypothetical:
+    the exact same encode, done the way `_normalise` used to do it, raises
+    Python's own `UnicodeEncodeError` — outside `CryptoError` entirely."""
+    import unicodedata
+
+    with pytest.raises(UnicodeEncodeError):
+        unicodedata.normalize("NFC", SURROGATE_PASSWORD).encode("utf-8")
+
+
+def test_seal_json_payload_with_a_lone_surrogate_round_trips_without_raising():
+    """The opposite finding, stated as a test: `json.dumps`'s default
+    `ensure_ascii=True` escapes a lone surrogate in the *payload* to plain
+    ASCII before it is ever encoded, so `seal_json` does not raise on one —
+    unlike the password case above. Documented here so a future change to
+    `seal_json`'s `ensure_ascii`/`separators` that reintroduced the failure
+    would be caught by `test_a_lone_surrogate_payload_value_fails_as_a_crypto_error`
+    below, and so this module's own claim about where the bug does and does
+    not live is verified, not merely asserted in a docstring."""
+    envelope = seal_json({"NAME": SURROGATE_PASSWORD}, PASSWORD, AAD)
+    assert unseal_json(envelope, PASSWORD, AAD) == {"NAME": SURROGATE_PASSWORD}
+
+
+def test_a_lone_surrogate_payload_value_fails_as_a_crypto_error(monkeypatch):
+    """`seal_json`'s own defensive guard, exercised directly: forces the
+    `ensure_ascii` escaping that normally protects this call to fail, so the
+    `except UnicodeEncodeError` inside `seal_json` itself is proven live
+    rather than merely present in the source."""
+
+    class _Unencodable(str):
+        def encode(self, *_args, **_kwargs):
+            raise UnicodeEncodeError("utf-8", self, 0, 1, "simulated")
+
+    def fake_dumps(*_args, **_kwargs):
+        return _Unencodable("{}")
+
+    monkeypatch.setattr(crypto.json, "dumps", fake_dumps)
+    with pytest.raises(crypto.EncodingError):
+        seal_json({"NAME": "value"}, PASSWORD, AAD)
+
+
+def test_a_lone_surrogate_aad_fails_as_a_crypto_error():
+    """The same guard on `aad.encode("utf-8")` in `seal`/`unseal` — no
+    current caller passes an AAD sourced from the environment, but the encode
+    is identical in shape to the password's, and identically reachable."""
+    with pytest.raises(crypto.EncodingError):
+        seal(MARKER, PASSWORD, SURROGATE_PASSWORD)
