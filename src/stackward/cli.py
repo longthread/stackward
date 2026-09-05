@@ -21,6 +21,7 @@ from .commands.check_config import cmd_check_config
 from .commands.install_hooks import cmd_install_hooks
 from .commands.pre_commit import cmd_pre_commit
 from .commands.session import cmd_exec, cmd_login, cmd_shell
+from .commands.set_secrets import cmd_set_secrets
 from .config import find_repo_config
 
 # Commands that must keep working even when a repo demands a newer stackward
@@ -153,6 +154,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     shell.add_argument("--profile", help="profile to use (overrides selection precedence)")
     shell.set_defaults(func=cmd_shell)
+
+    set_secrets = sub.add_parser(
+        "set-secrets", help="publish declared stack secrets into pulumi config"
+    )
+    set_secrets.add_argument("--stack", help="stack name, forwarded to pulumi")
+    set_secrets.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what would be set without running pulumi",
+    )
+    set_secrets.set_defaults(func=cmd_set_secrets)
 
     return parser
 
