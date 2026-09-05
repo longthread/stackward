@@ -59,6 +59,7 @@ from typing import Any
 from .crypto import (
     CryptoError,
     DecryptionError,
+    EmptyPasswordError,
     describe_value,
     seal_json,
     unseal_json,
@@ -95,8 +96,10 @@ VERIFIER_PLAINTEXT = "stackward credential store"
 # header as nesting, so `[profile.a.b]` declares a table `b` inside a table `a`
 # and not a profile named `a.b`. Allowing dotted names would mean a name that
 # has two spellings — one of which silently parses as something else — for no
-# benefit. What remains is exactly the TOML bare-key charset, so every valid
-# name is spellable as `[profile.<name>]` with no quoting and no ambiguity.
+# benefit. What remains is a strict subset of the TOML bare-key charset — TOML
+# would also allow a leading '_' or '-', which this does not — so every valid
+# name is spellable as `[profile.<name>]` with no quoting and no ambiguity,
+# but not every bare TOML key is a valid profile name.
 _PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
 
 _TOP_LEVEL_KEYS = frozenset({"default_profile", "profile"})
@@ -118,12 +121,13 @@ class ProfileError(StoreError):
 
 
 class PasswordError(StoreError):
-    """The store password is wrong: the verifier envelope did not open.
+    """The store password is unusable: absent, or wrong.
 
-    Raised in preference to letting a profile envelope's `DecryptionError`
-    surface, because the two mean different things to whoever reads them. This
-    one says "retype your password"; a failure on a profile envelope after the
-    verifier opened says the store itself is damaged or was tampered with."""
+    Both mean "the password given cannot open this store", which is a single
+    problem to whoever reads it. Kept distinct from a profile envelope's
+    `DecryptionError`, which is a different one: this says "retype your
+    password", while a failure on a profile envelope *after* the verifier opened
+    says the store itself is damaged or was tampered with."""
 
 
 @dataclass(frozen=True)
@@ -170,8 +174,13 @@ class StoreConfig:
 # ---------------------------------------------------------------------------
 
 
-def store_dir(home: Path | None = None) -> Path:
-    """The store directory: `home` when given, otherwise `cli.config_home()`.
+def store_dir(directory: Path | None = None) -> Path:
+    """The store directory: `directory` when given, otherwise `cli.config_home()`.
+
+    Named `directory`, not `home`: this is the store directory itself, the
+    thing `config_home()` returns with `/stackward` already appended. A
+    parameter called `home` invites a caller to pass a config home or
+    `Path.home()` and silently get `<that>/credentials`.
 
     `cli` is imported inside the function rather than at module scope. The
     commands that will drive this store live under `commands/`, which `cli`
@@ -181,19 +190,19 @@ def store_dir(home: Path | None = None) -> Path:
     not defined yet at that point in its own execution. `config.py` avoids the
     same cycle the same way; see `enforce_min_version` there.
     """
-    if home is not None:
-        return home
+    if directory is not None:
+        return directory
     from .cli import config_home  # local: breaks an import cycle
 
     return config_home()
 
 
-def config_path(home: Path | None = None) -> Path:
-    return store_dir(home) / CONFIG_FILENAME
+def config_path(directory: Path | None = None) -> Path:
+    return store_dir(directory) / CONFIG_FILENAME
 
 
-def credentials_path(home: Path | None = None) -> Path:
-    return store_dir(home) / CREDENTIALS_FILENAME
+def credentials_path(directory: Path | None = None) -> Path:
+    return store_dir(directory) / CREDENTIALS_FILENAME
 
 
 def warn_if_permissive(path: Path, allowed: int) -> None:
@@ -218,20 +227,20 @@ def warn_if_permissive(path: Path, allowed: int) -> None:
         )
 
 
-def ensure_store_dir(home: Path | None = None) -> Path:
+def ensure_store_dir(directory: Path | None = None) -> Path:
     """Create the store directory if absent, and make sure it is 0700.
 
     `chmod` runs unconditionally rather than relying on `mkdir(mode=...)`,
     whose result the process `umask` modifies — a `umask` of 0 would otherwise
     leave a world-readable directory holding a credentials file.
     """
-    directory = store_dir(home)
+    resolved = store_dir(directory)
     try:
-        directory.mkdir(parents=True, exist_ok=True)
-        os.chmod(directory, DIR_MODE)
+        resolved.mkdir(parents=True, exist_ok=True)
+        os.chmod(resolved, DIR_MODE)
     except OSError as exc:
-        raise StoreError(f"{directory}: cannot create store directory: {exc}") from exc
-    return directory
+        raise StoreError(f"{resolved}: cannot create store directory: {exc}") from exc
+    return resolved
 
 
 def atomic_write(path: Path, data: bytes, mode: int) -> None:
@@ -352,7 +361,7 @@ def _build_profile(name: str, raw: Any) -> Profile:
     return profile
 
 
-def load_store_config(home: Path | None = None) -> StoreConfig:
+def load_store_config(directory: Path | None = None) -> StoreConfig:
     """Parse `config`, or return an empty one when the file does not exist.
 
     Absent is a normal state for a user who has not set the tool up yet; the
@@ -361,7 +370,7 @@ def load_store_config(home: Path | None = None) -> StoreConfig:
     typo must never be treated as though it were absent, since that would turn
     a broken profile into a silently missing one.
     """
-    path = config_path(home)
+    path = config_path(directory)
     if not path.exists():
         return StoreConfig()
 
@@ -470,8 +479,8 @@ def select_profile(
 # ---------------------------------------------------------------------------
 
 
-def _read_document(home: Path | None = None) -> dict[str, Any]:
-    path = credentials_path(home)
+def _read_document(directory: Path | None = None) -> dict[str, Any]:
+    path = credentials_path(directory)
     warn_if_permissive(path, CREDENTIALS_MODE)
     try:
         raw = path.read_bytes()
@@ -507,10 +516,22 @@ def _read_document(home: Path | None = None) -> dict[str, Any]:
     return document
 
 
-def _write_document(document: Mapping[str, Any], home: Path | None = None) -> None:
-    ensure_store_dir(home)
+def _write_document(document: Mapping[str, Any], directory: Path | None = None) -> None:
+    ensure_store_dir(directory)
     payload = json.dumps(document, indent=2, sort_keys=True).encode("utf-8") + b"\n"
-    atomic_write(credentials_path(home), payload, CREDENTIALS_MODE)
+    atomic_write(credentials_path(directory), payload, CREDENTIALS_MODE)
+
+
+def _require_password(password: str, what: str = "a password") -> None:
+    """Refuse an absent password, as a `PasswordError` naming which one.
+
+    `crypto._normalise` is the real guarantee — it sits under every seal and
+    every open, so no path can miss it. This exists on top of it only to phrase
+    the refusal in the store's own vocabulary and to say *which* password was
+    missing when a call takes two, which the crypto layer cannot know.
+    """
+    if not password.strip():
+        raise PasswordError(f"{what} is required")
 
 
 def _check_password(document: Mapping[str, Any], password: str) -> None:
@@ -521,6 +542,7 @@ def _check_password(document: Mapping[str, Any], password: str) -> None:
     envelope is attempted, and therefore before a decryption failure could be
     mistaken for a damaged store.
     """
+    _require_password(password)
     envelope = document.get(VERIFIER_KEY)
     if envelope is None:
         raise StoreError(
@@ -531,6 +553,11 @@ def _check_password(document: Mapping[str, Any], password: str) -> None:
         plaintext = unseal_json(envelope, password, VERIFIER_AAD)
     except DecryptionError as exc:
         raise PasswordError("wrong password for the credential store") from exc
+    except EmptyPasswordError as exc:
+        # Unreachable while `_require_password` above stands, and mapped anyway:
+        # `EmptyPasswordError` is a `CryptoError`, so the clause below would
+        # otherwise recode "no password" as "the verifier is unusable".
+        raise PasswordError("a password is required") from exc
     except CryptoError as exc:
         raise StoreError(f"credential store verifier is unusable: {exc}") from exc
 
@@ -571,15 +598,16 @@ def _require_credentials(payload: Any, profile: str) -> dict[str, str]:
     return result
 
 
-def init_store(password: str, *, home: Path | None = None) -> None:
+def init_store(password: str, *, directory: Path | None = None) -> None:
     """Create the store directory and an empty `credentials` holding a verifier.
 
     Refuses to overwrite an existing store: doing so would discard every sealed
     envelope in it, irrecoverably, in response to a command a user could plausibly
     run twice.
     """
-    ensure_store_dir(home)
-    path = credentials_path(home)
+    _require_password(password)
+    ensure_store_dir(directory)
+    path = credentials_path(directory)
     if path.exists():
         raise StoreError(f"{path}: a credential store already exists here")
     _write_document(
@@ -588,14 +616,14 @@ def init_store(password: str, *, home: Path | None = None) -> None:
             VERIFIER_KEY: seal_json(VERIFIER_PLAINTEXT, password, VERIFIER_AAD),
             "profiles": {},
         },
-        home,
+        directory,
     )
 
 
-def store_profiles(home: Path | None = None) -> list[str]:
+def store_profiles(directory: Path | None = None) -> list[str]:
     """Names that have a sealed envelope, sorted. Reads no password and opens
     nothing, so it is safe to call for a listing."""
-    return sorted(_read_document(home)["profiles"])
+    return sorted(_read_document(directory)["profiles"])
 
 
 def set_credentials(
@@ -603,7 +631,7 @@ def set_credentials(
     credentials: Mapping[str, str],
     password: str,
     *,
-    home: Path | None = None,
+    directory: Path | None = None,
 ) -> None:
     """Seal `credentials` as `profile`'s envelope, replacing any existing one.
 
@@ -615,14 +643,14 @@ def set_credentials(
         if not isinstance(key, str) or not isinstance(value, str):
             raise StoreError("credentials must be a mapping of strings to strings")
 
-    document = _read_document(home)
+    document = _read_document(directory)
     _check_password(document, password)
     document["profiles"][profile] = seal_json(dict(credentials), password, profile)
-    _write_document(document, home)
+    _write_document(document, directory)
 
 
 def resolve_credentials(
-    profile: str, password: str, *, home: Path | None = None
+    profile: str, password: str, *, directory: Path | None = None
 ) -> dict[str, str]:
     """The bootstrap values for `profile`: names to values, decrypted.
 
@@ -637,7 +665,7 @@ def resolve_credentials(
     environment fallback belong to the command; a library that could prompt
     would be a library that can block a hook.
     """
-    document = _read_document(home)
+    document = _read_document(directory)
     _check_password(document, password)
 
     envelope = document["profiles"].get(profile)
@@ -662,7 +690,7 @@ def resolve_credentials(
 
 
 def rotate_password(
-    old_password: str, new_password: str, *, home: Path | None = None
+    old_password: str, new_password: str, *, directory: Path | None = None
 ) -> None:
     """Re-seal every envelope under `new_password`, or change nothing.
 
@@ -676,7 +704,8 @@ def rotate_password(
     `config`. An envelope whose `[profile.<name>]` table has been removed is
     unreachable but not gone, and rotating past it would quietly destroy it.
     """
-    document = _read_document(home)
+    _require_password(new_password, "the new password")
+    document = _read_document(directory)
     _check_password(document, old_password)
 
     rotated: dict[str, Any] = {}
@@ -690,11 +719,11 @@ def rotate_password(
             ) from exc
         rotated[name] = seal_json(payload, new_password, name)
 
-    _write_document(
-        {
-            "v": STORE_VERSION,
-            VERIFIER_KEY: seal_json(VERIFIER_PLAINTEXT, new_password, VERIFIER_AAD),
-            "profiles": rotated,
-        },
-        home,
-    )
+    # Replace only the two fields this operation owns and keep the rest of the
+    # document as it was read. Rebuilding from a literal would silently drop any
+    # other top-level field, and would leave the two write paths disagreeing
+    # about what a document is — `set_credentials` preserves the whole thing,
+    # and rotation would be the one discarding.
+    document[VERIFIER_KEY] = seal_json(VERIFIER_PLAINTEXT, new_password, VERIFIER_AAD)
+    document["profiles"] = rotated
+    _write_document(document, directory)

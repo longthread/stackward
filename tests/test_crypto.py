@@ -24,7 +24,7 @@ import base64
 import json
 
 import pytest
-from cryptography.exceptions import InvalidTag
+from cryptography.exceptions import InvalidTag, UnsupportedAlgorithm
 
 from stackward import crypto
 from stackward.crypto import (
@@ -36,7 +36,9 @@ from stackward.crypto import (
     KEY_BYTES,
     NONCE_BYTES,
     SALT_BYTES,
+    CryptoError,
     DecryptionError,
+    EmptyPasswordError,
     EnvelopeError,
     seal,
     seal_json,
@@ -181,7 +183,10 @@ def test_an_unknown_kdf_is_refused():
 @pytest.mark.parametrize(
     ("key", "value"),
     [
-        ("memory_kib", 2**31),  # `cryptography` answers this with a MemoryError
+        # Rejected by _MAX_MEMORY_KIB before it reaches the library. Note this
+        # bound has a fallback: were it gone, `_derive` would still map the
+        # library's MemoryError. The `iterations` ceiling below does not.
+        ("memory_kib", 2**31),
         ("memory_kib", 1),
         ("memory_kib", 0),
         ("memory_kib", -1),
@@ -292,3 +297,56 @@ def test_no_error_message_repeats_the_password_or_the_plaintext():
         assert MARKER.decode("ascii") not in message
         assert PASSWORD not in message
         assert OTHER_PASSWORD not in message
+
+
+# ---------------------------------------------------------------------------
+# The password itself
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("password", ["", " ", "\t", "\n", "   \t\n  "])
+def test_an_absent_password_is_refused_rather_than_deriving_a_key_from_nothing(password):
+    """Argon2id derives a perfectly good 32-byte key from `b""` — verified
+    against the pinned library — so without this check an empty password seals
+    a real store that opens with no password at all, indistinguishably from one
+    that was protected. Strength is the prompting command's business; emptiness
+    is not, because "" cannot be told apart from "nothing was supplied".
+    """
+    with pytest.raises(EmptyPasswordError):
+        seal(MARKER, password, AAD)
+    envelope = seal(MARKER, PASSWORD, AAD)
+    with pytest.raises(EmptyPasswordError):
+        unseal(envelope, password, AAD)
+
+
+def test_an_absent_password_is_refused_as_a_crypto_error():
+    """`EmptyPasswordError` must sit under `CryptoError`, or `store.py`'s
+    `except CryptoError` boundaries would not see it at all."""
+    assert issubclass(EmptyPasswordError, CryptoError)
+
+
+def test_a_password_is_refused_but_never_trimmed():
+    """Whitespace-only is refused; a password with significant surrounding
+    whitespace is honoured exactly as typed. Stripping would silently change
+    what the user entered into something else."""
+    padded = "  " + PASSWORD + "  "
+    envelope = seal(MARKER, padded, AAD)
+    assert unseal(envelope, padded, AAD) == MARKER
+    with pytest.raises(DecryptionError):
+        unseal(envelope, PASSWORD, AAD)
+
+
+def test_a_backend_that_cannot_do_argon2id_fails_closed_as_a_crypto_error(monkeypatch):
+    """Argon2id needs an OpenSSL 3.2+ backend; on an older one `cryptography`
+    raises `UnsupportedAlgorithm`, which inherits straight from `Exception`.
+    Uncaught it would sail past every `except CryptoError` in `store.py` as a
+    raw traceback, on the one class of machine where nothing about the store
+    works. Simulated, because this build's backend does support it.
+    """
+
+    def unsupported(*_args, **_kwargs):
+        raise UnsupportedAlgorithm("no Argon2id in this backend")
+
+    monkeypatch.setattr(crypto, "Argon2id", unsupported)
+    with pytest.raises(CryptoError):
+        seal(MARKER, PASSWORD, AAD)

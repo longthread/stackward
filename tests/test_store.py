@@ -76,15 +76,15 @@ def cheap_kdf(monkeypatch):
 
 
 @pytest.fixture
-def home(tmp_path):
-    """An isolated store directory. Every store function takes `home`, so no
-    test depends on the real `XDG_CONFIG_HOME` or writes outside `tmp_path`."""
+def store_directory(tmp_path):
+    """An isolated store directory. Every store function takes `directory`, so
+    no test depends on the real `XDG_CONFIG_HOME` or writes outside `tmp_path`."""
     return tmp_path / "stackward"
 
 
-def write_config(home, text: str):
-    home.mkdir(parents=True, exist_ok=True)
-    path = home / "config"
+def write_config(store_directory, text: str):
+    store_directory.mkdir(parents=True, exist_ok=True)
+    path = store_directory / "config"
     path.write_text(text)
     # At the required mode, so that these tests do not trip the permission
     # warning as a side effect of whatever umask the suite runs under. The
@@ -116,24 +116,24 @@ def config_with(*names: str, default: str | None = None) -> str:
         "some-future-scheme://placeholder",
     ],
 )
-def test_a_backend_url_is_carried_through_byte_for_byte(home, url):
+def test_a_backend_url_is_carried_through_byte_for_byte(store_directory, url):
     """Pass-through, not parsing. Any normalising or reassembling this module
     did would show up here as a changed string, and would be the thing that
     stopped an unanticipated scheme from working."""
-    write_config(home, f"[profile.one]\nbackend_url = {json.dumps(url)}\n")
-    assert load_store_config(home).profiles["one"].backend_url == url
+    write_config(store_directory, f"[profile.one]\nbackend_url = {json.dumps(url)}\n")
+    assert load_store_config(store_directory).profiles["one"].backend_url == url
 
 
-def test_the_component_form_is_carried_as_structured_data(home):
+def test_the_component_form_is_carried_as_structured_data(store_directory):
     write_config(
-        home,
+        store_directory,
         "[profile.one]\n"
         'bucket = "placeholder-bucket"\n'
         'prefix = "placeholder/prefix"\n'
         'endpoint = "https://placeholder.invalid"\n'
         'region = "placeholder-region"\n',
     )
-    profile = load_store_config(home).profiles["one"]
+    profile = load_store_config(store_directory).profiles["one"]
     assert profile.backend_url is None
     assert profile.bucket == "placeholder-bucket"
     assert profile.prefix == "placeholder/prefix"
@@ -141,57 +141,57 @@ def test_the_component_form_is_carried_as_structured_data(home):
     assert profile.region == "placeholder-region"
 
 
-def test_a_profile_carrying_both_forms_is_refused(home):
+def test_a_profile_carrying_both_forms_is_refused(store_directory):
     """Two answers to "which backend?" with no rule for choosing between them."""
     write_config(
-        home,
+        store_directory,
         '[profile.one]\nbackend_url = "file:///placeholder"\nbucket = "placeholder"\n',
     )
     with pytest.raises(StoreError):
-        load_store_config(home)
+        load_store_config(store_directory)
 
 
-def test_a_profile_carrying_neither_form_is_refused(home):
+def test_a_profile_carrying_neither_form_is_refused(store_directory):
     """There is no default backend to fall back on, so an empty profile is an
     error and not an inherited one."""
-    write_config(home, "[profile.one]\n")
+    write_config(store_directory, "[profile.one]\n")
     with pytest.raises(StoreError):
-        load_store_config(home)
+        load_store_config(store_directory)
 
 
-def test_the_component_form_without_a_bucket_is_refused(home):
-    write_config(home, '[profile.one]\nregion = "placeholder-region"\n')
+def test_the_component_form_without_a_bucket_is_refused(store_directory):
+    write_config(store_directory, '[profile.one]\nregion = "placeholder-region"\n')
     with pytest.raises(StoreError):
-        load_store_config(home)
+        load_store_config(store_directory)
 
 
-def test_an_unknown_profile_key_is_refused_rather_than_ignored(home):
+def test_an_unknown_profile_key_is_refused_rather_than_ignored(store_directory):
     write_config(
-        home,
+        store_directory,
         '[profile.one]\nbackend_url = "file:///placeholder"\nbucket_name = "typo"\n',
     )
     with pytest.raises(StoreError):
-        load_store_config(home)
+        load_store_config(store_directory)
 
 
-def test_a_default_profile_with_no_table_is_refused(home):
-    write_config(home, 'default_profile = "missing"\n' + config_with("one"))
+def test_a_default_profile_with_no_table_is_refused(store_directory):
+    write_config(store_directory, 'default_profile = "missing"\n' + config_with("one"))
     with pytest.raises(StoreError):
-        load_store_config(home)
+        load_store_config(store_directory)
 
 
-def test_an_absent_config_is_empty_rather_than_an_error(home):
+def test_an_absent_config_is_empty_rather_than_an_error(store_directory):
     """Not having set the tool up yet is a normal state. It is `select_profile`
     that reports it, because only it can say what to do about it."""
-    assert load_store_config(home) == StoreConfig()
+    assert load_store_config(store_directory) == StoreConfig()
 
 
-def test_an_invalid_config_raises_rather_than_reading_as_absent(home):
+def test_an_invalid_config_raises_rather_than_reading_as_absent(store_directory):
     """A typo must not degrade into "no profiles", which would turn a broken
     backend into a silently missing one."""
-    write_config(home, "[profile.one\nbackend_url = ")
+    write_config(store_directory, "[profile.one\nbackend_url = ")
     with pytest.raises(StoreError):
-        load_store_config(home)
+        load_store_config(store_directory)
 
 
 # ---------------------------------------------------------------------------
@@ -200,9 +200,11 @@ def test_an_invalid_config_raises_rather_than_reading_as_absent(home):
 
 
 @pytest.fixture
-def four_profiles(home):
-    write_config(home, config_with("chosen", "from_env", "from_repo", "fallback"))
-    return load_store_config(home)
+def four_profiles(store_directory):
+    write_config(
+        store_directory, config_with("chosen", "from_env", "from_repo", "fallback")
+    )
+    return load_store_config(store_directory)
 
 
 def test_the_explicit_profile_wins_over_every_other_source(four_profiles):
@@ -224,17 +226,17 @@ def test_the_environment_wins_when_no_explicit_profile_was_given(four_profiles):
     assert selected.name == "from_env"
 
 
-def test_the_repository_config_wins_over_the_default_profile(home):
-    write_config(home, config_with("from_repo", "fallback", default="fallback"))
+def test_the_repository_config_wins_over_the_default_profile(store_directory):
+    write_config(store_directory, config_with("from_repo", "fallback", default="fallback"))
     selected = select_profile(
-        config=load_store_config(home), repo_profile="from_repo", environ={}
+        config=load_store_config(store_directory), repo_profile="from_repo", environ={}
     )
     assert selected.name == "from_repo"
 
 
-def test_the_default_profile_is_the_last_resort(home):
-    write_config(home, config_with("fallback", default="fallback"))
-    selected = select_profile(config=load_store_config(home), environ={})
+def test_the_default_profile_is_the_last_resort(store_directory):
+    write_config(store_directory, config_with("fallback", default="fallback"))
+    selected = select_profile(config=load_store_config(store_directory), environ={})
     assert selected.name == "fallback"
 
 
@@ -243,15 +245,17 @@ def test_no_profile_anywhere_is_an_error_and_never_a_guess(four_profiles):
         select_profile(config=four_profiles, environ={})
 
 
-def test_a_named_profile_that_does_not_exist_errors_instead_of_using_the_default(home):
+def test_a_named_profile_that_does_not_exist_errors_instead_of_using_the_default(
+    store_directory,
+):
     """The case that separates "first source that *speaks* wins" from "first
     source that *resolves* wins". Falling through here would run the command
     against a backend nobody asked for — the worst thing this tool could do
     quietly — and a loop that skipped invalid sources would pass every other
     precedence test in this file.
     """
-    write_config(home, config_with("fallback", default="fallback"))
-    config = load_store_config(home)
+    write_config(store_directory, config_with("fallback", default="fallback"))
+    config = load_store_config(store_directory)
     for explicit, environ, repo_profile in (
         ("absent", {}, None),
         (None, {ENV_PROFILE: "absent"}, None),
@@ -265,15 +269,17 @@ def test_a_named_profile_that_does_not_exist_errors_instead_of_using_the_default
         assert "fallback" not in str(raised.value)
 
 
-def test_an_empty_environment_variable_is_an_error_rather_than_a_miss(home):
+def test_an_empty_environment_variable_is_an_error_rather_than_a_miss(store_directory):
     """A variable set to the empty string is a broken variable, not an absent
     one. Skipping it would silently substitute the default."""
-    write_config(home, config_with("fallback", default="fallback"))
+    write_config(store_directory, config_with("fallback", default="fallback"))
     with pytest.raises(ProfileError):
-        select_profile(config=load_store_config(home), environ={ENV_PROFILE: ""})
+        select_profile(
+            config=load_store_config(store_directory), environ={ENV_PROFILE: ""}
+        )
 
 
-def test_a_profile_name_that_would_collide_with_the_verifier_is_rejected(home):
+def test_a_profile_name_that_would_collide_with_the_verifier_is_rejected(store_directory):
     """The verifier's AAD is `stackward:verifier`. Excluding ':' from the name
     charset is the mechanism that keeps the two AAD namespaces disjoint, so a
     profile envelope can never be interchangeable with the verifier's."""
@@ -305,26 +311,27 @@ def test_an_unspellable_profile_name_is_rejected(name):
 # ---------------------------------------------------------------------------
 
 
-def test_the_store_directory_is_created_private_whatever_the_umask(home):
+def test_the_store_directory_is_created_private_whatever_the_umask(store_directory):
     previous = os.umask(0)
     try:
-        store.ensure_store_dir(home)
+        store.ensure_store_dir(store_directory)
     finally:
         os.umask(previous)
-    assert stat.S_IMODE(home.stat().st_mode) == DIR_MODE
+    assert stat.S_IMODE(store_directory.stat().st_mode) == DIR_MODE
 
 
-def test_the_credentials_file_is_written_private_whatever_the_umask(home):
+def test_the_credentials_file_is_written_private_whatever_the_umask(store_directory):
     previous = os.umask(0)
     try:
-        init_store(PASSWORD, home=home)
+        init_store(PASSWORD, directory=store_directory)
     finally:
         os.umask(previous)
-    assert stat.S_IMODE((home / "credentials").stat().st_mode) == CREDENTIALS_MODE
+    mode = stat.S_IMODE((store_directory / "credentials").stat().st_mode)
+    assert mode == CREDENTIALS_MODE
 
 
 @pytest.mark.parametrize("mode", [CREDENTIALS_MODE, CONFIG_MODE])
-def test_the_mode_is_set_before_the_rename_not_after(home, monkeypatch, mode):
+def test_the_mode_is_set_before_the_rename_not_after(store_directory, monkeypatch, mode):
     """Setting the mode after the rename leaves a window in which the finished
     file is visible at its real path with whatever mode it was created with.
     This records the mode of the temporary file at the moment of the rename.
@@ -334,7 +341,7 @@ def test_the_mode_is_set_before_the_rename_not_after(home, monkeypatch, mode):
     rename would look identical and this test would prove nothing. 0644 is what
     makes the ordering observable.
     """
-    home.mkdir(parents=True)
+    store_directory.mkdir(parents=True)
     real_replace = os.replace
     observed: list[int] = []
 
@@ -343,13 +350,13 @@ def test_the_mode_is_set_before_the_rename_not_after(home, monkeypatch, mode):
         return real_replace(src, dst)
 
     monkeypatch.setattr(os, "replace", spy)
-    atomic_write(home / "credentials", b"content", mode)
+    atomic_write(store_directory / "credentials", b"content", mode)
     assert observed == [mode]
 
 
-def test_a_failed_write_leaves_the_original_file_intact(home, monkeypatch):
-    target = home / "credentials"
-    home.mkdir(parents=True)
+def test_a_failed_write_leaves_the_original_file_intact(store_directory, monkeypatch):
+    target = store_directory / "credentials"
+    store_directory.mkdir(parents=True)
     target.write_bytes(b"the original content")
 
     def boom(*_args, **_kwargs):
@@ -361,9 +368,9 @@ def test_a_failed_write_leaves_the_original_file_intact(home, monkeypatch):
     assert target.read_bytes() == b"the original content"
 
 
-def test_a_failed_rename_leaves_the_original_file_intact(home, monkeypatch):
-    target = home / "credentials"
-    home.mkdir(parents=True)
+def test_a_failed_rename_leaves_the_original_file_intact(store_directory, monkeypatch):
+    target = store_directory / "credentials"
+    store_directory.mkdir(parents=True)
     target.write_bytes(b"the original content")
 
     def boom(*_args, **_kwargs):
@@ -376,11 +383,13 @@ def test_a_failed_rename_leaves_the_original_file_intact(home, monkeypatch):
 
 
 @pytest.mark.parametrize("failing", ["fsync", "replace"])
-def test_a_failed_write_leaves_no_temporary_file_behind(home, monkeypatch, failing):
+def test_a_failed_write_leaves_no_temporary_file_behind(
+    store_directory, monkeypatch, failing
+):
     """Debris in the store directory would be a sealed credentials file nobody
     is tracking, kept at whatever mode `mkstemp` produced."""
-    target = home / "credentials"
-    home.mkdir(parents=True)
+    target = store_directory / "credentials"
+    store_directory.mkdir(parents=True)
     target.write_bytes(b"the original content")
 
     def boom(*_args, **_kwargs):
@@ -389,7 +398,7 @@ def test_a_failed_write_leaves_no_temporary_file_behind(home, monkeypatch, faili
     monkeypatch.setattr(os, failing, boom)
     with pytest.raises(OSError):
         atomic_write(target, b"the replacement content", CREDENTIALS_MODE)
-    assert [path.name for path in home.iterdir()] == ["credentials"]
+    assert [path.name for path in store_directory.iterdir()] == ["credentials"]
 
 
 @pytest.mark.parametrize(
@@ -404,10 +413,10 @@ def test_a_failed_write_leaves_no_temporary_file_behind(home, monkeypatch, faili
     ],
 )
 def test_a_more_permissive_mode_than_required_is_warned_about(
-    home, capsys, filename, allowed, mode, expected
+    store_directory, capsys, filename, allowed, mode, expected
 ):
-    home.mkdir(parents=True)
-    path = home / filename
+    store_directory.mkdir(parents=True)
+    path = store_directory / filename
     path.write_text("")
     os.chmod(path, mode)
     store.warn_if_permissive(path, allowed)
@@ -422,14 +431,14 @@ def test_a_more_permissive_mode_than_required_is_warned_about(
 
 
 @pytest.fixture
-def initialised(home):
-    init_store(PASSWORD, home=home)
-    set_credentials("one", CREDENTIALS, PASSWORD, home=home)
-    return home
+def initialised(store_directory):
+    init_store(PASSWORD, directory=store_directory)
+    set_credentials("one", CREDENTIALS, PASSWORD, directory=store_directory)
+    return store_directory
 
 
 def test_credentials_round_trip_through_the_store(initialised):
-    assert resolve_credentials("one", PASSWORD, home=initialised) == CREDENTIALS
+    assert resolve_credentials("one", PASSWORD, directory=initialised) == CREDENTIALS
 
 
 def test_the_credentials_file_holds_none_of_the_credential_bytes(initialised):
@@ -446,7 +455,7 @@ def test_a_wrong_password_is_reported_as_a_wrong_password(initialised):
     """What the store-level verifier buys: the failure names the actual problem
     instead of surfacing as an unopenable profile."""
     with pytest.raises(PasswordError):
-        resolve_credentials("one", WRONG_PASSWORD, home=initialised)
+        resolve_credentials("one", WRONG_PASSWORD, directory=initialised)
 
 
 def test_a_wrong_password_is_refused_before_any_profile_envelope_is_touched(
@@ -454,9 +463,9 @@ def test_a_wrong_password_is_refused_before_any_profile_envelope_is_touched(
 ):
     """The verifier must be the first thing opened, or a mistyped password
     would be indistinguishable from a damaged store."""
-    set_credentials("two", CREDENTIALS, PASSWORD, home=initialised)
+    set_credentials("two", CREDENTIALS, PASSWORD, directory=initialised)
     with pytest.raises(PasswordError):
-        set_credentials("three", CREDENTIALS, WRONG_PASSWORD, home=initialised)
+        set_credentials("three", CREDENTIALS, WRONG_PASSWORD, directory=initialised)
     assert store_profiles(initialised) == ["one", "two"]
 
 
@@ -469,9 +478,9 @@ def test_an_envelope_moved_between_profiles_does_not_open(initialised):
     document["profiles"]["two"] = document["profiles"]["one"]
     path.write_text(json.dumps(document))
 
-    assert resolve_credentials("one", PASSWORD, home=initialised) == CREDENTIALS
+    assert resolve_credentials("one", PASSWORD, directory=initialised) == CREDENTIALS
     with pytest.raises(StoreError) as raised:
-        resolve_credentials("two", PASSWORD, home=initialised)
+        resolve_credentials("two", PASSWORD, directory=initialised)
     assert not isinstance(raised.value, PasswordError)
     assert MARKER not in str(raised.value)
 
@@ -480,34 +489,37 @@ def test_a_profile_with_no_envelope_is_an_error_not_an_empty_mapping(initialised
     """Fail closed. Returning `{}` would let a caller run a command with no
     credentials in the environment and blame the backend for the result."""
     with pytest.raises(ProfileError):
-        resolve_credentials("absent", PASSWORD, home=initialised)
+        resolve_credentials("absent", PASSWORD, directory=initialised)
 
 
-def test_a_profile_in_config_without_credentials_selects_but_does_not_resolve(home):
+def test_a_profile_in_config_without_credentials_selects_but_does_not_resolve(
+    store_directory,
+):
     """How the two files relate when a profile is in one and not the other.
     `config` alone is enough to know which backend a profile names — which is
     all `login` needs — so selection succeeds; resolving credentials that were
     never sealed is an error naming the profile."""
-    write_config(home, config_with("one"))
-    init_store(PASSWORD, home=home)
+    write_config(store_directory, config_with("one"))
+    init_store(PASSWORD, directory=store_directory)
 
-    assert select_profile("one", config=load_store_config(home), environ={}).name == "one"
+    config = load_store_config(store_directory)
+    assert select_profile("one", config=config, environ={}).name == "one"
     with pytest.raises(ProfileError) as raised:
-        resolve_credentials("one", PASSWORD, home=home)
+        resolve_credentials("one", PASSWORD, directory=store_directory)
     assert "one" in str(raised.value)
 
 
-def test_resolving_before_the_store_exists_says_so(home):
+def test_resolving_before_the_store_exists_says_so(store_directory):
     with pytest.raises(StoreError):
-        resolve_credentials("one", PASSWORD, home=home)
+        resolve_credentials("one", PASSWORD, directory=store_directory)
 
 
 def test_initialising_over_an_existing_store_is_refused(initialised):
     """`init` twice is a plausible mistake; discarding every sealed envelope in
     response to it is not a recoverable one."""
     with pytest.raises(StoreError):
-        init_store(PASSWORD, home=initialised)
-    assert resolve_credentials("one", PASSWORD, home=initialised) == CREDENTIALS
+        init_store(PASSWORD, directory=initialised)
+    assert resolve_credentials("one", PASSWORD, directory=initialised) == CREDENTIALS
 
 
 @pytest.mark.parametrize(
@@ -539,7 +551,7 @@ def test_a_malformed_decrypted_payload_is_refused_without_echoing_it(
     path.write_text(json.dumps(document))
 
     with pytest.raises(StoreError) as raised:
-        resolve_credentials("malformed", PASSWORD, home=initialised)
+        resolve_credentials("malformed", PASSWORD, directory=initialised)
     assert MARKER not in str(raised.value)
     assert "malformed" in str(raised.value)
 
@@ -547,7 +559,7 @@ def test_a_malformed_decrypted_payload_is_refused_without_echoing_it(
 def test_a_damaged_store_file_is_refused_rather_than_read_as_empty(initialised):
     (initialised / "credentials").write_text("{ not json")
     with pytest.raises(StoreError):
-        resolve_credentials("one", PASSWORD, home=initialised)
+        resolve_credentials("one", PASSWORD, directory=initialised)
 
 
 def test_an_unsupported_store_version_is_refused(initialised):
@@ -556,7 +568,7 @@ def test_an_unsupported_store_version_is_refused(initialised):
     document["v"] = 99
     path.write_text(json.dumps(document))
     with pytest.raises(StoreError):
-        resolve_credentials("one", PASSWORD, home=initialised)
+        resolve_credentials("one", PASSWORD, directory=initialised)
 
 
 # ---------------------------------------------------------------------------
@@ -565,20 +577,22 @@ def test_an_unsupported_store_version_is_refused(initialised):
 
 
 def test_rotation_reseals_every_envelope(initialised):
-    set_credentials("two", {"NAME": "another-placeholder"}, PASSWORD, home=initialised)
-    rotate_password(PASSWORD, NEW_PASSWORD, home=initialised)
+    set_credentials(
+        "two", {"NAME": "another-placeholder"}, PASSWORD, directory=initialised
+    )
+    rotate_password(PASSWORD, NEW_PASSWORD, directory=initialised)
 
-    assert resolve_credentials("one", NEW_PASSWORD, home=initialised) == CREDENTIALS
-    assert resolve_credentials("two", NEW_PASSWORD, home=initialised) == {
+    assert resolve_credentials("one", NEW_PASSWORD, directory=initialised) == CREDENTIALS
+    assert resolve_credentials("two", NEW_PASSWORD, directory=initialised) == {
         "NAME": "another-placeholder"
     }
     with pytest.raises(PasswordError):
-        resolve_credentials("one", PASSWORD, home=initialised)
+        resolve_credentials("one", PASSWORD, directory=initialised)
 
 
 def test_rotation_draws_fresh_salts_rather_than_reusing_the_old_ones(initialised):
     before = json.loads((initialised / "credentials").read_bytes())
-    rotate_password(PASSWORD, NEW_PASSWORD, home=initialised)
+    rotate_password(PASSWORD, NEW_PASSWORD, directory=initialised)
     after = json.loads((initialised / "credentials").read_bytes())
     for section in (["verifier"], ["profiles", "one"]):
         old, new = before, after
@@ -588,19 +602,21 @@ def test_rotation_draws_fresh_salts_rather_than_reusing_the_old_ones(initialised
         assert old["nonce"] != new["nonce"]
 
 
-def test_rotation_reseals_an_envelope_whose_config_table_is_gone(home):
+def test_rotation_reseals_an_envelope_whose_config_table_is_gone(store_directory):
     """Rotation iterates the credentials file, not the profile list in `config`.
     An implementation that walked `config` instead would silently and
     irrecoverably destroy this envelope, and every other test here would pass."""
-    write_config(home, config_with("one"))
-    init_store(PASSWORD, home=home)
-    set_credentials("one", CREDENTIALS, PASSWORD, home=home)
-    set_credentials("orphan", {"NAME": "orphan-placeholder"}, PASSWORD, home=home)
+    write_config(store_directory, config_with("one"))
+    init_store(PASSWORD, directory=store_directory)
+    set_credentials("one", CREDENTIALS, PASSWORD, directory=store_directory)
+    set_credentials(
+        "orphan", {"NAME": "orphan-placeholder"}, PASSWORD, directory=store_directory
+    )
 
-    rotate_password(PASSWORD, NEW_PASSWORD, home=home)
+    rotate_password(PASSWORD, NEW_PASSWORD, directory=store_directory)
 
-    assert store_profiles(home) == ["one", "orphan"]
-    assert resolve_credentials("orphan", NEW_PASSWORD, home=home) == {
+    assert store_profiles(store_directory) == ["one", "orphan"]
+    assert resolve_credentials("orphan", NEW_PASSWORD, directory=store_directory) == {
         "NAME": "orphan-placeholder"
     }
 
@@ -608,7 +624,7 @@ def test_rotation_reseals_an_envelope_whose_config_table_is_gone(home):
 def test_rotation_with_the_wrong_current_password_changes_nothing(initialised):
     before = (initialised / "credentials").read_bytes()
     with pytest.raises(PasswordError):
-        rotate_password(WRONG_PASSWORD, NEW_PASSWORD, home=initialised)
+        rotate_password(WRONG_PASSWORD, NEW_PASSWORD, directory=initialised)
     assert (initialised / "credentials").read_bytes() == before
 
 
@@ -619,7 +635,9 @@ def test_rotation_is_all_or_nothing_when_one_reseal_fails(initialised, monkeypat
     leave a store whose profiles need different passwords with nothing recording
     which is which.
     """
-    set_credentials("two", {"NAME": "another-placeholder"}, PASSWORD, home=initialised)
+    set_credentials(
+        "two", {"NAME": "another-placeholder"}, PASSWORD, directory=initialised
+    )
     before = (initialised / "credentials").read_bytes()
 
     real_seal_json = store.seal_json
@@ -636,16 +654,16 @@ def test_rotation_is_all_or_nothing_when_one_reseal_fails(initialised, monkeypat
 
     monkeypatch.setattr(store, "seal_json", failing_seal_json)
     with pytest.raises(RuntimeError):
-        rotate_password(PASSWORD, NEW_PASSWORD, home=initialised)
+        rotate_password(PASSWORD, NEW_PASSWORD, directory=initialised)
     monkeypatch.undo()
 
     assert (initialised / "credentials").read_bytes() == before
-    assert resolve_credentials("one", PASSWORD, home=initialised) == CREDENTIALS
-    assert resolve_credentials("two", PASSWORD, home=initialised) == {
+    assert resolve_credentials("one", PASSWORD, directory=initialised) == CREDENTIALS
+    assert resolve_credentials("two", PASSWORD, directory=initialised) == {
         "NAME": "another-placeholder"
     }
     with pytest.raises(PasswordError):
-        resolve_credentials("one", NEW_PASSWORD, home=initialised)
+        resolve_credentials("one", NEW_PASSWORD, directory=initialised)
     assert sorted(path.name for path in initialised.iterdir()) == ["credentials"]
 
 
@@ -655,7 +673,9 @@ def test_rotation_touches_the_file_exactly_once(initialised, monkeypatch):
     after each profile would be all-or-nothing only by luck about where a
     failure landed, and the induced-failure test above can only observe the
     failures it induces."""
-    set_credentials("two", {"NAME": "another-placeholder"}, PASSWORD, home=initialised)
+    set_credentials(
+        "two", {"NAME": "another-placeholder"}, PASSWORD, directory=initialised
+    )
     real_atomic_write = store.atomic_write
     writes: list[str] = []
 
@@ -664,7 +684,7 @@ def test_rotation_touches_the_file_exactly_once(initialised, monkeypatch):
         return real_atomic_write(path, data, mode)
 
     monkeypatch.setattr(store, "atomic_write", counting_atomic_write)
-    rotate_password(PASSWORD, NEW_PASSWORD, home=initialised)
+    rotate_password(PASSWORD, NEW_PASSWORD, directory=initialised)
     assert writes == ["credentials"]
 
 
@@ -678,7 +698,7 @@ def test_rotation_stops_rather_than_dropping_an_envelope_it_cannot_open(initiali
     before = path.read_bytes()
 
     with pytest.raises(StoreError):
-        rotate_password(PASSWORD, NEW_PASSWORD, home=initialised)
+        rotate_password(PASSWORD, NEW_PASSWORD, directory=initialised)
     assert path.read_bytes() == before
 
 
@@ -709,12 +729,14 @@ def test_no_error_message_from_any_failing_path_contains_a_credential(
 
     messages: list[str] = []
     for call in (
-        lambda: resolve_credentials("one", WRONG_PASSWORD, home=initialised),
-        lambda: resolve_credentials("absent", PASSWORD, home=initialised),
-        lambda: resolve_credentials("moved", PASSWORD, home=initialised),
-        lambda: rotate_password(WRONG_PASSWORD, NEW_PASSWORD, home=initialised),
-        lambda: init_store(PASSWORD, home=initialised),
-        lambda: set_credentials("four", CREDENTIALS, WRONG_PASSWORD, home=initialised),
+        lambda: resolve_credentials("one", WRONG_PASSWORD, directory=initialised),
+        lambda: resolve_credentials("absent", PASSWORD, directory=initialised),
+        lambda: resolve_credentials("moved", PASSWORD, directory=initialised),
+        lambda: rotate_password(WRONG_PASSWORD, NEW_PASSWORD, directory=initialised),
+        lambda: init_store(PASSWORD, directory=initialised),
+        lambda: set_credentials(
+            "four", CREDENTIALS, WRONG_PASSWORD, directory=initialised
+        ),
     ):
         with pytest.raises(StoreError) as raised:
             call()
@@ -730,3 +752,78 @@ def test_no_error_message_from_any_failing_path_contains_a_credential(
 def test_a_profile_dataclass_reports_which_form_it_carries():
     assert not Profile(name="one", backend_url="file:///placeholder").has_components
     assert Profile(name="one", bucket="placeholder-bucket").has_components
+
+
+# ---------------------------------------------------------------------------
+# An absent password, per entry point
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("password", ["", "   ", "\t\n"])
+def test_init_store_refuses_an_absent_password_instead_of_sealing_with_nothing(
+    store_directory, password
+):
+    """Argon2id derives a usable key from `b""`, so an unguarded `init_store("")`
+    writes a well-formed store that opens with no password at all — no error, no
+    warning, and no way to tell it from a protected one."""
+    with pytest.raises(PasswordError):
+        init_store(password, directory=store_directory)
+    assert not (store_directory / "credentials").exists()
+
+
+@pytest.mark.parametrize("password", ["", "   ", "\t\n"])
+def test_set_credentials_refuses_an_absent_password(initialised, password):
+    with pytest.raises(PasswordError):
+        set_credentials("two", CREDENTIALS, password, directory=initialised)
+    assert store_profiles(initialised) == ["one"]
+
+
+@pytest.mark.parametrize("password", ["", "   ", "\t\n"])
+def test_resolve_credentials_refuses_an_absent_password(initialised, password):
+    with pytest.raises(PasswordError):
+        resolve_credentials("one", password, directory=initialised)
+
+
+@pytest.mark.parametrize("password", ["", "   ", "\t\n"])
+def test_rotation_refuses_an_absent_new_password_and_changes_nothing(
+    initialised, password
+):
+    """The irreversible one: rotating *to* an empty password would leave a store
+    that opens with nothing, with the old password gone."""
+    before = (initialised / "credentials").read_bytes()
+    with pytest.raises(PasswordError):
+        rotate_password(PASSWORD, password, directory=initialised)
+    assert (initialised / "credentials").read_bytes() == before
+    assert resolve_credentials("one", PASSWORD, directory=initialised) == CREDENTIALS
+
+
+@pytest.mark.parametrize("password", ["", "   ", "\t\n"])
+def test_rotation_refuses_an_absent_current_password(initialised, password):
+    with pytest.raises(PasswordError):
+        rotate_password(password, NEW_PASSWORD, directory=initialised)
+
+
+def test_an_absent_password_is_not_reported_as_a_damaged_store(initialised):
+    """`EmptyPasswordError` is a `CryptoError`, so the broad clause in
+    `_check_password` would otherwise recode "no password" as "the verifier is
+    unusable" — a message that sends the reader after the wrong problem."""
+    with pytest.raises(PasswordError) as raised:
+        resolve_credentials("one", "", directory=initialised)
+    assert "required" in str(raised.value)
+
+
+def test_rotation_keeps_top_level_fields_it_does_not_own(initialised):
+    """Rotation replaces the verifier and the profiles and leaves the rest of
+    the document alone. Rebuilding it from a literal would silently drop any
+    other field, and would leave the two write paths disagreeing about what a
+    document is — `set_credentials` preserves the whole thing."""
+    path = initialised / "credentials"
+    document = json.loads(path.read_bytes())
+    document["a_field_a_later_version_added"] = {"kept": True}
+    path.write_text(json.dumps(document))
+
+    rotate_password(PASSWORD, NEW_PASSWORD, directory=initialised)
+
+    after = json.loads(path.read_bytes())
+    assert after["a_field_a_later_version_added"] == {"kept": True}
+    assert resolve_credentials("one", NEW_PASSWORD, directory=initialised) == CREDENTIALS

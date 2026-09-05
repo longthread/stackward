@@ -55,7 +55,7 @@ import os
 import unicodedata
 from typing import Any
 
-from cryptography.exceptions import InvalidTag
+from cryptography.exceptions import InvalidTag, UnsupportedAlgorithm
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
 
@@ -128,7 +128,27 @@ class DecryptionError(CryptoError):
     this module performed itself."""
 
 
+class EmptyPasswordError(CryptoError):
+    """No password was supplied.
+
+    Argon2id derives a perfectly good 32-byte key from `b""`, so without this
+    check an empty password seals a real store that opens with no password at
+    all, silently and with no way to tell it apart from one that was protected.
+    Password *strength* is the prompting command's business; *emptiness* is not,
+    because `""` is indistinguishable from "nothing was supplied" — the same
+    reasoning `store.select_profile` applies to an empty `STACKWARD_PROFILE`."""
+
+
 def _normalise(password: str) -> bytes:
+    """NFC-normalise and encode, refusing a password that is not one.
+
+    The check lives here rather than at each store entry point so that no call
+    path can seal or open anything with an empty password by forgetting to ask.
+    Whitespace-only is refused too, and the password is *not* stripped: trimming
+    it would silently change what the user typed into something else.
+    """
+    if not password.strip():
+        raise EmptyPasswordError("a password is required")
     return unicodedata.normalize("NFC", password).encode("utf-8")
 
 
@@ -187,7 +207,18 @@ def _derive(password: str, salt: bytes, params: dict[str, int]) -> bytes:
     `ValueError`, `OverflowError` or `MemoryError` escape: a caller catching
     `CryptoError` must not have to enumerate the library's exception types to
     stay fail-closed.
+
+    `UnsupportedAlgorithm` is in that tuple for a case the others do not cover.
+    Argon2id needs an OpenSSL 3.2+ backend, and on an older one `cryptography`
+    raises it — inheriting straight from `Exception`, so it would otherwise sail
+    past every `except CryptoError` in `store.py` as a raw traceback on the one
+    class of machine where nothing about the store works.
+
+    `_normalise` runs outside the `try` on purpose: an empty password is this
+    module refusing, not the library rejecting, and must not be recoded as an
+    envelope problem.
     """
+    key_material = _normalise(password)
     try:
         return Argon2id(
             salt=salt,
@@ -195,8 +226,14 @@ def _derive(password: str, salt: bytes, params: dict[str, int]) -> bytes:
             iterations=params["iterations"],
             lanes=params["lanes"],
             memory_cost=params["memory_kib"],
-        ).derive(_normalise(password))
-    except (ValueError, OverflowError, MemoryError, TypeError) as exc:
+        ).derive(key_material)
+    except (
+        ValueError,
+        OverflowError,
+        MemoryError,
+        TypeError,
+        UnsupportedAlgorithm,
+    ) as exc:
         raise EnvelopeError(
             f"key derivation rejected the envelope's parameters ({type(exc).__name__})"
         ) from exc
