@@ -371,7 +371,7 @@ def test_yaml_error_redaction_removes_any_percent_r_escape_character(trigger_cha
     precisely what a test quantified over characters, rather than fixed to
     one, is for."""
     exc = _marked_yaml_error(f"found unknown escape character {trigger_char!r}")
-    message = check_config_module._describe_yaml_error(exc)
+    message = check_config_module.describe_yaml_error(exc)
     assert trigger_char not in message
     assert "<redacted>" in message
     assert "found unknown escape character" in message
@@ -386,7 +386,7 @@ def test_yaml_error_redaction_removes_any_percent_r_reserved_character(trigger_c
     any token"."""
     problem = f"found character {trigger_char!r} that cannot start any token"
     exc = _marked_yaml_error(problem)
-    message = check_config_module._describe_yaml_error(exc)
+    message = check_config_module.describe_yaml_error(exc)
     assert trigger_char not in message
     assert "<redacted>" in message
     assert "found character" in message

@@ -18,6 +18,7 @@ from pathlib import Path
 
 from . import __version__
 from .commands.check_config import cmd_check_config
+from .commands.pre_commit import cmd_pre_commit
 from .config import find_repo_config
 
 # Commands that must keep working even when a repo demands a newer stackward
@@ -118,6 +119,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     check_config.add_argument("files", nargs="+", metavar="FILE")
     check_config.set_defaults(func=cmd_check_config)
+
+    pre_commit = sub.add_parser(
+        "pre-commit",
+        help="check staged content for a plaintext credential (git hook body)",
+    )
+    pre_commit.set_defaults(func=cmd_pre_commit)
 
     return parser
 

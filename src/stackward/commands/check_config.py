@@ -25,7 +25,7 @@ from ..nets.heuristic import DocumentError, find_plaintext_credentials
 # to double quotes whenever the value contains `'` and no `"` (so `%r` on a
 # lone apostrophe is `"'"`, not `'''`), which is why both delimiter forms
 # are matched here: matching only `'...'` leaves exactly that one trigger
-# character unredacted. See `_describe_yaml_error` for why every such
+# character unredacted. See `describe_yaml_error` for why every such
 # fragment gets redacted rather than trusted.
 _QUOTED_FRAGMENT = re.compile(r"'[^']*'|\"[^\"]*\"")
 
@@ -33,7 +33,13 @@ _QUOTED_FRAGMENT = re.compile(r"'[^']*'|\"[^\"]*\"")
 class CheckError(Exception):
     """A file could not be checked at all: an unreadable path, unparsable
     YAML, or a document that is not a mapping. Maps to exit code 2, never
-    1 — that code means "a credential was found", which this is not."""
+    1 — that code means "a credential was found", which this is not.
+
+    Reused as-is by `commands.pre_commit` for the same "could not run"
+    conditions on a staged blob (undecodable content, unparsable YAML, a
+    non-mapping document, an unmerged index entry, a git command that
+    failed) — one exception type for one meaning, not a second class that
+    would have to be kept consistent with this one by hand."""
 
 
 def scan_file(path: Path, check: CheckConfig) -> list[str]:
@@ -60,7 +66,7 @@ def scan_file(path: Path, check: CheckConfig) -> list[str]:
     try:
         document = yaml.safe_load(text)
     except yaml.YAMLError as exc:
-        raise CheckError(f"{path}: invalid YAML: {_describe_yaml_error(exc)}") from exc
+        raise CheckError(f"{path}: invalid YAML: {describe_yaml_error(exc)}") from exc
 
     try:
         return find_plaintext_credentials(document, check)
@@ -68,10 +74,16 @@ def scan_file(path: Path, check: CheckConfig) -> list[str]:
         raise CheckError(f"{path}: {exc}") from exc
 
 
-def _describe_yaml_error(exc: yaml.YAMLError) -> str:
+def describe_yaml_error(exc: yaml.YAMLError) -> str:
     """A `YAMLError` message built only from PyYAML's own description and
     the error position, with every repr-quoted fragment in it redacted —
     never from `str(exc)`.
+
+    Public (not `_`-prefixed) specifically so `commands.pre_commit` can
+    reuse it for the same reason: a staged blob it parses can hold a
+    credential just as easily as a file on disk can, so a YAML parse
+    failure there needs the exact same redaction, not a second,
+    independently-written copy of it.
 
     `str(exc)` on a `MarkedYAMLError` calls `Mark.__str__`, which calls
     `Mark.get_snippet()` and emits the *whole source line* around the
@@ -141,7 +153,7 @@ def cmd_check_config(args: argparse.Namespace) -> int:
     propagate: Python's default exit code for an uncaught exception is 1,
     which here would misreport "a credential was found" for a file this
     command never actually finished evaluating. The message never includes
-    `str(exc)`, for the same reason `_describe_yaml_error` avoids it: an
+    `str(exc)`, for the same reason `describe_yaml_error` avoids it: an
     unanticipated exception's text is not something this module can vouch
     for as free of file content.
     """
