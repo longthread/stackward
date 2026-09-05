@@ -26,6 +26,31 @@ Two rules a plausible implementation gets wrong — see `_is_encrypted` and
 - "Empty" is `None` or `""`, tested so that `True`/`False` also pass but the
   integers `0` and `1` do not — a plain `value in (None, "", False, True)`
   gets this backwards, because `0 == False` and `1 == True` in Python.
+
+A third rule, added after the first version of this module shipped:
+**a key matching `sensitive_keys` makes its entire subtree sensitive**, not
+just a leaf sitting directly under it. The `{"secure": ...}` envelope is
+itself one level of nesting — `apiToken: {"secure": "v1:..."}` puts the
+actual leaf at `apiToken.secure`, whose own key is `secure`, which matches
+no built-in pattern. Under the original "only the leaf's own key, or an
+explicitly-declared `sensitive_parents` ancestor" rule, that leaf was never
+even considered sensitive when a repository declares no `sensitive_parents`
+— which is every repository's starting policy, since `sensitive_parents`
+ships empty by design. That made the malformed-envelope case this module
+exists to catch (`apiToken: {"secure": X, "other": Y}`, `other` a plaintext
+leak) *unreachable* under the default policy: neither `secure` nor `other`
+ever became a candidate, so `_is_encrypted`'s careful parent-shape check
+never ran. Propagating `sensitive_keys` down the subtree closes that gap
+without inventing an environment-specific default for `sensitive_parents`
+(which Global Constraint 5 forbids) — it needs no new configuration, only a
+key a repository (or the built-ins) already flagged as sensitive.
+
+**Accepted cost:** a sensitive-keyed mapping holding structured
+non-credential data now reports every leaf beneath it —
+`token_settings: {retries: 3}` flags `token_settings.retries`, even though
+`3` is not a credential. This is a deliberate trade, not an oversight: in a
+commit gate, a false positive costs someone a minute reading a diff; a
+missed credential is permanent and public the moment it is pushed.
 """
 
 from __future__ import annotations
@@ -62,12 +87,14 @@ def find_plaintext_credentials(document: Any, check: CheckConfig) -> list[str]:
     `git show ":<path>"` blob.
 
     A leaf is a finding when its own key matches `check.sensitive_keys`
-    (case-insensitive substring) or any strict ancestor key is a member of
+    (case-insensitive substring), OR any ancestor key matched
+    `check.sensitive_keys`, OR any ancestor key is a member of
     `check.sensitive_parents` — unless the leaf's parent mapping is the
     `{"secure": ...}` encryption wrapper, the value is empty (`None`, `""`,
     `True` or `False`), or the leaf's rendered path is one of
     `check.allowed_references` (a path that names another secret rather
-    than holding one).
+    than holding one). A sensitive key's subtree is sensitive all the way
+    down — see the module docstring for why.
 
     Returns the rendered paths of every finding, sorted. Never returns or
     inspects a value for anything other than its structure and identity —
@@ -86,7 +113,7 @@ def find_plaintext_credentials(document: Any, check: CheckConfig) -> list[str]:
         allowed_references=frozenset(check.allowed_references),
         findings=[],
     )
-    _walk(document, [], frozenset(), ctx)
+    _walk(document, [], False, ctx)
     return sorted(ctx.findings)
 
 
@@ -94,7 +121,7 @@ def find_plaintext_credentials(document: Any, check: CheckConfig) -> list[str]:
 class _ScanContext:
     """The parts of a scan that stay the same as `_walk`/`_check_leaf`
     recurse, bundled so their signatures carry only what actually varies
-    per call: the node, its path, and its ancestor set.
+    per call: the node, its path, and whether an ancestor was sensitive.
 
     `findings` is a plain mutable list, appended to in place — `frozen`
     only stops `_walk`/`_check_leaf` from *reassigning* `ctx.findings` to a
@@ -109,15 +136,19 @@ class _ScanContext:
 def _walk(
     node: Any,
     path: list[str | int],
-    ancestors: frozenset[str],
+    ancestor_sensitive: bool,
     ctx: _ScanContext,
 ) -> None:
     """Recurse through `node`, appending a rendered path to `ctx.findings`
-    for every leaf that qualifies. `ancestors` holds every dict key seen
-    strictly above the current position — never the current key itself,
-    since `sensitive_parents` matching is defined over ancestors, and a
-    key's own membership in `sensitive_parents` only matters for what is
-    *beneath* it.
+    for every leaf that qualifies.
+
+    `ancestor_sensitive` is true once any *strict* ancestor key has matched
+    `sensitive_keys` or belonged to `sensitive_parents` — never the current
+    key itself, since that key's own contribution (if any) is what makes
+    its *children* sensitive, not itself; a leaf's own sensitivity is
+    checked separately in `_check_leaf`. It only ever turns true going
+    down and is never cleared, so a sensitive key's entire subtree stays
+    sensitive to the bottom.
     """
     if isinstance(node, dict):
         for raw_key, value in node.items():
@@ -128,16 +159,19 @@ def _walk(
             key = raw_key if isinstance(raw_key, str) else str(raw_key)
             child_path = [*path, key]
             if isinstance(value, (dict, list)):
-                _walk(value, child_path, ancestors | {key}, ctx)
+                key_is_sensitive = _matches_sensitive_key(
+                    key, ctx.check.sensitive_keys
+                ) or key in ctx.check.sensitive_parents
+                _walk(value, child_path, ancestor_sensitive or key_is_sensitive, ctx)
             else:
-                _check_leaf(node, key, value, child_path, ancestors, ctx)
+                _check_leaf(node, key, value, child_path, ancestor_sensitive, ctx)
     elif isinstance(node, list):
         for index, value in enumerate(node):
             child_path = [*path, index]
             if isinstance(value, (dict, list)):
-                _walk(value, child_path, ancestors, ctx)
+                _walk(value, child_path, ancestor_sensitive, ctx)
             else:
-                _check_leaf(None, None, value, child_path, ancestors, ctx)
+                _check_leaf(None, None, value, child_path, ancestor_sensitive, ctx)
 
 
 def _check_leaf(
@@ -145,7 +179,7 @@ def _check_leaf(
     own_key: str | None,
     value: Any,
     path: list[str | int],
-    ancestors: frozenset[str],
+    ancestor_sensitive: bool,
     ctx: _ScanContext,
 ) -> None:
     """Decide whether the scalar `value` at `path` is a finding.
@@ -153,14 +187,14 @@ def _check_leaf(
     `parent` is the mapping directly containing this leaf (`None` when the
     leaf sits directly in a list, which cannot be the `{"secure": ...}`
     shape). `own_key` is that mapping's key for this leaf (`None` for a
-    list element, which has no name to match `sensitive_keys` against —
-    only an ancestor dict key further up can make such a leaf sensitive).
+    list element, which has no name of its own to match `sensitive_keys`
+    against — only sensitivity inherited from a strict ancestor can make
+    such a leaf sensitive).
     """
     sensitive_by_key = own_key is not None and _matches_sensitive_key(
         own_key, ctx.check.sensitive_keys
     )
-    sensitive_by_ancestor = bool(ancestors & ctx.check.sensitive_parents)
-    if not (sensitive_by_key or sensitive_by_ancestor):
+    if not (sensitive_by_key or ancestor_sensitive):
         return
     if parent is not None and _is_encrypted(parent):
         return

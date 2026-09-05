@@ -73,6 +73,60 @@ def test_malformed_secure_wrapper_with_extra_sibling_is_flagged():
     ]
 
 
+# ---------------------------------------------------------------------------
+# Ruling: a sensitive key propagates to its subtree. Without this, the
+# malformed-envelope case above is unreachable under the default policy —
+# see the module docstring for why.
+# ---------------------------------------------------------------------------
+
+
+def test_encrypted_leaf_passes_under_default_policy_via_key_propagation():
+    """`apiToken` matches `sensitive_keys` directly and propagates to its
+    subtree; the leaf `apiToken.secure` inherits that sensitivity, but its
+    parent mapping is exactly `{"secure": ...}` — still exempt. The
+    exemption keeps working through propagation, exactly as it did through
+    `sensitive_parents` above."""
+    document = {"apiToken": {"secure": "v1:AAAA"}}
+    assert find_plaintext_credentials(document, CheckConfig()) == []
+
+
+def test_malformed_secure_wrapper_flagged_under_default_policy():
+    """Regression for the propagation ruling: under the shipped default
+    policy (no `sensitive_parents` declared, which is every repository's
+    starting policy), this returned `[]` before propagation — neither
+    "secure" nor "other" matches a built-in key, and no ancestor was
+    declared a sensitive parent, so `_is_encrypted`'s parent-shape check
+    never even ran. A sensitive key now makes its whole subtree sensitive,
+    so both leaves are correctly flagged."""
+    document = {"apiToken": {"secure": "v1:AAAA", "other": "leaked-plaintext"}}
+    findings = find_plaintext_credentials(document, CheckConfig())
+    assert findings == ["apiToken.other", "apiToken.secure"]
+
+
+def test_sensitive_key_propagates_through_several_levels_of_nesting():
+    document = {"credential": {"a": {"b": {"c": "leaked-plaintext"}}}}
+    assert find_plaintext_credentials(document, CheckConfig()) == ["credential.a.b.c"]
+
+
+def test_empty_value_under_a_sensitive_key_still_passes():
+    """Empty beats propagation: a sensitive key's subtree still exempts
+    `None`/`""`/`True`/`False` leaves, same as a directly-matched key
+    would."""
+    document = {"credential": {"nested": {"value": None}}}
+    assert find_plaintext_credentials(document, CheckConfig()) == []
+
+
+def test_propagation_does_not_leak_to_a_sibling_non_sensitive_mapping():
+    """A sensitive key's subtree is sensitive; an unrelated sibling
+    subtree, whose own keys match nothing, is not — propagation flows
+    down a branch, never sideways."""
+    document = {
+        "credential": {"a": "leaked-plaintext"},
+        "unrelated": {"b": "not-flagged-by-this-policy"},
+    }
+    assert find_plaintext_credentials(document, CheckConfig()) == ["credential.a"]
+
+
 def test_none_and_empty_string_pass():
     document = {"password": None, "token": ""}
     assert find_plaintext_credentials(document, CheckConfig()) == []
