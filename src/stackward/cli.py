@@ -17,13 +17,12 @@ import sys
 from pathlib import Path
 
 from . import __version__
+from .config import find_repo_config
 
 # Commands that must keep working even when a repo demands a newer stackward
 # than the one installed. Without this exemption the upgrade instruction would
 # itself be blocked by the check that prints it.
 VERSION_CHECK_EXEMPT = frozenset({"doctor", "self-update"})
-
-CONFIG_FILENAME = ".stackward.toml"
 
 
 def config_home() -> Path:
@@ -31,22 +30,6 @@ def config_home() -> Path:
     xdg = os.environ.get("XDG_CONFIG_HOME")
     base = Path(xdg) if xdg else Path.home() / ".config"
     return base / "stackward"
-
-
-def find_repo_config(start: Path | None = None) -> Path | None:
-    """Nearest .stackward.toml at or above `start`, stopping at the repo root.
-
-    Returns None rather than falling back to a default: a tool that guesses
-    which backend it is talking to is worse than one that refuses.
-    """
-    current = (start or Path.cwd()).resolve()
-    for candidate in [current, *current.parents]:
-        config = candidate / CONFIG_FILENAME
-        if config.is_file():
-            return config
-        if (candidate / ".git").exists():
-            break
-    return None
 
 
 def _tool_version(name: str) -> str:

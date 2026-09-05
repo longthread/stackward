@@ -9,7 +9,6 @@ from stackward.cli import (
     VERSION_CHECK_EXEMPT,
     config_home,
     crypto_selftest,
-    find_repo_config,
     main,
 )
 
@@ -76,28 +75,3 @@ def test_config_home_falls_back_to_dot_config(monkeypatch, tmp_path):
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     assert config_home() == tmp_path / ".config" / "stackward"
-
-
-def test_repo_config_found_from_a_subdirectory(tmp_path):
-    (tmp_path / ".git").mkdir()
-    config = tmp_path / ".stackward.toml"
-    config.write_text("")
-    nested = tmp_path / "deploy" / "nested"
-    nested.mkdir(parents=True)
-    assert find_repo_config(nested) == config
-
-
-def test_repo_config_absent_returns_none_rather_than_guessing(tmp_path):
-    """Refusing beats defaulting: a tool that guesses which backend it is
-    pointed at can publish a credential to the wrong place."""
-    (tmp_path / ".git").mkdir()
-    assert find_repo_config(tmp_path) is None
-
-
-def test_search_stops_at_the_repo_root(tmp_path):
-    """A config outside the repository must not be picked up — it would make
-    behaviour depend on where the repo happens to be checked out."""
-    (tmp_path / ".stackward.toml").write_text("")
-    repo = tmp_path / "repo"
-    (repo / ".git").mkdir(parents=True)
-    assert find_repo_config(repo) is None
