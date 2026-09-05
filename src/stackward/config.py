@@ -65,6 +65,7 @@ _CHECK_KEYS = frozenset(
     {
         "model_net",
         "stack_models",
+        "declared_paths_fn",
         "sensitive_keys",
         "sensitive_parents",
         "allowed_references",
@@ -94,6 +95,9 @@ class CheckConfig:
 
     model_net: str = "none"
     stack_models: dict[str, str] = field(default_factory=dict)
+    # `"module:function"`, or None for this tool's own marking convention.
+    # See `_require_module_class` for why the shape is validated here.
+    declared_paths_fn: str | None = None
     sensitive_keys: frozenset[str] = BUILTIN_SENSITIVE_KEYS
     sensitive_parents: frozenset[str] = BUILTIN_SENSITIVE_PARENTS
     allowed_references: list[str] = field(default_factory=list)
@@ -236,6 +240,18 @@ def _build_check(raw: Any) -> CheckConfig:
         _require_module_class(target, f"check.stack_models.{namespace!r}")
         stack_models[namespace] = target
 
+    declared_paths_fn = _require_str(
+        raw, "declared_paths_fn", "check.declared_paths_fn"
+    )
+    if declared_paths_fn is not None:
+        # The escape hatch for a repository whose marking convention is not
+        # this tool's `json_schema_extra={"secret": True}`. Same
+        # `"module:Attribute"` shape as `stack_models`, and validated here for
+        # the same reason: a malformed value would otherwise surface as a
+        # confusing ImportError inside the generator subprocess, far from the
+        # file that caused it.
+        _require_module_class(declared_paths_fn, "check.declared_paths_fn")
+
     sensitive_keys = _require_str_list(raw, "sensitive_keys", "check.sensitive_keys")
     sensitive_parents = _require_str_list(
         raw, "sensitive_parents", "check.sensitive_parents"
@@ -247,6 +263,7 @@ def _build_check(raw: Any) -> CheckConfig:
     return CheckConfig(
         model_net=model_net,
         stack_models=stack_models,
+        declared_paths_fn=declared_paths_fn,
         sensitive_keys=_extend(BUILTIN_SENSITIVE_KEYS, sensitive_keys),
         sensitive_parents=_replace(BUILTIN_SENSITIVE_PARENTS, sensitive_parents),
         allowed_references=list(allowed_references or []),

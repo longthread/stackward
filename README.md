@@ -25,6 +25,7 @@ diff. `stackward` exists to make that mistake hard.
 | `login` | Point Pulumi at a profile's backend |
 | `set-secrets` | Publish stack secrets from a declared manifest, values on stdin |
 | `check-passphrase` | Verify a passphrase actually decrypts a stack, rather than merely exiting 0 |
+| `sync-declared-secrets` | Regenerate the committed graph of secrets a repo's own models declare |
 
 ## Design commitments
 

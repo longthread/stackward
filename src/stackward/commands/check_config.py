@@ -1,11 +1,27 @@
-"""`check-config`: the heuristic net, run over one or more stack config files.
+"""`check-config`: the credential nets, run over one or more stack config files.
 
 Registered in `cli.build_parser` as `stackward check-config FILE...`. Exit
 codes are deliberately distinct: 0 clean, 1 a credential was found, 2 the
 check could not run at all (an unreadable path, unparsable YAML, a
-`.stackward.toml` this module could not load, or a document that is not a
-mapping) — never conflated, so a later fail-closed refusal (also exit 2)
-reads the same way this one does: "the gate did not get to answer".
+`.stackward.toml` this module could not load, a document that is not a
+mapping, or a model-net artifact that is missing, malformed or stale) —
+never conflated, so a fail-closed refusal reads the same way whichever check
+made it: "the gate did not get to answer".
+
+**Two nets, unioned.** `nets.heuristic` names a credential by the shape of
+its key and needs no cooperation from the repository. `nets.model` names one
+the repository *declared*, by walking a committed graph of its own pydantic
+models against the document. A leaf either net names is a finding, and a leaf
+both name is reported once — `scan_file` unions the two through a set, so a
+path found twice does not print twice.
+
+**A stale model net is exit 2, not exit 1.** `load_model_net` raises rather
+than returning an empty net when the artifact is missing, unreadable or no
+longer matches the sources it was generated from, and this module maps that
+to "could not run". Reporting it as a finding would file a fail-closed
+refusal under "a credential was found"; reporting it as clean would be worse
+still. `model_net = "none"` is the *declared* way to run without that net,
+and is never reached as a fallback from a failure.
 """
 
 from __future__ import annotations
@@ -21,6 +37,7 @@ import yaml
 
 from ..config import CheckConfig, ConfigError, find_repo_config, load_config
 from ..nets.heuristic import DocumentError, find_plaintext_credentials
+from ..nets.model import ModelNet, ModelNetError, find_declared_credentials, load_model_net
 
 # Matches a repr-quoted fragment the way PyYAML's `%r` interpolation
 # produces one — e.g. `'2'`, `` '`' ``, `'id001'`. Python's `repr()` flips
@@ -89,17 +106,25 @@ def fail_closed(
     return wrapped
 
 
-def scan_file(path: Path, check: CheckConfig) -> list[str]:
-    """Thin file-path wrapper over `find_plaintext_credentials`.
+def scan_file(
+    path: Path, check: CheckConfig, net: ModelNet | None = None
+) -> list[str]:
+    """Thin file-path wrapper over both nets, unioned.
 
     Reads `path` from the working tree and parses it as YAML before handing
-    the result to the content-level net. This is deliberately the *only*
-    place that happens: `find_plaintext_credentials` itself takes
-    already-parsed document data, so a caller that must check staged
-    content instead of the working tree — `pre-commit`, reading
-    `git show ":<path>"` — calls that function directly rather than going
-    through this wrapper, and never round-trips a blob through a temp file
-    to get there.
+    the result to the content-level nets. This is deliberately the *only*
+    place that happens: both nets take already-parsed document data, so a
+    caller that must check staged content instead of the working tree —
+    `pre-commit`, reading `git show ":<path>"` — calls them directly rather
+    than going through this wrapper, and never round-trips a blob through a
+    temp file to get there.
+
+    `net` is `None` when the repository declares `model_net = "none"`, or
+    has no `[check]` policy at all; the heuristic net always runs. The two
+    result lists are unioned through a set, because both nets can name the
+    same leaf — a field marked `secret` whose key is also called `password`
+    is the ordinary case, not a corner one — and a finding printed twice
+    reads as two problems.
 
     Raises `CheckError` for anything that means the check could not run:
     the path cannot be read, the content is not valid YAML, or the parsed
@@ -116,9 +141,12 @@ def scan_file(path: Path, check: CheckConfig) -> list[str]:
         raise CheckError(f"{path}: invalid YAML: {describe_yaml_error(exc)}") from exc
 
     try:
-        return find_plaintext_credentials(document, check)
+        found = set(find_plaintext_credentials(document, check))
+        if net is not None:
+            found |= set(find_declared_credentials(document, net, check))
     except DocumentError as exc:
         raise CheckError(f"{path}: {exc}") from exc
+    return sorted(found)
 
 
 def describe_yaml_error(exc: yaml.YAMLError) -> str:
@@ -210,6 +238,12 @@ def cmd_check_config(args: argparse.Namespace) -> int:
     ConfigError` below only catches that one type — is caught instead by
     the `@fail_closed` decorator wrapping this function, for the same
     "never exit 1 for a reason other than a real finding" guarantee.
+
+    The model net is loaded once, before the loop, and a failure to load it
+    exits 2 without scanning anything. That ordering is the point: a stale
+    artifact means this command does not know what the repository declared,
+    so reporting the *other* net's findings and exiting 1 would announce a
+    complete answer it does not have.
     """
     try:
         check = _load_check_policy()
@@ -217,11 +251,17 @@ def cmd_check_config(args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    try:
+        net = load_model_net(check)
+    except ModelNetError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
     findings: list[tuple[str, str]] = []
     errored = False
     for file_arg in args.files:
         try:
-            paths = scan_file(Path(file_arg), check)
+            paths = scan_file(Path(file_arg), check, net)
         except CheckError as exc:
             print(f"error: {exc}", file=sys.stderr)
             errored = True

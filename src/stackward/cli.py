@@ -23,6 +23,7 @@ from .commands.install_hooks import cmd_install_hooks
 from .commands.pre_commit import cmd_pre_commit
 from .commands.session import cmd_exec, cmd_login, cmd_shell
 from .commands.set_secrets import cmd_set_secrets
+from .commands.sync_declared import cmd_sync_declared
 from .config import find_repo_config
 
 # Commands that must keep working even when a repo demands a newer stackward
@@ -166,6 +167,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="report what would be set without running pulumi",
     )
     set_secrets.set_defaults(func=cmd_set_secrets)
+
+    sync_declared = sub.add_parser(
+        "sync-declared-secrets",
+        help="regenerate the declared-secrets artifact from this repo's models",
+    )
+    sync_declared.set_defaults(func=cmd_sync_declared)
 
     check_passphrase = sub.add_parser(
         "check-passphrase",

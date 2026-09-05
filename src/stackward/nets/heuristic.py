@@ -16,8 +16,8 @@ file on disk (`commands.check_config`) and from a staged git blob
 (`commands.pre_commit`, checking `git show ":<path>"` output) without either
 caller having to round-trip through a temp file first.
 
-Two rules a plausible implementation gets wrong — see `_is_encrypted` and
-`_is_empty` for why, in detail:
+Two rules a plausible implementation gets wrong — see `is_encrypted` and
+`is_empty` for why, in detail:
 
 - "Encrypted" is a property of the leaf's *parent mapping*, not of the
   leaf's own path text. `path.endswith(".secure")` cannot tell a genuine
@@ -39,7 +39,7 @@ even considered sensitive when a repository declares no `sensitive_parents`
 ships empty by design. That made the malformed-envelope case this module
 exists to catch (`apiToken: {"secure": X, "other": Y}`, `other` a plaintext
 leak) *unreachable* under the default policy: neither `secure` nor `other`
-ever became a candidate, so `_is_encrypted`'s careful parent-shape check
+ever became a candidate, so `is_encrypted`'s careful parent-shape check
 never ran. Propagating `sensitive_keys` down the subtree closes that gap
 without inventing an environment-specific default for `sensitive_parents`
 (which Global Constraint 5 forbids) — it needs no new configuration, only a
@@ -220,9 +220,9 @@ def _check_leaf(
     )
     if not (sensitive_by_key or ancestor_sensitive):
         return
-    if parent is not None and _is_encrypted(parent):
+    if parent is not None and is_encrypted(parent):
         return
-    if _is_empty(value):
+    if is_empty(value):
         return
     rendered = render(path)
     if rendered in ctx.allowed_references:
@@ -235,9 +235,16 @@ def _matches_sensitive_key(key: str, sensitive_keys: frozenset[str]) -> bool:
     return any(pattern.lower() in lowered for pattern in sensitive_keys)
 
 
-def _is_encrypted(parent: dict[str, Any]) -> bool:
+def is_encrypted(parent: dict[str, Any]) -> bool:
     """The leaf's parent mapping is exactly `{"secure": ...}` — one key,
     named `secure`.
+
+    Public (not `_`-prefixed) so `nets.model` can reuse it, for the same
+    reason `check_config.describe_yaml_error` is public: the model net has
+    to make the identical "is this leaf actually a credential?" decision,
+    and two independently-written copies of this check would eventually
+    disagree about the same leaf — which, since the two nets are unioned,
+    would show up as one net reporting a value the other suppressed.
 
     Tested against the mapping's shape, never against the leaf's own
     rendered path: `path.endswith(".secure")` cannot distinguish this from
@@ -248,9 +255,12 @@ def _is_encrypted(parent: dict[str, Any]) -> bool:
     return set(parent.keys()) == _SECURE_WRAPPER_KEYS
 
 
-def _is_empty(value: Any) -> bool:
+def is_empty(value: Any) -> bool:
     """`None`, `""`, `True` and `False` are excluded; every integer,
     including `0` and `1`, is not.
+
+    Public for the same reason as `is_encrypted` above: `nets.model` needs
+    exactly this predicate, not a second one that agrees with it today.
 
     `None`/`True`/`False` are tested by identity and `""` by an
     exact-type-safe equality (`isinstance` first) — never by a containment

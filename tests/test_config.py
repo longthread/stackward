@@ -139,6 +139,41 @@ def test_check_stack_models_value_with_empty_class_raises(tmp_path):
         )
 
 
+def test_check_declared_paths_fn_defaults_to_none(tmp_path):
+    """Absent means this tool's own marking convention, not a disabled net."""
+    config = load_config(write_config(tmp_path, "[check]\n"))
+    assert config.check.declared_paths_fn is None
+
+
+def test_check_declared_paths_fn_is_parsed(tmp_path):
+    config = load_config(
+        write_config(
+            tmp_path,
+            '[check]\ndeclared_paths_fn = "conventions.marks:secret_fields"\n',
+        )
+    )
+    assert config.check.declared_paths_fn == "conventions.marks:secret_fields"
+
+
+def test_check_declared_paths_fn_with_no_colon_raises(tmp_path):
+    """Same shape as `stack_models`, rejected here for the same reason: a
+    malformed value would otherwise surface as a confusing ImportError deep
+    inside the generator subprocess, far from the file that caused it."""
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(
+            write_config(
+                tmp_path,
+                '[check]\ndeclared_paths_fn = "conventions.marks.secret_fields"\n',
+            )
+        )
+    assert "declared_paths_fn" in str(exc_info.value)
+
+
+def test_check_declared_paths_fn_must_be_a_string(tmp_path):
+    with pytest.raises(ConfigError):
+        load_config(write_config(tmp_path, "[check]\ndeclared_paths_fn = 3\n"))
+
+
 def test_check_sensitive_keys_is_parsed_and_extends_the_builtins(tmp_path):
     config = load_config(
         write_config(tmp_path, '[check]\nsensitive_keys = ["jwtsecret"]\n')

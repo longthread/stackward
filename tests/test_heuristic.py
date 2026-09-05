@@ -119,7 +119,7 @@ def test_malformed_secure_wrapper_flagged_under_default_policy():
     policy (no `sensitive_parents` declared, which is every repository's
     starting policy), this returned `[]` before propagation — neither
     "secure" nor "other" matches a built-in key, and no ancestor was
-    declared a sensitive parent, so `_is_encrypted`'s parent-shape check
+    declared a sensitive parent, so `is_encrypted`'s parent-shape check
     never even ran. A sensitive key now makes its whole subtree sensitive,
     so both leaves are correctly flagged."""
     document = {"apiToken": {"secure": "v1:AAAA", "other": "leaked-plaintext"}}
