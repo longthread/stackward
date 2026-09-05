@@ -68,7 +68,23 @@ fi
 # SIGBUSes anything mid-invocation — a git hook, for instance.
 mkdir -p "$TMP/x" && tar -xzf "$TMP/$ASSET" -C "$TMP/x"
 [ -x "$TMP/x/stackward/stackward" ] || die "archive does not contain the expected layout"
-RESOLVED="$("$TMP/x/stackward/stackward" --version | awk '{print $2}')"
+
+# Running it here is also the compatibility check: a bundle links against the
+# glibc it was built on, and the resulting error is otherwise cryptic and
+# arrives later, at some unrelated moment.
+if ! RESOLVED="$("$TMP/x/stackward/stackward" --version 2>"$TMP/err")"; then
+  if grep -q 'GLIBC_' "$TMP/err" 2>/dev/null; then
+    printf 'install: this build needs a newer C library than this system provides.\n' >&2
+    sed 's/^/  /' "$TMP/err" >&2
+    printf '  Linux builds require glibc 2.35 or newer (Ubuntu 22.04, Debian 12,\n' >&2
+    printf '  RHEL 9 and later). On an older system, install from source:\n' >&2
+    printf '    https://github.com/%s\n' "$REPO" >&2
+    exit 1
+  fi
+  sed 's/^/  /' "$TMP/err" >&2
+  die "the downloaded binary could not run on this system"
+fi
+RESOLVED="$(printf '%s' "$RESOLVED" | awk '{print $2}')"
 [ -n "$RESOLVED" ] || die "extracted binary did not report a version"
 
 TARGET="$LIBDIR/$RESOLVED"

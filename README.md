@@ -49,13 +49,31 @@ These are constraints, not aspirations — each has a test.
 
 ## Install
 
-Prebuilt binaries are published per release. Nothing needs to be installed to
-build or run them — no Python, no package manager.
+Prebuilt binaries are published per release. Nothing else is needed to run
+them — no Python, no package manager.
 
 ```sh
-# once the first release is published
 curl -fsSL https://github.com/longthread/stackward/releases/latest/download/install.sh | sh
 ```
+
+The installer verifies the published checksum, and build provenance too when
+`gh` is available. It installs each version into its own directory and swaps a
+symlink, so upgrading never disturbs a running process — a git hook, for
+instance.
+
+Pin the version in CI; a build should not move underneath you:
+
+```sh
+STACKWARD_VERSION=v0.1.0 sh install.sh
+```
+
+| Platform | Requirement |
+|---|---|
+| Linux x86-64 | glibc 2.35 or newer — Ubuntu 22.04, Debian 12, RHEL 9 and later |
+| macOS arm64 | Apple silicon |
+
+Older glibc, other architectures, and Windows are not built. The installer says
+so plainly rather than installing something that cannot start.
 
 ## Development
 
