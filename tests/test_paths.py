@@ -227,3 +227,54 @@ def test_invalid_escape_sequence_raises_value_error_naming_the_position():
     message = str(exc_info.value)
     assert "position 4" in message  # the stray backslash itself
     assert "b\\nc" not in message
+
+
+# ---------------------------------------------------------------------------
+# The grammar's refusals. Every branch below is a `ValueError` that no other
+# test in this file reaches, and `set_secrets.parse_project_manifest` wraps
+# `parse` in its own `try`, so none of them can ever surface as a traceback a
+# reader would notice. A refusal that has never executed is where a fail-open
+# hides: the branch could have been deleted, or could raise something the
+# caller does not catch, and the suite would stay green either way.
+#
+# Each case asserts the position as well as the wording, because the position
+# is what makes a refusal actionable, and asserts the offending text is absent
+# from the message, which is the promise `parse`'s own docstring makes.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("text", "position", "fragment"),
+    [
+        # A path may not begin with the separator: `.a` names no first segment.
+        (".a", 0, "cannot start with"),
+        # A bare key may not contain a character that only means something
+        # inside the bracket form -- here the closing bracket itself.
+        ("a]b", 1, "unexpected character in key"),
+        # A quoted key whose closing `"` never arrives.
+        ('a["b', 3, "unterminated quoted key"),
+        # A quoted key that closes, followed by anything other than `]`.
+        ('a["b"c', 5, "expected ']' after quoted key"),
+        # A bare character resuming straight after a bracket, with no
+        # separator -- the `b` in `a[0]b`.
+        ("a[0]b", 4, "expected '.' or '['"),
+    ],
+)
+def test_a_malformed_path_is_refused_naming_the_position(text, position, fragment):
+    with pytest.raises(ValueError) as exc_info:
+        parse(text)
+    message = str(exc_info.value)
+    assert f"position {position}" in message
+    assert fragment in message
+    assert text not in message
+
+
+def test_the_empty_path_is_refused():
+    """Its own test rather than a parametrised case: there is no offending
+    text to assert the absence of, and `""` is a substring of every string,
+    so the shared `text not in message` assertion would be vacuous for it."""
+    with pytest.raises(ValueError) as exc_info:
+        parse("")
+    message = str(exc_info.value)
+    assert "position 0" in message
+    assert "empty path" in message

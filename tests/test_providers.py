@@ -29,7 +29,6 @@ value's appearance in output being treated as proof of anything.
 from __future__ import annotations
 
 import json
-import subprocess
 import sys
 import textwrap
 from pathlib import Path
@@ -67,6 +66,11 @@ MARKER_SECRET = "marker-secret-key-5e6f7a8b"
 MARKER_PASSPHRASE = "marker-passphrase-9c0d1e2f"
 MARKER_DB_PASSWORD = "marker-db-password-1a2b3c4d"
 MARKER_API_TOKEN = "marker-api-token-5e6f7a8b"
+
+# The one backend URL every profile in the three-provider contract test
+# carries. Named so the contract assertion can be anchored to it rather than
+# to whichever environment happened to be captured first.
+STAGING_BACKEND_URL = "file:///staging-backend"
 
 FULL_CREDENTIALS = {
     AWS_ACCESS_KEY_ID: MARKER_KEY,
@@ -826,11 +830,11 @@ def test_file_and_a_fake_remote_produce_identical_child_environments(
     command_toml = json.dumps(remote_command(remote_stub))
     write_store_config(
         store_dir,
-        '[profile.staging-file]\nbackend_url = "file:///staging-backend"\n\n'
-        '[profile.staging-remote]\nbackend_url = "file:///staging-backend"\n\n'
+        f'[profile.staging-file]\nbackend_url = "{STAGING_BACKEND_URL}"\n\n'
+        f'[profile.staging-remote]\nbackend_url = "{STAGING_BACKEND_URL}"\n\n'
         '[profile.staging-remote.credentials]\n'
         f'provider = "command"\ncommand = {command_toml}\n\n'
-        '[profile.staging-env]\nbackend_url = "file:///staging-backend"\n\n'
+        f'[profile.staging-env]\nbackend_url = "{STAGING_BACKEND_URL}"\n\n'
         '[profile.staging-env.credentials]\nprovider = "env"\n',
     )
     store.init_store(PASSWORD, directory=store_dir)
@@ -858,8 +862,14 @@ def test_file_and_a_fake_remote_produce_identical_child_environments(
     assert main(["exec", "--profile", "staging-env", "--", str(env_stub)]) == 0
     env_c = json.loads(dump_c.read_text())
 
+    # Anchored to the seeded constants, not to `env_a`. Deriving `expected`
+    # from one of the three environments makes the assertion say only "all
+    # three agree", which a uniform mutation in the shared `_child_env` --
+    # dropping a name, or injecting the wrong one under every provider --
+    # satisfies just as well as the correct behaviour does. Naming the values
+    # is what makes this test say what it means.
     relevant = (*CREDENTIAL_NAMES, PULUMI_BACKEND_URL)
-    expected = {key: env_a[key] for key in relevant}
+    expected = {**FULL_CREDENTIALS, PULUMI_BACKEND_URL: STAGING_BACKEND_URL}
+    assert {key: env_a[key] for key in relevant} == expected
     assert {key: env_b[key] for key in relevant} == expected
     assert {key: env_c[key] for key in relevant} == expected
-    assert env_a[AWS_ACCESS_KEY_ID] == MARKER_KEY

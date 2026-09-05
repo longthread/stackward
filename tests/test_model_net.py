@@ -251,6 +251,30 @@ def test_a_declared_field_holding_an_encryption_envelope_is_not_reported():
     assert match(document, SELF_REFERENTIAL) == []
 
 
+def test_a_marked_map_whose_only_key_is_literally_secure_is_an_accepted_false_negative():
+    """The adversarial case the plan names, pinned as **accepted**, not fixed.
+
+    A declared field may legitimately hold a mapping whose single key happens
+    to be the word `secure` and whose value is an ordinary plaintext string.
+    That is byte-for-byte the shape of Pulumi's encryption envelope, so
+    `heuristic.is_encrypted` suppresses it and the credential goes unreported.
+
+    This is a deliberate trade, not an oversight. The alternative is to decide
+    what a ciphertext looks like -- a version prefix, a length, an alphabet --
+    and every such rule reports *genuinely encrypted* values as findings the
+    day Pulumi changes its envelope format. A gate that fires on values it has
+    already succeeded in protecting is a gate that gets switched off, which
+    costs more than this one blind spot does.
+
+    So the test exists to say that out loud, and to fail if someone
+    "fixes" it: tightening `is_encrypted` to inspect the wrapped value is
+    exactly the change this docstring rules out, and the sibling test above
+    (whose value reads like a real ciphertext) would not notice it.
+    """
+    document = {"config": {"app:app": {"token": {"secure": "not-really-encrypted"}}}}
+    assert match(document, SELF_REFERENTIAL) == []
+
+
 def test_a_malformed_encryption_envelope_is_still_reported():
     """A sibling key beside `secure` means the mapping is not the envelope,
     and nothing tells a reader the sibling was not the value that leaked."""
@@ -1837,6 +1861,63 @@ def test_the_hook_reports_a_leaf_both_nets_name_once(repo, monkeypatch, capsys):
         if "plaintext credential at" in line
     ]
     assert len(lines) == 1
+
+
+# ---------------------------------------------------------------------------
+# Talking to git.
+# ---------------------------------------------------------------------------
+
+
+def test_every_git_invocation_runs_under_a_fixed_locale(repo, monkeypatch, capsys):
+    """`nets.model.run_git` is the third git call site in this tool, and the
+    last one without a fixed locale -- `commands.pre_commit` and
+    `commands.install_hooks` have theirs.
+
+    Hardening rather than a live fix here: every caller in this module
+    branches on `returncode`, never on git's text. But git's diagnostics are
+    gettext-marked, and this module quotes git's stderr verbatim into a
+    `ModelNetError` a reader is expected to act on.
+
+    **The merge is the half that matters.** git exports `GIT_DIR` and
+    `GIT_INDEX_FILE` to a hook process, and this module's `ls-files`/`show`
+    calls are what read the index the commit is being gated on. A bare
+    `env={"LC_ALL": "C"}` would silently point them at a different index than
+    `pre-commit` is checking -- a fail-open that no assertion about output
+    could catch, which is why the ambient marker is asserted alongside the
+    locale.
+
+    Driven through `check-config` under `model_net = "artifact"` rather than
+    by calling `run_git` directly, so it covers every invocation this module
+    makes -- `rev-parse`, `ls-files` and `show` -- rather than the one a
+    direct call happens to pick. `check-config` shells out to nothing but
+    git, so every recorded call came from this module.
+    """
+    write(repo, "declared.py", RECURSIVE_MODEL)
+    declare(repo)
+    git(repo, "add", "-A")
+    sync_and_commit(repo, monkeypatch, capsys)
+    write(repo, "Pulumi.dev.yaml", "name: myproject\n")
+
+    # Recording starts only now: this file's own `git` helper shells out too,
+    # and it is not what is under test.
+    monkeypatch.setenv("STACKWARD_TEST_MARKER", "inherited")
+    seen: list[dict[str, str] | None] = []
+    real_run = subprocess.run
+
+    def recording_run(args, **kwargs):
+        if args and args[0] == "git":
+            seen.append(kwargs.get("env"))
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", recording_run)
+    assert check(repo, monkeypatch) == 0
+    capsys.readouterr()
+
+    assert seen, "no git invocation was recorded"
+    for env in seen:
+        assert env is not None, "a git invocation inherited the ambient locale"
+        assert env.get("LC_ALL") == "C"
+        assert env.get("STACKWARD_TEST_MARKER") == "inherited"
 
 
 # ---------------------------------------------------------------------------

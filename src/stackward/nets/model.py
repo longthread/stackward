@@ -77,6 +77,7 @@ entirely; it is never reached as a fallback from a failure above.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -517,9 +518,27 @@ def run_git(args: list[str]) -> bytes:
     only invocations made through this helper are `rev-parse`, `ls-files` and
     `show` of the artifact path, and a *failing* run of any of them has not
     produced blob content to leak.
+
+    Runs under `LC_ALL=C`, like `commands.pre_commit`'s own git calls. Nothing
+    here branches on git's message text — every caller branches on
+    `returncode` — so this is hardening rather than a live fix, but a stderr
+    line quoted verbatim into a `ModelNetError` should read the same in a bug
+    report as it did on the machine that hit it.
+
+    The environment is **merged**, never replaced. git exports `GIT_DIR` and
+    `GIT_INDEX_FILE` to a hook process, and this helper is what reads the
+    index the commit is actually being gated on; a bare `env={"LC_ALL": "C"}`
+    would silently point every `ls-files` and `show` here at a different index
+    than `pre-commit` is checking — a fail-open no output assertion would
+    catch.
     """
     try:
-        proc = subprocess.run(["git", *args], capture_output=True, check=False)
+        proc = subprocess.run(
+            ["git", *args],
+            capture_output=True,
+            check=False,
+            env={**os.environ, "LC_ALL": "C"},
+        )
     except OSError as exc:
         raise ModelNetError(f"cannot run git {' '.join(args)}: {exc}") from exc
     if proc.returncode != 0:
