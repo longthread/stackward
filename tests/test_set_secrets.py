@@ -50,12 +50,42 @@ from stackward.commands.set_secrets import (
 )
 from stackward.config import Config, find_repo_config, load_config
 
-# Placeholder values only -- see GC4 in the task brief. Distinctive enough
-# that an accidental substring match elsewhere in captured output would be
-# implausible.
-MARKER_DB_PASSWORD = "marker-db-password-1a2b3c4d"
-MARKER_PUBLISHED = "marker-published-value-9c0d1e2f"
-MARKER_BOOTSTRAP = "marker-bootstrap-value-3f4e5d6c"
+from leakcheck import assert_no_leak
+
+# Placeholder values only -- see GC4 in the task brief.
+#
+# They read as noise on purpose. The leak assertions below go through
+# `leakcheck.assert_no_leak`, which fails on *any* eight-character run of the
+# value as well as on the whole string, so a marker sharing an eight-character
+# run with something the command legitimately prints -- a config path, a
+# logical name, a `tmp_path` component -- would fail on output that disclosed
+# nothing. The previous spelling, `marker-db-password-...`, shared the run
+# `password` with the config path `db.password` that every one of these tests
+# prints, which is exactly that false positive; and a leak check that cries
+# wolf is a leak check that gets deleted.
+#
+# No two of these share an eight-character run with each other either, so a
+# test asserting one marker's absence cannot fire on another marker's
+# legitimate presence.
+MARKER_DB_PASSWORD = "qz7m4x-1f8b3d9k-6t2v5r0w"
+MARKER_PUBLISHED = "hj9c5n-2p6y8s4g-7l1e3a0u"
+MARKER_BOOTSTRAP = "wd3r7v-5k9z1q6h-8n4j2c0m"
+# The value a `plaintext`-table entry carries. Spelled opaquely for the same
+# reason as the markers above: the old literal shared the run `plaintext` with
+# the `--plaintext` flag the same argv legitimately carries.
+MARKER_PLAINTEXT = "np4b8k-2z6r1x9d-5c7h3j0t"
+
+# One per parameter case of the stdin/argv test below, so a leak under one
+# invocation shape cannot be excused by a match against another shape's value.
+# Opaque rather than descriptive for the reason above: a marker spelling out
+# its own case (`case-plaintext-no-stack-...`) shares the run `plaintext` with
+# the `--plaintext` flag that same argv legitimately carries.
+ARGV_CASE_MARKERS = {
+    ("secret", "no-stack"): "b4k9w2-7t5m1x8r",
+    ("secret", "with-stack"): "c6p3z8-2h9v4n1s",
+    ("plaintext", "no-stack"): "d1r7y5-8j2c6q0f",
+    ("plaintext", "with-stack"): "e9s2u4-3g7l5b1k",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +199,36 @@ def load_repo_config(repo: Path) -> Config:
     return load_config(path)
 
 
+def recorded_pulumi_calls(argv_dump: Path, *values: str) -> list[list[str]]:
+    """Every `pulumi` invocation the stub recorded -- having first asserted
+    that none of `values` appears in any argument of any of them.
+
+    Global Constraint 6 ("values reach external commands on stdin, never
+    argv") used to be proved for exactly one invocation shape: one test, one
+    `secret` entry, no `--stack`. `--stack` is the production shape for any
+    real rotation, and `plaintext` goes through the same
+    `_pulumi_config_set` code path, so appending the value to argv under
+    either of those conditions passed the whole suite. Every test in this
+    file that dumps argv now reads it back through this function, so the
+    absence assertion cannot be forgotten by the next test that dumps argv
+    for some unrelated reason.
+
+    `assert_no_leak`, not `value not in arg`: a truncated or re-encoded value
+    in `ps` output discloses the credential just as completely as the whole
+    string does. Checked against the joined argv as well as each argument
+    separately -- the join is what would catch a value split across two
+    arguments, which `ps` renders back as one line anyway.
+    """
+    calls = [json.loads(line) for line in argv_dump.read_text().splitlines()]
+    assert calls, "no pulumi invocation was recorded"
+    for call in calls:
+        for value in values:
+            assert_no_leak(" ".join(call), value, what="the resolved value")
+            for arg in call:
+                assert_no_leak(arg, value, what="the resolved value")
+    return calls
+
+
 # ---------------------------------------------------------------------------
 # `parse_env_file`
 # ---------------------------------------------------------------------------
@@ -205,6 +265,65 @@ def test_parse_env_file_only_strips_one_matched_pair(tmp_path):
     assert parse_env_file(path) == {"DB_PASSWORD": '"nested"'}
 
 
+def test_parse_env_file_keeps_a_hash_inside_a_value(tmp_path):
+    """`#` opens a comment only at the *start* of a line.
+
+    No test anywhere wrote a value containing one, so truncating at an inline
+    `#` -- the behaviour several `.env` parsers actually have -- passed the
+    whole suite. A `#` is ordinary in a generated credential, and truncating
+    at it publishes a different, shorter value that looks entirely correct in
+    every log and every `pulumi config` listing: the failure only ever
+    surfaces as an authentication error somewhere else, later.
+    """
+    path = tmp_path / ".env"
+    value = "p4x#z9q#mk2"
+    path.write_text(f"DB_PASSWORD={value}\n")
+    path.chmod(0o600)
+    assert parse_env_file(path) == {"DB_PASSWORD": value}
+
+
+def test_parse_env_file_splits_at_the_first_equals_only(tmp_path):
+    """A value may contain `=`, and everything after the first one is the
+    value.
+
+    Also untested until now, and equally ordinary: base64 padding ends in
+    `=`, and a connection string or a query-shaped token carries them
+    throughout. Splitting at the last `=` instead would move part of the
+    value into the key, so the name would silently resolve to nothing and the
+    entry would be reported as a clean skip.
+    """
+    path = tmp_path / ".env"
+    value = "p4x=z9q=="
+    path.write_text(f"DB_PASSWORD={value}\n")
+    path.chmod(0o600)
+    assert parse_env_file(path) == {"DB_PASSWORD": value}
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        '"p4xz9q',      # an opening quote with nothing closing it
+        'p4xz9q"',      # a closing quote with nothing opening it
+        "\'p4xz9q\"",    # two quote characters, but not a matched pair
+        "xp4xz9qx",     # a matched pair -- of something that is not a quote
+    ],
+)
+def test_parse_env_file_strips_quotes_only_as_an_anchored_matched_pair(tmp_path, value):
+    """Both halves of the anchoring, each on its own: the two characters must
+    be *equal*, and they must be *quotes*.
+
+    Dropping either half silently eats the first and last character of a
+    value that was never quoted -- which, for a credential, means publishing
+    something that is wrong by two characters and looks right everywhere.
+    Each case here fails under exactly one of the two weakenings and passes
+    under the correct rule.
+    """
+    path = tmp_path / ".env"
+    path.write_text(f"DB_PASSWORD={value}\n")
+    path.chmod(0o600)
+    assert parse_env_file(path) == {"DB_PASSWORD": value}
+
+
 def test_parse_env_file_warns_on_a_permissive_mode(tmp_path, capfd):
     path = tmp_path / ".env"
     path.write_text(f"DB_PASSWORD={MARKER_DB_PASSWORD}\n")
@@ -213,7 +332,7 @@ def test_parse_env_file_warns_on_a_permissive_mode(tmp_path, capfd):
     err = capfd.readouterr().err
     assert str(path) in err
     assert "0644" in err or "644" in err
-    assert MARKER_DB_PASSWORD not in err
+    assert_no_leak(err, MARKER_DB_PASSWORD, what="the file's own value")
 
 
 def test_parse_env_file_no_warning_at_exactly_0600(tmp_path, capfd):
@@ -720,7 +839,7 @@ def test_dry_run_never_invokes_a_subprocess(repo, monkeypatch, capfd):
     out = capfd.readouterr().out
     assert "would set" in out
     assert "db.password" in out
-    assert MARKER_DB_PASSWORD not in out
+    assert_no_leak(out, MARKER_DB_PASSWORD, what="the resolved value")
 
 
 def test_dry_run_reports_a_required_unresolved_path_as_a_failure(repo, monkeypatch, capfd):
@@ -738,15 +857,38 @@ def test_dry_run_reports_a_required_unresolved_path_as_a_failure(repo, monkeypat
     assert "db.password" in err
 
 
-def test_value_reaches_the_subprocess_via_stdin_and_never_via_argv(
-    repo, monkeypatch, capfd, stub_pulumi, tmp_path
+@pytest.mark.parametrize("table", ["secret", "plaintext"])
+@pytest.mark.parametrize(
+    ("stack_args", "stack_label"),
+    [([], "no-stack"), (["--stack", "placeholder-stack"], "with-stack")],
+    ids=["no-stack", "with-stack"],
+)
+def test_a_value_reaches_pulumi_on_stdin_and_never_in_argv(
+    repo, monkeypatch, capfd, stub_pulumi, tmp_path, table, stack_args, stack_label
 ):
+    """Global Constraint 6, over every shape this command actually produces.
+
+    This was one test: one `secret` entry, no `--stack`. Both of the
+    conditions it did not cover are the ordinary ones -- `--stack` is how any
+    real rotation is invoked, and `plaintext` entries go through the same
+    `_pulumi_config_set` call with a different flag -- and appending the
+    value to argv under either of them passed the entire suite. `--stack` in
+    particular is the more dangerous shape: it is the branch that *already*
+    appends to `args`, so a value appended one line later reads as part of
+    the same edit.
+
+    Each case carries its own marker, so a leak under one parameter cannot be
+    excused by a match against another parameter's value; and the marker is
+    resolved from the environment, so what lands on stdin is the same string
+    the assertion is made about.
+    """
+    value = ARGV_CASE_MARKERS[table, stack_label]
     write_repo_config(
         repo,
-        '[secrets."."]\nsecret = { "db.password" = "DB_PASSWORD" }\n',
+        f'[secrets."."]\n{table} = {{ "managed.value" = "VALUE_NAME" }}\n',
     )
     monkeypatch.chdir(repo)
-    monkeypatch.setenv("DB_PASSWORD", MARKER_DB_PASSWORD)
+    monkeypatch.setenv("VALUE_NAME", value)
     fake_pulumi(monkeypatch, stub_pulumi)
 
     argv_dump = tmp_path / "argv.log"
@@ -754,21 +896,23 @@ def test_value_reaches_the_subprocess_via_stdin_and_never_via_argv(
     monkeypatch.setenv("STUB_DUMP_ARGV_TO", str(argv_dump))
     monkeypatch.setenv("STUB_DUMP_STDIN_TO", str(stdin_dump))
 
-    assert main(["set-secrets"]) == 0
+    assert main(["set-secrets", *stack_args]) == 0
 
-    argv_calls = [json.loads(line) for line in argv_dump.read_text().splitlines()]
-    assert len(argv_calls) == 1
-    call_argv = argv_calls[0]
-    assert "--secret" in call_argv
-    assert "--path" in call_argv and "db.password" in call_argv
-    assert not any(MARKER_DB_PASSWORD in arg for arg in call_argv)
+    calls = recorded_pulumi_calls(argv_dump, value)
+    assert len(calls) == 1
+    call_argv = calls[0]
+    assert f"--{table}" in call_argv
+    assert "--path" in call_argv and "managed.value" in call_argv
+    assert ("--stack" in call_argv) is bool(stack_args)
 
-    stdin_content = stdin_dump.read_bytes()
-    assert MARKER_DB_PASSWORD.encode() in stdin_content
+    # The other half of the same claim: it really did reach the child, on
+    # stdin, where `ps` cannot see it. Absent from argv alone would also be
+    # satisfied by never sending it at all.
+    assert value.encode() in stdin_dump.read_bytes()
 
     captured = capfd.readouterr()
-    assert MARKER_DB_PASSWORD not in captured.out
-    assert MARKER_DB_PASSWORD not in captured.err
+    assert_no_leak(captured.out, value, what="the resolved value")
+    assert_no_leak(captured.err, value, what="the resolved value")
 
 
 def test_a_plaintext_entry_is_published_with_plaintext_and_not_secret(
@@ -782,7 +926,7 @@ def test_a_plaintext_entry_is_published_with_plaintext_and_not_secret(
         '[secrets."."]\nplaintext = { "registry.user" = "REGISTRY_USER" }\n',
     )
     monkeypatch.chdir(repo)
-    monkeypatch.setenv("REGISTRY_USER", "a-plaintext-value")
+    monkeypatch.setenv("REGISTRY_USER", MARKER_PLAINTEXT)
     fake_pulumi(monkeypatch, stub_pulumi)
 
     argv_dump = tmp_path / "argv.log"
@@ -792,12 +936,12 @@ def test_a_plaintext_entry_is_published_with_plaintext_and_not_secret(
 
     assert main(["set-secrets"]) == 0
 
-    call_argv = json.loads(argv_dump.read_text().splitlines()[0])
+    (call_argv,) = recorded_pulumi_calls(argv_dump, MARKER_PLAINTEXT)
     assert "--plaintext" in call_argv
     assert "--secret" not in call_argv
     assert "--path" in call_argv and "registry.user" in call_argv
 
-    assert b"a-plaintext-value" in stdin_dump.read_bytes()
+    assert MARKER_PLAINTEXT.encode() in stdin_dump.read_bytes()
 
 
 def test_a_secret_entry_is_never_published_with_plaintext(
@@ -818,7 +962,7 @@ def test_a_secret_entry_is_never_published_with_plaintext(
     monkeypatch.setenv("STUB_DUMP_ARGV_TO", str(argv_dump))
 
     assert main(["set-secrets"]) == 0
-    call_argv = json.loads(argv_dump.read_text().splitlines()[0])
+    (call_argv,) = recorded_pulumi_calls(argv_dump, MARKER_DB_PASSWORD)
     assert "--secret" in call_argv
     assert "--plaintext" not in call_argv
 
@@ -836,14 +980,14 @@ def test_secret_and_plaintext_entries_are_both_published_in_one_run(
     )
     monkeypatch.chdir(repo)
     monkeypatch.setenv("DB_PASSWORD", MARKER_DB_PASSWORD)
-    monkeypatch.setenv("REGISTRY_USER", "a-plaintext-value")
+    monkeypatch.setenv("REGISTRY_USER", MARKER_PLAINTEXT)
     fake_pulumi(monkeypatch, stub_pulumi)
 
     argv_dump = tmp_path / "argv.log"
     monkeypatch.setenv("STUB_DUMP_ARGV_TO", str(argv_dump))
 
     assert main(["set-secrets"]) == 0
-    calls = [json.loads(line) for line in argv_dump.read_text().splitlines()]
+    calls = recorded_pulumi_calls(argv_dump, MARKER_DB_PASSWORD, MARKER_PLAINTEXT)
     assert len(calls) == 2
 
     secret_call = next(c for c in calls if "db.password" in c)
@@ -865,13 +1009,13 @@ def test_stack_flag_is_forwarded_to_pulumi(repo, monkeypatch, capfd, stub_pulumi
     monkeypatch.setenv("STUB_DUMP_ARGV_TO", str(argv_dump))
 
     assert main(["set-secrets", "--stack", "placeholder-stack"]) == 0
-    call_argv = json.loads(argv_dump.read_text().splitlines()[0])
+    (call_argv,) = recorded_pulumi_calls(argv_dump, MARKER_DB_PASSWORD)
     assert "--stack" in call_argv
     assert "placeholder-stack" in call_argv
 
     captured = capfd.readouterr()
-    assert MARKER_DB_PASSWORD not in captured.out
-    assert MARKER_DB_PASSWORD not in captured.err
+    assert_no_leak(captured.out, MARKER_DB_PASSWORD, what="the resolved value")
+    assert_no_leak(captured.err, MARKER_DB_PASSWORD, what="the resolved value")
 
 
 def test_stack_flag_omitted_when_not_given(repo, monkeypatch, capfd, stub_pulumi, tmp_path):
@@ -887,12 +1031,12 @@ def test_stack_flag_omitted_when_not_given(repo, monkeypatch, capfd, stub_pulumi
     monkeypatch.setenv("STUB_DUMP_ARGV_TO", str(argv_dump))
 
     assert main(["set-secrets"]) == 0
-    call_argv = json.loads(argv_dump.read_text().splitlines()[0])
+    (call_argv,) = recorded_pulumi_calls(argv_dump, MARKER_DB_PASSWORD)
     assert "--stack" not in call_argv
 
     captured = capfd.readouterr()
-    assert MARKER_DB_PASSWORD not in captured.out
-    assert MARKER_DB_PASSWORD not in captured.err
+    assert_no_leak(captured.out, MARKER_DB_PASSWORD, what="the resolved value")
+    assert_no_leak(captured.err, MARKER_DB_PASSWORD, what="the resolved value")
 
 
 def test_required_unresolved_path_fails_the_run(repo, monkeypatch, stub_pulumi, capfd):
@@ -945,6 +1089,65 @@ def test_a_non_canonical_required_shape_is_rejected_not_silently_ignored(
     assert "paths" in captured.err
 
 
+def test_a_scalar_where_the_secret_table_belongs_is_rejected_not_read_as_empty(
+    repo, monkeypatch, capfd
+):
+    """`secret = "DB_PASSWORD"` -- the shape a manifest author writes when
+    they forget the `path = name` mapping -- is a hard load-time refusal.
+
+    Read instead as "this project declares no entries", it produces `0 set,
+    0 skipped, 0 failed` and exit 0: a rotation that published nothing,
+    reported in the language of success. Exit 0 with no work done is the
+    worst of the three possible outcomes here, because nothing downstream has
+    any reason to look again.
+
+    The `summary:` line's absence, not the exit code, is what proves the
+    refusal happened at load time rather than in the publishing loop.
+    """
+    write_repo_config(repo, '[secrets."."]\nsecret = "DB_PASSWORD"\n')
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("DB_PASSWORD", MARKER_DB_PASSWORD)
+
+    assert main(["set-secrets"]) == 2
+    captured = capfd.readouterr()
+    assert "summary:" not in captured.out
+    assert "must be a table" in captured.err
+    assert "secret" in captured.err
+    assert_no_leak(captured.out, MARKER_DB_PASSWORD, what="the resolved value")
+    assert_no_leak(captured.err, MARKER_DB_PASSWORD, what="the resolved value")
+
+
+def test_the_summary_line_counts_every_outcome(repo, monkeypatch, capfd, stub_pulumi):
+    """One run with one of each outcome, and the exact counts asserted.
+
+    The `summary:` line is the whole report for a run nobody reads closely,
+    and no test anywhere asserted its numbers -- hard-coding
+    `0 set, 0 skipped, 0 failed` passed all 781. Three entries in a fixed,
+    known declaration order: one that resolves, one that does not and is not
+    required, and one that does not and is.
+    """
+    write_repo_config(
+        repo,
+        '[secrets."."]\n'
+        "secret = { "
+        '"a.set" = "NAME_SET", '
+        '"b.skip" = "NAME_SKIP", '
+        '"c.fail" = "NAME_FAIL" '
+        "}\n\n"
+        '[secrets.".".required]\n'
+        'paths = ["c.fail"]\n',
+    )
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("NAME_SET", "a-value-that-resolves")
+    monkeypatch.delenv("NAME_SKIP", raising=False)
+    monkeypatch.delenv("NAME_FAIL", raising=False)
+    fake_pulumi(monkeypatch, stub_pulumi)
+
+    assert main(["set-secrets"]) == 2
+    captured = capfd.readouterr()
+    assert "summary: 1 set, 1 skipped, 1 failed" in captured.out
+
+
 def test_a_path_declared_in_both_secret_and_plaintext_is_rejected_not_downgraded(
     repo, monkeypatch, capfd, stub_pulumi
 ):
@@ -969,8 +1172,8 @@ def test_a_path_declared_in_both_secret_and_plaintext_is_rejected_not_downgraded
     captured = capfd.readouterr()
     assert "summary:" not in captured.out
     assert "db.password" in captured.err
-    assert MARKER_DB_PASSWORD not in captured.out
-    assert MARKER_DB_PASSWORD not in captured.err
+    assert_no_leak(captured.out, MARKER_DB_PASSWORD, what="the resolved value")
+    assert_no_leak(captured.err, MARKER_DB_PASSWORD, what="the resolved value")
 
 
 def test_a_missing_pulumi_binary_fails_that_entry_and_is_reported(repo, monkeypatch, capfd):
@@ -986,8 +1189,8 @@ def test_a_missing_pulumi_binary_fails_that_entry_and_is_reported(repo, monkeypa
     captured = capfd.readouterr()
     assert "not found on PATH" in captured.err
     assert "db.password" in captured.err
-    assert MARKER_DB_PASSWORD not in captured.out
-    assert MARKER_DB_PASSWORD not in captured.err
+    assert_no_leak(captured.out, MARKER_DB_PASSWORD, what="the resolved value")
+    assert_no_leak(captured.err, MARKER_DB_PASSWORD, what="the resolved value")
 
 
 def test_a_timeout_in_the_middle_does_not_abort_the_remaining_entries(
@@ -1054,8 +1257,12 @@ def test_a_pulumi_failure_never_echoes_the_value_it_was_given(
 
     assert main(["set-secrets"]) == 2
     captured = capfd.readouterr()
-    assert MARKER_DB_PASSWORD not in captured.out
-    assert MARKER_DB_PASSWORD not in captured.err
+    # `assert_no_leak`, not `not in`: the reason this module builds for a
+    # non-zero exit (`pulumi exited 1`) is printed by `_print_outcome`, and a
+    # reason quoting even the first eight characters of the value would pass a
+    # whole-string check while disclosing the credential.
+    assert_no_leak(captured.out, MARKER_DB_PASSWORD, what="the resolved value")
+    assert_no_leak(captured.err, MARKER_DB_PASSWORD, what="the resolved value")
 
 
 # ---------------------------------------------------------------------------
@@ -1130,10 +1337,12 @@ def test_drift_warns_when_the_values_differ(repo, monkeypatch, capfd, stub_pulum
     assert "BOOTSTRAP_NAME" in captured.err
     assert "MANAGED_NAME" in captured.err
     assert "managed.path" in captured.err
-    assert MARKER_PUBLISHED not in captured.err
-    assert MARKER_BOOTSTRAP not in captured.err
-    assert MARKER_PUBLISHED not in captured.out
-    assert MARKER_BOOTSTRAP not in captured.out
+    # The drift warning names the two logical names and the config path, and
+    # must never quote either value -- not whole, and not the leading run of
+    # one, which a `not in` check would have let through.
+    for stream in (captured.err, captured.out):
+        assert_no_leak(stream, MARKER_PUBLISHED, what="the published value")
+        assert_no_leak(stream, MARKER_BOOTSTRAP, what="the bootstrap value")
 
 
 def test_drift_is_silent_when_the_values_agree(repo, monkeypatch, capfd, stub_pulumi):
@@ -1201,7 +1410,7 @@ def test_drift_warns_when_the_managed_name_is_ambiguous(repo, monkeypatch, capfd
     assert main(["set-secrets"]) == 0
     captured = capfd.readouterr()
     assert "MANAGED_NAME" in captured.err
-    assert MARKER_BOOTSTRAP not in captured.err
+    assert_no_leak(captured.err, MARKER_BOOTSTRAP, what="the bootstrap value")
 
 
 def test_drift_finds_a_managed_name_declared_in_plaintext(repo, monkeypatch, capfd, stub_pulumi):
@@ -1212,7 +1421,7 @@ def test_drift_finds_a_managed_name_declared_in_plaintext(repo, monkeypatch, cap
     secret" branch instead of comparing the values at all."""
     write_repo_config(repo, _PLAINTEXT_MANAGED_DRIFT_MANIFEST)
     monkeypatch.chdir(repo)
-    monkeypatch.setenv("MANAGED_NAME", "a-plaintext-value")
+    monkeypatch.setenv("MANAGED_NAME", MARKER_PLAINTEXT)
     monkeypatch.setenv("BOOTSTRAP_NAME", MARKER_BOOTSTRAP)
     fake_pulumi(monkeypatch, stub_pulumi)
     monkeypatch.setenv(
@@ -1224,7 +1433,7 @@ def test_drift_finds_a_managed_name_declared_in_plaintext(repo, monkeypatch, cap
     assert "does not name exactly one" not in captured.err
     assert "drift" in captured.err
     assert "managed.path" in captured.err
-    assert MARKER_BOOTSTRAP not in captured.err
+    assert_no_leak(captured.err, MARKER_BOOTSTRAP, what="the bootstrap value")
 
 
 def test_a_second_drift_pair_is_evaluated_and_the_run_reaches_its_summary(

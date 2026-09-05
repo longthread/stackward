@@ -404,11 +404,17 @@ def resolve_source_files(config: Config, repo_root: Path, stack: str | None) -> 
     against `repo_root` when not already absolute. A missing `[secrets.source]`
     table, or one with no `files`, resolves to an empty list — value
     resolution then falls back to the process environment alone, which is a
-    normal, working configuration, not an error."""
-    source = config.secrets.get("source", {})
-    if not isinstance(source, dict):
-        raise SetSecretsError("secrets.source must be a table")
+    normal, working configuration, not an error.
 
+    Deliberately does **not** re-check that `[secrets.source]` is a table.
+    `_build_secret_source` is this function's only caller and refuses a
+    non-table `source` before it ever gets here, so a second copy of that
+    check could never execute — and a refusal that cannot execute is worse
+    than none: it reads as a live guard, so the next reader trusts it and
+    stops looking for the real one. Said here rather than left as an absence,
+    because an absent guard is exactly what gets helpfully re-added.
+    """
+    source = config.secrets.get("source", {})
     raw_files = source.get("files", [])
     if not isinstance(raw_files, list) or not all(isinstance(f, str) for f in raw_files):
         raise SetSecretsError("secrets.source.files must be a list of strings")
