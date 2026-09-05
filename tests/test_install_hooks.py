@@ -10,9 +10,12 @@ tracked hooks directory, an existing foreign hook -- so, exactly as in
 
 from __future__ import annotations
 
+import os
 import stat
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -32,7 +35,42 @@ def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
 
 
 @pytest.fixture
-def repo(tmp_path: Path) -> Path:
+def isolated_git(tmp_path: Path, monkeypatch) -> Path:
+    """Cut every `git` these tests run off from the machine's own git config.
+
+    Without this, a developer (or a CI image) with a *global*
+    `core.hooksPath` -- what husky, lefthook and the `pre-commit` framework
+    all set, and precisely the configuration this command exists to handle
+    -- makes `git init` here inherit that hook, and sixty-odd tests across
+    this file and `test_pre_commit.py` error out for a reason that has
+    nothing to do with the code under test. Worse here than anywhere else
+    in the suite: a global `core.hooksPath` also silently moves where
+    `hooks install` writes, so tests asserting on `.git/hooks/pre-commit`
+    would be examining a directory the command was never pointed at.
+
+    All four sources git consults are redirected, not only the global one:
+    `GIT_CONFIG_SYSTEM` covers `/etc/gitconfig`, which is exactly where an
+    org-wide `hooksPath` lives; `HOME` and `XDG_CONFIG_HOME` cover
+    `~/.gitconfig` and `$XDG_CONFIG_HOME/git/config`, which git still reads
+    on a path that leaves `GIT_CONFIG_GLOBAL` unset. `/dev/null` is git's
+    own documented spelling of "this configuration file does not exist" for
+    the two `GIT_CONFIG_*` variables.
+
+    The redirect is set with `monkeypatch`, so it is still in place while
+    the *test body* runs `git commit` -- not only while the fixture built
+    the repository.
+    """
+    home = tmp_path / "git-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "config"))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+    return home
+
+
+@pytest.fixture
+def repo(tmp_path: Path, isolated_git: Path) -> Path:
     """A real, minimal git repository with one initial commit that declares
     a `.stackward.toml`.
 
@@ -291,18 +329,92 @@ def test_existing_foreign_hook_is_backed_up(repo, monkeypatch, capsys):
     assert str(found[0]) in capsys.readouterr().out
 
 
+def backup_stamp(hooks_dir: Path) -> str:
+    [backup] = backups(hooks_dir)
+    assert backup.name.startswith("pre-commit.backup.")
+    return backup.name.removeprefix("pre-commit.backup.")
+
+
+@pytest.fixture
+def local_time_far_from_utc():
+    """Move this process's *local* time twelve hours away from UTC.
+
+    `XXX-12` is a POSIX `TZ` string -- a made-up zone abbreviation and a
+    numeric offset, no geography and no place name -- so nothing here depends
+    on the tz database or on where the suite happens to run. `time.tzset()`
+    is what makes `datetime.now()` (which reads local time) actually observe
+    it.
+
+    Restored by hand rather than through `monkeypatch`, because `tzset()`
+    caches the zone in the C library: undoing the variable without calling
+    `tzset()` again would leave every later test in the session running with
+    a shifted local clock.
+    """
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = "XXX-12"
+    time.tzset()
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()
+
+
 def test_backup_filename_matches_hook_dot_backup_dot_timestamp(repo, monkeypatch):
+    """The suffix parses as the full timestamp, not merely "starts with
+    eight digits".
+
+    `stamp[:8].isdigit()` was satisfied by any date-shaped prefix, so
+    neither the microseconds (what stops two installs in the same second
+    from colliding) nor the format was pinned by it.
+    """
     hooks_dir = repo / ".git" / "hooks"
     (hooks_dir / "pre-commit").write_text("#!/bin/sh\necho foreign\n")
 
+    before = datetime.now(timezone.utc)
     install(repo, monkeypatch)
+    after = datetime.now(timezone.utc)
 
-    [backup] = backups(hooks_dir)
-    assert backup.name.startswith("pre-commit.backup.")
-    # The suffix is a real timestamp, not an arbitrary string.
-    stamp = backup.name.removeprefix("pre-commit.backup.")
-    assert stamp  # non-empty
-    assert stamp[:8].isdigit()  # YYYYMMDD at minimum
+    stamp = backup_stamp(hooks_dir)
+    parsed = datetime.strptime(stamp, "%Y%m%dT%H%M%S.%fZ").replace(tzinfo=timezone.utc)
+    assert before <= parsed <= after
+    assert parsed.microsecond or "." in stamp  # sub-second resolution is present
+
+
+def test_backup_timestamp_is_utc_and_not_local_time(
+    repo, monkeypatch, local_time_far_from_utc
+):
+    """The `Z` in the filename has to mean UTC.
+
+    Nothing pinned it: every existing assertion on this name held equally
+    for `datetime.now()`, and on a machine whose local zone *is* UTC the two
+    are indistinguishable -- which is most CI images, so the gap would never
+    have surfaced there either. With local time twelve hours away, a
+    timestamp taken in local time cannot fall inside a UTC bracket around
+    the call.
+
+    It matters because these names sort, and because two clones on machines
+    in different zones would otherwise produce backups whose apparent order
+    is wrong -- for files whose whole job is to be the recoverable copy of
+    somebody else's hook.
+    """
+    hooks_dir = repo / ".git" / "hooks"
+    (hooks_dir / "pre-commit").write_text("#!/bin/sh\necho foreign\n")
+
+    before = datetime.now(timezone.utc)
+    install(repo, monkeypatch)
+    after = datetime.now(timezone.utc)
+
+    parsed = datetime.strptime(backup_stamp(hooks_dir), "%Y%m%dT%H%M%S.%fZ").replace(
+        tzinfo=timezone.utc
+    )
+    assert before <= parsed <= after
+    # Guard against the fixture silently not taking effect, which would make
+    # the assertion above prove nothing.
+    assert abs((datetime.now() - datetime.now(timezone.utc).replace(tzinfo=None)).total_seconds()) > 3600
 
 
 # ---------------------------------------------------------------------------
@@ -576,6 +688,191 @@ def test_unanticipated_exception_exits_2_not_1(repo, monkeypatch, capsys):
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "RuntimeError" in captured.err
+
+
+# ---------------------------------------------------------------------------
+# Git is invoked under a fixed locale, and the fixtures are hermetic.
+# ---------------------------------------------------------------------------
+
+
+def test_every_git_invocation_runs_under_a_fixed_locale(repo, monkeypatch):
+    """`LC_ALL=C` on every git call, with the environment merged, not
+    replaced.
+
+    Hardening for `_run_git`, which branches on the exit code -- but a live
+    bug for `_is_tracked`, which branches on git's *message text*. Both
+    strings it recognises (`did not match any file`, `is outside
+    repository`) are gettext-marked in git's own source, so under any
+    non-English locale neither matches, `_is_tracked` raises, and `hooks
+    install` exits 2 in **every** repository, not only one with a redirected
+    `core.hooksPath`. The command that installs the gate stops working.
+
+    The merge half matters as much as the override: `git` sets `GIT_DIR` and
+    friends for a hook process, and a bare `env={"LC_ALL": "C"}` would drop
+    them and point this command at a different repository than the one it
+    was invoked for.
+    """
+    monkeypatch.setenv("STACKWARD_TEST_MARKER", "inherited")
+    seen: list[dict[str, str] | None] = []
+    real_run = subprocess.run
+
+    def recording_run(args, **kwargs):
+        if args and args[0] == "git":
+            seen.append(kwargs.get("env"))
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", recording_run)
+    assert install(repo, monkeypatch) == 0
+
+    assert seen, "no git invocation was recorded"
+    for env in seen:
+        assert env is not None, "a git invocation inherited the ambient locale"
+        assert env.get("LC_ALL") == "C"
+        assert env.get("STACKWARD_TEST_MARKER") == "inherited"
+
+
+def test_hooks_install_survives_a_git_that_translates_its_diagnostics(
+    repo, monkeypatch, capsys
+):
+    """The live half of the bug above, at the level where it actually bites.
+
+    `_is_tracked` recognises "not tracked" by matching two English phrases,
+    and both are gettext-marked in git's own source. Simply exporting a
+    non-English `LC_ALL` here would prove nothing on a machine with no git
+    translations installed -- which is most CI images, and this one -- so
+    the translation is modelled at the subprocess boundary instead, exactly
+    as gettext behaves: git's stderr comes back translated **unless** the
+    invocation asked for the C locale.
+
+    Deterministic everywhere, and it goes red the moment the `LC_ALL=C`
+    override is dropped: `_is_tracked` then matches neither phrase, raises,
+    and `hooks install` exits 2 in an ordinary repository with an ordinary
+    `.git/hooks` -- the command that installs the gate, refusing to install
+    it, for a reason that has nothing to do with the repository.
+    """
+    real_run = subprocess.run
+    translations = {
+        "did not match any file": "ne correspond a aucun fichier",
+        "is outside repository": "est en dehors du depot",
+    }
+
+    def translating_run(args, **kwargs):
+        proc = real_run(args, **kwargs)
+        env = kwargs.get("env") or os.environ
+        if list(args[:1]) == ["git"] and env.get("LC_ALL") != "C":
+            stderr = proc.stderr
+            if isinstance(stderr, str):
+                for english, translated in translations.items():
+                    stderr = stderr.replace(english, translated)
+                return subprocess.CompletedProcess(
+                    args, proc.returncode, proc.stdout, stderr
+                )
+        return proc
+
+    monkeypatch.setattr(subprocess, "run", translating_run)
+
+    assert install(repo, monkeypatch) == 0
+    assert (repo / ".git" / "hooks" / "pre-commit").is_file()
+    assert capsys.readouterr().err == ""
+
+
+def test_the_repo_fixture_ignores_a_global_core_hookspath(repo, isolated_git):
+    """The fixture's isolation, asserted rather than assumed.
+
+    A global `core.hooksPath` -- husky, lefthook, `pre-commit`, or an
+    org-wide `/etc/gitconfig` -- silently moves where git looks for hooks,
+    so without isolation the tests in this file examine a directory the
+    command was never pointed at, and sixty-odd tests across this file and
+    `test_pre_commit.py` error out.
+
+    The positive control is the point: it proves git *would* honour the file
+    written below, so the first assertion is about the fixture suppressing
+    it and not about the file being ineffective.
+    """
+    hostile = isolated_git / ".gitconfig"
+    hostile.write_text("[core]\n\thooksPath = /nonexistent/global-hooks\n")
+
+    def hooks_path(env: dict[str, str]) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", "config", "--get", "core.hooksPath"],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            env=env,
+        )
+
+    control = hooks_path({**os.environ, "GIT_CONFIG_GLOBAL": str(hostile)})
+    assert control.stdout.strip() == "/nonexistent/global-hooks"
+
+    isolated = hooks_path(dict(os.environ))
+    assert isolated.returncode == 1
+    assert isolated.stdout.strip() == ""
+
+
+# ---------------------------------------------------------------------------
+# A repository with no policy file: a warning, never a refusal.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def repo_without_policy(repo, monkeypatch) -> Path:
+    """`repo` with its `.stackward.toml` removed from the working tree.
+
+    `find_repo_config` reads the filesystem, not the index -- deliberately,
+    since `hooks install` is not the gate and does not scan staged content
+    -- so removing the file is enough to make the repository policy-less
+    from this command's point of view.
+    """
+    (repo / ".stackward.toml").unlink()
+    return repo
+
+
+def test_no_policy_warns_on_stderr_and_still_installs(repo_without_policy, monkeypatch, capsys):
+    """A repository that has not declared a policy yet gets told so, at the
+    moment it can still be fixed in one line -- rather than at somebody's
+    first blocked commit, since `pre-commit` refuses a repository that
+    declares none.
+
+    A warning, not a refusal: installing the hook before writing the policy
+    is a legitimate order to do things in, and this command's exit 1 and 2
+    mean specific things about the *install*, which this is not one of.
+    """
+    assert install(repo_without_policy, monkeypatch) == 0
+    assert (repo_without_policy / ".git" / "hooks" / "pre-commit").is_file()
+
+    captured = capsys.readouterr()
+    assert "warning" in captured.err.lower()
+    assert ".stackward.toml" in captured.err
+    # Names the minimal file to write, not merely that one is missing.
+    for line in install_hooks_module.MINIMAL_POLICY.splitlines():
+        assert line in captured.err
+    # stdout stays the machine-readable "where the hook went" line.
+    assert "warning" not in captured.out.lower()
+    assert str(repo_without_policy / ".git" / "hooks" / "pre-commit") in captured.out
+
+
+def test_a_repository_that_declares_a_policy_gets_no_warning(repo, monkeypatch, capsys):
+    """The other half: the warning must not fire for the normal case, or it
+    is noise everyone learns to ignore."""
+    assert (repo / ".stackward.toml").is_file()
+    assert install(repo, monkeypatch) == 0
+    assert "warning" not in capsys.readouterr().err.lower()
+
+
+def test_the_policy_warning_does_not_change_the_exit_code_of_a_refusal(
+    repo_without_policy, monkeypatch, capsys
+):
+    """A tracked hooks directory is still exit 1, and the hook was not
+    written -- so there is nothing to warn about and the refusal is not
+    diluted by a second message about a different problem."""
+    (repo_without_policy / "githooks").mkdir()
+    (repo_without_policy / "githooks" / "pre-commit").write_text("#!/bin/sh\n")
+    _git(repo_without_policy, "add", "githooks")
+    _git(repo_without_policy, "commit", "-q", "-m", "commit shared hooks")
+    _git(repo_without_policy, "config", "core.hooksPath", "githooks")
+
+    assert install(repo_without_policy, monkeypatch) == 1
+    assert "no .stackward.toml" not in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

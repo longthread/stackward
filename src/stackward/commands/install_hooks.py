@@ -77,7 +77,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .check_config import fail_closed
+from ..config import CONFIG_FILENAME, find_repo_config
+from .check_config import MINIMAL_POLICY, fail_closed
 
 _HOOK_NAME = "pre-commit"
 
@@ -97,6 +98,44 @@ class InstallError(Exception):
     *content* at all, only git's own metadata about paths."""
 
 
+def _git(args: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run `git <args>` in the current working directory, under `LC_ALL=C`,
+    and hand the completed process back for the caller to interpret.
+
+    **Every** git invocation in this module goes through here, including the
+    one whose exit code is not simply pass/fail (`_is_tracked`). That is the
+    point of it existing separately from `_run_git`: `_is_tracked` has to
+    read git's own stderr *text* to tell "this path is not tracked" apart
+    from "git could not answer", and it previously called `subprocess.run`
+    directly to do so -- a bypass that already produced one bug, and that
+    hid this one. Git's diagnostics are gettext-marked, so under any
+    non-English locale those strings are translated, `_is_tracked` matches
+    neither, and `hooks install` raises and exits 2 in *every* repository --
+    not merely a repository with a redirected `core.hooksPath`. The command
+    that installs the gate stops working, for a reason that has nothing to
+    do with the repository it is run in.
+
+    The environment is *merged*, never replaced, exactly as
+    `commands.pre_commit._run_git` merges it: `git` sets `GIT_DIR`,
+    `GIT_INDEX_FILE` and friends for a hook process, and a bare
+    `env={"LC_ALL": "C"}` would drop them and point this command at a
+    different repository than the one it was invoked for.
+
+    Raises `InstallError` only for the `git` executable being missing --
+    every other interpretation of the result belongs to the caller.
+    """
+    try:
+        return subprocess.run(
+            ["git", *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except OSError as exc:
+        raise InstallError(f"cannot run git {' '.join(args)}: {exc}") from exc
+
+
 def _run_git(args: list[str]) -> str:
     """Run `git <args>` in the current working directory and return its
     stdout, stripped of surrounding whitespace.
@@ -105,10 +144,7 @@ def _run_git(args: list[str]) -> str:
     proceed: the `git` executable missing, or the invoked subcommand
     failing for any git-reported reason (most notably, the current
     directory not being inside a git working tree at all)."""
-    try:
-        proc = subprocess.run(["git", *args], capture_output=True, text=True, check=False)
-    except OSError as exc:
-        raise InstallError(f"cannot run git {' '.join(args)}: {exc}") from exc
+    proc = _git(args)
     if proc.returncode != 0:
         stderr = proc.stderr.strip()
         raise InstallError(f"git {' '.join(args)} failed: {stderr}")
@@ -152,13 +188,15 @@ def _is_tracked(path: Path) -> bool:
     any non-zero exit rather than guessing -- so an unrecognised failure
     raises `InstallError` here too, mapped by the caller to the same
     could-not-determine exit code as every other git failure in this
-    command."""
-    proc = subprocess.run(
-        ["git", "ls-files", "--error-unmatch", str(path)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    command.
+
+    Both recognised strings are gettext-marked in git's own source, so the
+    match below is only meaningful under a fixed locale. That is why this
+    goes through `_git`, which sets `LC_ALL=C` -- see its docstring; run
+    under a translated locale without it, *every* invocation in *every*
+    repository falls through to the raise below and `hooks install` exits
+    2."""
+    proc = _git(["ls-files", "--error-unmatch", str(path)])
     if proc.returncode == 0:
         return True
     stderr = proc.stderr
@@ -305,14 +343,18 @@ def cmd_install_hooks(_args: argparse.Namespace) -> int:
     must not fall through to Python's own default exit code of 1, which
     this tool reserves for a specific, different meaning everywhere else it
     appears.
+
+    A repository with no policy file gets a **warning** after the hook is
+    written, never a refusal, and the exit code stays 0. Installing the hook
+    before writing the policy is a legitimate order to do things in, and
+    exit 1 and 2 here mean specific things about the *install* that this is
+    not one of -- but without the warning, a repository that installed the
+    gate and never declared a policy discovers that at somebody's first
+    blocked commit (`pre-commit` refuses a repository that declares none)
+    rather than at the moment it could still be fixed in one line.
     """
     try:
         hooks_dir = _hooks_dir()
-    except InstallError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-
-    try:
         tracked = _is_tracked(hooks_dir)
     except InstallError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -336,4 +378,37 @@ def cmd_install_hooks(_args: argparse.Namespace) -> int:
     if backup_path is not None:
         print(f"Existing hook backed up to {backup_path}")
     print(f"Installed pre-commit hook -> {hook_path}")
+    _warn_when_no_policy()
     return 0
+
+
+def _warn_when_no_policy() -> None:
+    """Warn on stderr when the repository declares no `.stackward.toml`.
+
+    Deliberately *after* the hook is written and deliberately not an error:
+    see `cmd_install_hooks`'s own docstring. On stderr, not stdout, for the
+    same reason `store.warn_if_permissive` puts its warning there -- this
+    command's stdout says where the hook landed, and a caller reading that
+    must not have to filter advisory text out of it.
+
+    `find_repo_config` returns `None` for absence rather than raising, so
+    this cannot turn a legitimate install into a failure. A
+    `.stackward.toml` that exists but does not parse is *present* as far as
+    this is concerned -- reporting it is the gate's job, at the point it
+    actually reads it, and duplicating that judgement here would give one
+    repository two different verdicts on the same file.
+    """
+    if find_repo_config() is not None:
+        return
+    print(
+        f"warning: this repository declares no {CONFIG_FILENAME}, and "
+        "`stackward pre-commit` refuses a repository that declares none -- "
+        "the hook is installed, but every commit will be blocked until one "
+        "exists.",
+        file=sys.stderr,
+    )
+    print(
+        f"Create {CONFIG_FILENAME} at the repository root with at least:\n"
+        + "\n".join(f"    {line}" for line in MINIMAL_POLICY.splitlines()),
+        file=sys.stderr,
+    )

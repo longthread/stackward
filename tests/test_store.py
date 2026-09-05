@@ -24,10 +24,13 @@ from __future__ import annotations
 import base64
 import json
 import os
+import pathlib
 import stat
+import tomllib
 
 import pytest
 
+from leakcheck import assert_no_leak
 from stackward import crypto, store
 from stackward.store import (
     CONFIG_MODE,
@@ -87,9 +90,11 @@ def write_config(store_directory, text: str):
     path = store_directory / "config"
     path.write_text(text)
     # At the required mode, so that these tests do not trip the permission
-    # warning as a side effect of whatever umask the suite runs under. The
-    # warning has its own tests below.
-    os.chmod(path, CONFIG_MODE)
+    # warning as a side effect of whatever umask the suite runs under. A
+    # literal rather than `CONFIG_MODE`: this helper is used by the test that
+    # pins the call site's constant, which cannot pin anything if the helper
+    # moves with it.
+    os.chmod(path, 0o600)
     return path
 
 
@@ -191,6 +196,112 @@ def test_an_invalid_config_raises_rather_than_reading_as_absent(store_directory)
     backend into a silently missing one."""
     write_config(store_directory, "[profile.one\nbackend_url = ")
     with pytest.raises(StoreError):
+        load_store_config(store_directory)
+
+
+def test_an_invalid_config_is_reported_by_position_and_never_by_quoting_it(
+    store_directory,
+):
+    """`config` can hold a credential, so its parse error must not quote it.
+
+    This call site used to interpolate `tomllib`'s own message in full, on
+    the stated grounds that "`config` holds backend identity and never a
+    credential". Both halves of that were wrong. A `backend_url` of the
+    documented `postgres://user:password@host/db` form is a credential in
+    `config`; and `tomllib` does read document text back -- most of its
+    messages are a fixed description plus a coordinate, but a duplicated
+    table declaration names the key, which is the shape written below
+    (`Cannot declare ('...',) twice`).
+
+    The coordinate is asserted too: dropping the message entirely would also
+    satisfy a bare no-leak check, and the position is what makes the error
+    actionable.
+    """
+    secret = "supersecret-marker-9f1e2d"
+    write_config(
+        store_directory,
+        f'[{secret}]\nbackend_url = "file:///placeholder"\n[{secret}]\n',
+    )
+    with pytest.raises(StoreError) as raised:
+        load_store_config(store_directory)
+
+    message = str(raised.value)
+    assert_no_leak(message, secret, what="a name written into `config`")
+    assert "invalid TOML" in message
+    assert "line 3" in message
+
+
+def test_a_config_value_is_never_quoted_back_by_a_syntax_error(store_directory):
+    """The same rule for a credential in the *value* position -- the shape a
+    real `postgres://user:password@host/db` backend URL takes."""
+    secret = "supersecret-marker-4b7c0a"
+    write_config(
+        store_directory,
+        f'[profile.one]\nbackend_url = "postgres://u:{secret}@h.invalid/db"\n[broken\n',
+    )
+    with pytest.raises(StoreError) as raised:
+        load_store_config(store_directory)
+    assert_no_leak(str(raised.value), secret, what="a backend URL password")
+
+
+def test_a_credential_at_the_end_of_the_document_is_not_quoted_back(store_directory):
+    """The other coordinate `tomllib` produces, `(at end of document)`.
+
+    `_toml_position` matches two message shapes and every other test here
+    exercises only the first, which would leave the second silently
+    unrecognised -- and an unrecognised shape yields no coordinate at all,
+    so the branch is worth a test of its own. An unterminated string is the
+    natural way to reach it, and is also the shape a half-pasted backend URL
+    actually takes.
+    """
+    secret = "supersecret-marker-2e8d6c"
+    write_config(store_directory, f'backend_url = "postgres://u:{secret}@h.invalid/db')
+    with pytest.raises(StoreError) as raised:
+        load_store_config(store_directory)
+
+    message = str(raised.value)
+    assert_no_leak(message, secret, what="a backend URL password")
+    assert "invalid TOML" in message
+    assert "end of document" in message
+
+
+def test_a_toml_message_with_no_coordinate_loses_the_coordinate_not_the_secrecy(
+    store_directory, monkeypatch
+):
+    """The fallback: an unrecognised message shape must degrade to no
+    position, never to quoting the message.
+
+    `TOMLDecodeError`'s text is not an API and this project supports three
+    Python versions, so `_toml_position` has to cope with a message it
+    cannot parse. The safe degradation is losing the diagnostic; the unsafe
+    one is falling back to the whole message, which is exactly what this
+    call site used to do unconditionally.
+    """
+    secret = "supersecret-marker-5a3f1b"
+    write_config(store_directory, '[profile.one]\nbucket = "b"\n')
+
+    def raise_unparseable(*_args, **_kwargs):
+        raise tomllib.TOMLDecodeError(f"a shape from some future release: {secret}")
+
+    monkeypatch.setattr(tomllib, "load", raise_unparseable)
+    with pytest.raises(StoreError) as raised:
+        load_store_config(store_directory)
+
+    message = str(raised.value)
+    assert_no_leak(message, secret, what="the parser's own message")
+    assert message.endswith("invalid TOML")
+
+
+def test_an_unknown_top_level_key_is_refused_naming_it(store_directory):
+    """The profile-level analogue of this is tested; the top-level one was
+    not, so `_build_store_config`'s own refusal never ran at all. An
+    unrecognised top-level key must not be ignored: a misspelled
+    `default_profile` silently dropped would make the store fall through to
+    "no profile selected" with nothing pointing at the typo."""
+    write_config(
+        store_directory, 'defualt_profile = "one"\n[profile.one]\nbucket = "b"\n'
+    )
+    with pytest.raises(StoreError, match="defualt_profile"):
         load_store_config(store_directory)
 
 
@@ -312,34 +423,73 @@ def test_an_unspellable_profile_name_is_rejected(name):
 
 
 def test_the_store_directory_is_created_private_whatever_the_umask(store_directory):
+    """0o700 as a literal, deliberately -- never `DIR_MODE`.
+
+    Asserting `== DIR_MODE` compares the module against itself: the
+    expectation moves with the constant, so `DIR_MODE = 0o777` produces a
+    world-writable store directory and this test still passes. The number is
+    the requirement, so the number is what is written here.
+    """
     previous = os.umask(0)
     try:
         store.ensure_store_dir(store_directory)
     finally:
         os.umask(previous)
-    assert stat.S_IMODE(store_directory.stat().st_mode) == DIR_MODE
+    assert stat.S_IMODE(store_directory.stat().st_mode) == 0o700
 
 
 def test_the_credentials_file_is_written_private_whatever_the_umask(store_directory):
+    """0o600 as a literal -- see the sibling test above on why not
+    `CREDENTIALS_MODE`. `CREDENTIALS_MODE = 0o606` leaves the credentials
+    file world-*writable* and passes an `== CREDENTIALS_MODE` assertion."""
     previous = os.umask(0)
     try:
         init_store(PASSWORD, directory=store_directory)
     finally:
         os.umask(previous)
     mode = stat.S_IMODE((store_directory / "credentials").stat().st_mode)
-    assert mode == CREDENTIALS_MODE
+    assert mode == 0o600
 
 
-@pytest.mark.parametrize("mode", [CREDENTIALS_MODE, CONFIG_MODE])
+def test_the_config_file_mode_the_store_expects_is_owner_only(store_directory, capsys):
+    """The mode `config` is *held to*, asserted where the module actually
+    applies it rather than against the constant it applies.
+
+    Nothing in this module writes `config` -- it is hand-edited -- so the
+    only place `CONFIG_MODE` has an effect is the permissiveness warning
+    `load_store_config` raises, and that is therefore where it has to be
+    pinned. A unit test of `warn_if_permissive(path, 0o600)` proves the
+    function; it says nothing about which constant the call site passes,
+    and `CONFIG_MODE = 0o644` leaves that unit test green.
+
+    0644 is the specific mode that matters: `config` can hold a credential
+    (a `backend_url` of the documented `postgres://user:password@host/db`
+    form), so a world-readable one has to be reported.
+    """
+    write_config(store_directory, '[profile.one]\nbackend_url = "file:///placeholder"\n')
+    os.chmod(store_directory / "config", 0o644)
+
+    load_store_config(store_directory)
+
+    captured = capsys.readouterr()
+    assert "0644" in captured.err
+    assert str(store_directory / "config") in captured.err
+    assert captured.out == ""
+
+
+@pytest.mark.parametrize("mode", [0o600, 0o644])
 def test_the_mode_is_set_before_the_rename_not_after(store_directory, monkeypatch, mode):
     """Setting the mode after the rename leaves a window in which the finished
     file is visible at its real path with whatever mode it was created with.
     This records the mode of the temporary file at the moment of the rename.
 
-    Both modes are checked because only one of them discriminates: `mkstemp`
-    already creates at 0600, so for the credentials file a mode set after the
-    rename would look identical and this test would prove nothing. 0644 is what
-    makes the ordering observable.
+    Two modes are checked because only one of them discriminates: `mkstemp`
+    already creates at 0600, so at that mode a `chmod` after the rename would
+    look identical and this test would prove nothing. 0644 is what makes the
+    ordering observable -- which is why it is written as a literal and not as
+    `CONFIG_MODE`, whose value is now also 0600. Parametrising over the
+    module's two constants would have quietly turned this into two copies of
+    the case that proves nothing the moment `CONFIG_MODE` changed.
     """
     store_directory.mkdir(parents=True)
     real_replace = os.replace
@@ -404,17 +554,26 @@ def test_a_failed_write_leaves_no_temporary_file_behind(
 @pytest.mark.parametrize(
     ("filename", "allowed", "mode", "expected"),
     [
-        ("credentials", CREDENTIALS_MODE, 0o600, False),
-        ("credentials", CREDENTIALS_MODE, 0o640, True),
-        ("credentials", CREDENTIALS_MODE, 0o644, True),
-        ("config", CONFIG_MODE, 0o644, False),
-        ("config", CONFIG_MODE, 0o600, False),
-        ("config", CONFIG_MODE, 0o666, True),
+        ("credentials", 0o600, 0o600, False),
+        ("credentials", 0o600, 0o640, True),
+        ("credentials", 0o600, 0o644, True),
+        ("config", 0o600, 0o600, False),
+        ("config", 0o600, 0o644, True),
+        ("config", 0o600, 0o666, True),
+        # More restrictive than allowed is not "more permissive".
+        ("credentials", 0o644, 0o600, False),
     ],
 )
 def test_a_more_permissive_mode_than_required_is_warned_about(
     store_directory, capsys, filename, allowed, mode, expected
 ):
+    """`allowed` is a literal on both halves, deliberately.
+
+    Passing `allowed=CREDENTIALS_MODE` made every row compare the module
+    against itself: widen the constant and the expectation widens with it,
+    so the parametrisation kept passing while describing a different, more
+    permissive policy than the one written down here.
+    """
     store_directory.mkdir(parents=True)
     path = store_directory / filename
     path.write_text("")
@@ -569,6 +728,80 @@ def test_an_unsupported_store_version_is_refused(initialised):
     path.write_text(json.dumps(document))
     with pytest.raises(StoreError):
         resolve_credentials("one", PASSWORD, directory=initialised)
+
+
+def test_a_store_with_no_verifier_is_refused_rather_than_opened(initialised):
+    """The verifier is what makes a mistyped password fail immediately
+    instead of weeks later, so a store that has none cannot be treated as
+    "no check to run" -- that would silently restore the failure mode the
+    verifier exists to remove. None of `_check_password`'s three refusals
+    had ever executed."""
+    path = initialised / "credentials"
+    document = json.loads(path.read_bytes())
+    del document[store.VERIFIER_KEY]
+    path.write_text(json.dumps(document))
+
+    with pytest.raises(StoreError, match="verifier"):
+        resolve_credentials("one", PASSWORD, directory=initialised)
+
+
+def test_an_unusable_verifier_envelope_is_a_store_error_not_a_wrong_password(
+    initialised,
+):
+    """A structurally broken verifier envelope is damage, and must be
+    reported as damage: telling a user "wrong password" for a store their
+    password is fine for sends them to retype it forever."""
+    path = initialised / "credentials"
+    document = json.loads(path.read_bytes())
+    document[store.VERIFIER_KEY] = {"v": 1, "kdf": "not an object"}
+    path.write_text(json.dumps(document))
+
+    with pytest.raises(StoreError) as raised:
+        resolve_credentials("one", PASSWORD, directory=initialised)
+    assert not isinstance(raised.value, PasswordError)
+    assert "unusable" in str(raised.value)
+
+
+def test_a_verifier_that_opens_to_the_wrong_plaintext_is_refused(initialised):
+    """The known-plaintext half of the check, which the GCM tag alone does
+    not provide: an envelope sealed under the right password and the right
+    AAD but carrying different content still is not this tool's verifier."""
+    path = initialised / "credentials"
+    document = json.loads(path.read_bytes())
+    document[store.VERIFIER_KEY] = crypto.seal_json(
+        "not the verifier plaintext", PASSWORD, store.VERIFIER_AAD
+    )
+    path.write_text(json.dumps(document))
+
+    with pytest.raises(StoreError, match="did not match"):
+        resolve_credentials("one", PASSWORD, directory=initialised)
+
+
+def test_the_temporary_file_is_created_in_the_target_directory(
+    store_directory, monkeypatch
+):
+    """`atomic_write`'s atomicity rests entirely on the rename being within
+    one filesystem, which rests entirely on `mkstemp(dir=...)`. Nothing
+    pinned it: dropping `dir=directory` puts the temporary file under
+    `$TMPDIR`, and `os.replace` across filesystems raises `OSError` -- or,
+    worse, on a setup where `$TMPDIR` happens to share the filesystem,
+    succeeds while writing sealed credentials into a world-traversable
+    directory first.
+
+    Recorded at the moment of the rename, which is the only point the
+    temporary file is guaranteed to still exist.
+    """
+    store_directory.mkdir(parents=True)
+    real_replace = os.replace
+    observed: list[pathlib.Path] = []
+
+    def spy(src, dst):
+        observed.append(pathlib.Path(src).parent)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", spy)
+    atomic_write(store_directory / "credentials", b"content", 0o600)
+    assert observed == [store_directory]
 
 
 # ---------------------------------------------------------------------------

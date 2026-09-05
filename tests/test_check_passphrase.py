@@ -46,6 +46,8 @@ from pathlib import Path
 
 import pytest
 from cryptography.hazmat.primitives import hashes
+
+from leakcheck import assert_no_leak
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
@@ -60,9 +62,15 @@ from stackward.commands.check_passphrase import (
 )
 
 # Placeholder values only -- see GC4. Distinctive enough that an accidental
-# substring match elsewhere in captured output would be implausible.
-MARKER_PASSPHRASE = "marker-passphrase-7c8d9e0f"
-WRONG_PASSPHRASE = "marker-wrong-passphrase-1a2b3c"
+# substring match elsewhere in captured output would be implausible, and
+# deliberately free of any word this command itself prints: the leak checks
+# below look for any eight-character run of these values, and a placeholder
+# spelled `marker-passphrase-...` collides with the command's own
+# `passphrase fingerprint:` line on the run `passphra`. A placeholder that
+# embeds the tool's vocabulary makes a partial-disclosure check unusable,
+# which is how such a check ends up deleted.
+MARKER_PASSPHRASE = "marker-candidate-7c8d9e0f"
+WRONG_PASSPHRASE = "decoy-input-1a2b3c4d5e6f"
 
 # ---------------------------------------------------------------------------
 # A real vector, captured once from an actual `pulumi stack export` against
@@ -77,6 +85,27 @@ WRONG_PASSPHRASE = "marker-wrong-passphrase-1a2b3c"
 # ---------------------------------------------------------------------------
 REAL_PULUMI_SALT_FIELD = "v1:qs/zMEaMbWE=:v1:iMv8Ne7bNxnv6rkP:vGQfE+/D8kOTOH8eT1DTPj68sddAoA=="
 REAL_PULUMI_PASSPHRASE = "placeholder-passphrase-marker"
+
+
+def assert_no_disclosure(text: str, value: str, *, what: str) -> None:
+    """`assert_no_leak`, plus the one case it cannot see on its own here: a
+    **truncated** re-encoding of the value.
+
+    `assert_no_leak` checks each whole encoding (so `value.hex()` in full is
+    caught) and every eight-character run of the *raw* value. This command
+    prints a fixed-length value derived from the passphrase, so the shape
+    that matters is neither: `passphrase.encode("utf-8").hex()[:16]` is a
+    16-character *prefix* of the hex encoding, so the whole-encoding check
+    never matches it, and it shares no raw run with the passphrase because
+    it is hex. Verified rather than assumed -- that exact defective
+    implementation passes a bare `assert_no_leak(fingerprint(p), p)`.
+
+    Handing the hex encoding in as the *value* is what closes it: the
+    run-based half of the check then operates on hex runs, and a truncated
+    hex encoding of any length above eight characters is caught.
+    """
+    assert_no_leak(text, value, what=what)
+    assert_no_leak(text, value.encode("utf-8").hex(), what=f"{what}, hex-encoded")
 
 
 def _encrypt_pulumi_style(passphrase: str, plaintext: bytes = b"pulumi") -> str:
@@ -197,10 +226,47 @@ def test_a_ciphertext_shorter_than_the_gcm_tag_errors_rather_than_being_reported
 # ---------------------------------------------------------------------------
 
 
+# SHA-256 of the exact UTF-8 bytes, truncated to 16 hex characters, written
+# out as literals. Computed once with `hashlib` at a Python prompt and pasted;
+# deliberately not recomputed inside the test from `hashlib.sha256(...)`, which
+# would only prove this file and `check_passphrase` agree on how to spell the
+# same call rather than pinning the digest to a known value.
+FINGERPRINT_OF_X = "2d711642b726b044"
+FINGERPRINT_OF_MARKER = "7e742b5d41ffb360"
+
+
+def test_fingerprint_is_the_truncated_sha256_of_the_passphrase_bytes():
+    """The digest itself, pinned against known values.
+
+    Nothing pinned it before. "16 hex characters", "stable", "differs for
+    different inputs" and "does not contain the passphrase" are jointly
+    satisfied by `passphrase.encode("utf-8").hex()[:16]` -- which is not a
+    digest at all, but the passphrase's own first eight bytes, and which
+    `cmd_check_passphrase` prints to stdout on every run. Every one of those
+    four tests passed against it. This is the assertion that does not.
+    """
+    assert fingerprint("x") == FINGERPRINT_OF_X
+    assert fingerprint(MARKER_PASSPHRASE) == FINGERPRINT_OF_MARKER
+
+
 def test_fingerprint_is_16_hex_characters():
     fp = fingerprint(MARKER_PASSPHRASE)
     assert len(fp) == 16
     int(fp, 16)  # raises ValueError if it is not hex
+
+
+def test_fingerprint_is_over_the_exact_bytes_and_not_a_normalised_form():
+    """The module's stated rule -- the fingerprint covers the identical bytes
+    handed to PBKDF2, unlike `crypto.py`'s stored passwords, which are NFC
+    normalised because they must reproduce across sessions. Two spellings of
+    the same grapheme derive two different keys, so they must fingerprint
+    differently; a fingerprint that normalised would report one candidate
+    for two that behave differently, which is the one thing it exists to
+    prevent."""
+    composed = "caf\u00e9"  # e-acute as a single code point
+    decomposed = "cafe\u0301"  # 'e' plus a combining acute
+    assert composed != decomposed
+    assert fingerprint(composed) != fingerprint(decomposed)
 
 
 def test_fingerprint_is_stable_for_the_same_passphrase():
@@ -214,8 +280,16 @@ def test_fingerprint_differs_for_different_passphrases():
     assert fingerprint(MARKER_PASSPHRASE) != fingerprint(WRONG_PASSPHRASE)
 
 
-def test_fingerprint_never_contains_the_passphrase_itself():
-    assert MARKER_PASSPHRASE not in fingerprint(MARKER_PASSPHRASE)
+def test_fingerprint_never_discloses_the_passphrase_whole_or_in_part():
+    """`MARKER_PASSPHRASE not in fingerprint(...)` was a tautology: the
+    fingerprint is pinned to 16 characters by the test above and the
+    passphrase is 26, so no implementation could ever fail it.
+    `assert_no_leak` is what actually discriminates -- it checks the hex
+    encoding and every eight-character run, which is exactly the shape a
+    `passphrase.encode("utf-8").hex()[:16]` "fingerprint" takes."""
+    assert_no_disclosure(
+        fingerprint(MARKER_PASSPHRASE), MARKER_PASSPHRASE, what="the passphrase"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -557,15 +631,21 @@ def test_the_passphrase_never_appears_in_output_on_any_outcome(stub_pulumi, monk
     main(["check-passphrase", "stack-accept", "stack-error"])
 
     combined = "".join(capfd.readouterr())
-    assert MARKER_PASSPHRASE not in combined
+    # `assert_no_disclosure`, not `not in`: this command *prints* a value
+    # derived from the passphrase on every run (`passphrase fingerprint:
+    # ...`), so a whole-string check here is exactly the assertion a partial
+    # or re-encoded disclosure walks straight through -- and did.
+    assert_no_disclosure(combined, MARKER_PASSPHRASE, what="the passphrase")
 
     # A rejected outcome too, in a separate run against a fresh capture.
     fake_pulumi(monkeypatch, stub_pulumi)
     feed_stdin(monkeypatch, WRONG_PASSPHRASE)
     main(["check-passphrase", "stack-accept"])
     combined_reject = "".join(capfd.readouterr())
-    assert MARKER_PASSPHRASE not in combined_reject
-    assert WRONG_PASSPHRASE not in combined_reject
+    assert_no_disclosure(combined_reject, MARKER_PASSPHRASE, what="the passphrase")
+    assert_no_disclosure(
+        combined_reject, WRONG_PASSPHRASE, what="the wrong passphrase"
+    )
 
 
 def test_the_passphrase_never_reaches_pulumis_argv(stub_pulumi, monkeypatch, tmp_path):
@@ -578,4 +658,6 @@ def test_the_passphrase_never_reaches_pulumis_argv(stub_pulumi, monkeypatch, tmp
 
     main(["check-passphrase", "stack-a"])
 
-    assert MARKER_PASSPHRASE not in argv_dump.read_text()
+    assert_no_disclosure(
+        argv_dump.read_text(), MARKER_PASSPHRASE, what="the passphrase"
+    )

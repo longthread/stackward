@@ -34,6 +34,7 @@ from pathlib import Path
 
 import pytest
 
+from leakcheck import assert_no_leak
 from stackward import store
 from stackward.cli import main
 from stackward.commands import session
@@ -47,8 +48,15 @@ from stackward.commands.session import (
 )
 from stackward.store import Profile, ProfileError, StoreError
 
-PASSWORD = "the store password"
-WRONG_PASSWORD = "not the store password"
+# Placeholder values only -- see GC4. Deliberately free of any word this
+# module itself prints: the leak checks below look for any eight-character
+# run of these values, and the previous spelling, `the store password`,
+# collides with `_read_store_password`'s own refusal ("no store password
+# available: set STACKWARD_PASSWORD...") on the run ` store p`. A placeholder
+# that embeds the tool's vocabulary makes a partial-disclosure check
+# unusable, which is how such a check ends up deleted.
+PASSWORD = "store-unlock-4d7a2f9c1e8b"
+WRONG_PASSWORD = "wrong-unlock-6b3e0d5a2f7c"
 
 # Placeholder values only -- see GC4 in the task brief. Distinctive enough
 # that an accidental substring match elsewhere in a test's own output would
@@ -63,6 +71,30 @@ FULL_CREDENTIALS = {
     PULUMI_CONFIG_PASSPHRASE: MARKER_PASSPHRASE,
 }
 ALL_MARKERS = (MARKER_KEY, MARKER_SECRET, MARKER_PASSPHRASE)
+
+# What a developer who already has credentials exported in their own shell
+# looks like -- a different, non-secret set of values under the *same* three
+# names, seeded into the parent environment of every test in this file by the
+# autouse fixture below. Distinct from the MARKERs on purpose: "the child got
+# the profile's value" and "the child inherited the shell's value" are
+# different outcomes, and a test whose parent environment does not carry these
+# names at all cannot tell them apart.
+AMBIENT_KEY = "ambient-access-key-2f4e6a8c"
+AMBIENT_SECRET = "ambient-secret-key-1d3f5b7d"
+AMBIENT_PASSPHRASE = "ambient-config-value-0e2c4a6e"
+AMBIENT_CREDENTIALS = {
+    AWS_ACCESS_KEY_ID: AMBIENT_KEY,
+    AWS_SECRET_ACCESS_KEY: AMBIENT_SECRET,
+    PULUMI_CONFIG_PASSPHRASE: AMBIENT_PASSPHRASE,
+}
+
+# A backend URL that carries a password in its userinfo -- the
+# `postgres://user:password@host/db` form `pulumi login --help` documents and
+# `_redact_url` exists for. Used wherever a test would otherwise only ever see
+# a `file://` URL, for which `_redact_url` is the identity function and every
+# assertion about redaction is therefore vacuous.
+USERINFO_BACKEND_URL = "postgres://dbuser:super-secret-password@db.invalid:5432/state"
+USERINFO_PASSWORD = "super-secret-password"
 
 
 @pytest.fixture(autouse=True)
@@ -79,12 +111,41 @@ def cheap_kdf(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def no_real_pulumi_state(monkeypatch, tmp_path):
-    """Point `PULUMI_HOME` at an empty, per-test directory, and clear
-    `PULUMI_BACKEND_URL`, so no test in this file can read or depend on this
+    """Fix this file's *parent* environment: the four names `exec`/`shell`
+    overlay, and nothing about them left to whoever's shell runs the suite.
+
+    `PULUMI_HOME` points at an empty, per-test directory and
+    `PULUMI_BACKEND_URL` is cleared, so no test can read or depend on this
     machine's real Pulumi state -- `_current_backend()` consults both, in
-    that order, once `PULUMI_BACKEND_URL` is set."""
+    that order, once `PULUMI_BACKEND_URL` is set.
+
+    The three credential names are **set**, not cleared, and that is the
+    single decision this fixture exists to make for the whole file. It does
+    two jobs at once, which were previously two separate bugs:
+
+    *Isolation.* A developer with `AWS_ACCESS_KEY_ID` or
+    `AWS_SECRET_ACCESS_KEY` exported in their own shell -- an entirely
+    ordinary state -- failed the environment-delta tests below, which
+    computed `child_keys - parent_keys` and got a smaller set than they
+    expected. The suite's result must not depend on the shell it is run
+    from.
+
+    *Discrimination.* Nothing in this suite ever put a credential name in the
+    parent environment, which made the delta tests blind to the one
+    substitution that matters: `env[name] = credentials[name]` weakened to
+    `env.setdefault(name, credentials[name])` passed every test in this file.
+    That implementation hands a developer's ambient key to a child paired
+    with a *different* profile's backend -- credentials for one account
+    pointed at another account's state. `session.py`'s own module docstring
+    claims the diff-based tests catch "an implementation that happened to
+    also inherit the right ambient variables"; this is precisely the case
+    they could not see, and seeding these names is what makes the assertions
+    below about the child's *values* rather than merely its set of keys.
+    """
     monkeypatch.setenv("PULUMI_HOME", str(tmp_path / "pulumi-home"))
     monkeypatch.delenv(PULUMI_BACKEND_URL, raising=False)
+    for name, value in AMBIENT_CREDENTIALS.items():
+        monkeypatch.setenv(name, value)
 
 
 @pytest.fixture
@@ -210,6 +271,22 @@ def test_component_form_with_endpoint_forces_path_style():
     profile = Profile(name="p", bucket="placeholder-bucket", endpoint="placeholder.invalid")
     url = session._compose_backend_url(profile)
     assert "endpoint=placeholder.invalid" in url
+    assert "s3ForcePathStyle=true" in url
+
+
+def test_component_form_percent_encodes_a_scheme_bearing_endpoint():
+    """An `endpoint` is routinely a full URL (`https://host:port`), and it
+    goes into a *query parameter*, where `://` and `:` are reserved. Correct
+    by construction today because `urlencode` quotes its values -- but
+    nothing exercised it, so hand-assembling the query string (the obvious
+    "simplification") would produce a URL Pulumi parses differently and no
+    test would notice."""
+    profile = Profile(
+        name="p", bucket="placeholder-bucket", endpoint="https://placeholder.invalid:9000"
+    )
+    url = session._compose_backend_url(profile)
+    assert "endpoint=https%3A%2F%2Fplaceholder.invalid%3A9000" in url
+    assert "://placeholder.invalid" not in url.removeprefix("s3://placeholder-bucket")
     assert "s3ForcePathStyle=true" in url
 
 
@@ -360,6 +437,40 @@ def test_guard_refuses_a_mismatch_naming_both(monkeypatch):
     assert "file:///other" in message
 
 
+@pytest.mark.parametrize(
+    ("current", "resolved"),
+    [
+        # The resolved URL is a *prefix* of the current one, and vice versa.
+        # Two different buckets, two different backends -- containment is not
+        # a match, and a substring comparison would silently allow the pair.
+        ("s3://placeholder-bucket-two/prefix", "s3://placeholder-bucket"),
+        ("s3://placeholder-bucket", "s3://placeholder-bucket-two/prefix"),
+        # A trailing path segment, the same shape by a different route.
+        ("file:///backend/inner", "file:///backend"),
+        ("file:///backend", "file:///backend/inner"),
+    ],
+)
+def test_guard_refuses_a_backend_that_merely_contains_the_other(
+    monkeypatch, current, resolved
+):
+    """Containment is not equality, and the guard must not treat it as such.
+
+    Every existing guard test pairs two URLs where neither contains the
+    other, so `current != resolved_url` weakened to `resolved_url not in
+    current` -- a substring test -- passes all of them. It would let a
+    profile pointing at one bucket run against a live login to a
+    differently-named bucket whose name merely starts the same way: a
+    different backend, silently accepted, which is the entire failure the
+    guard exists to prevent.
+
+    The comparison in `session.py` is already an exact `!=`; this pins it
+    there so it cannot be relaxed into containment by a later "fix".
+    """
+    monkeypatch.setattr(session, "_current_backend", lambda: current)
+    with pytest.raises(SessionError, match="backend mismatch"):
+        session._check_backend_guard(resolved)
+
+
 def test_guard_message_redacts_userinfo_in_both_urls(monkeypatch):
     """The guard's "naming both" message must never print a password that
     happened to be embedded in a backend URL (`postgres://user:pass@host/db`
@@ -505,6 +616,52 @@ def poisoned_stdin(monkeypatch):
     monkeypatch.setattr(sys, "stdin", _PoisonedStdin())
 
 
+def test_tty_available_asks_for_dev_tty_specifically_and_closes_it(monkeypatch):
+    """The function body itself, which no test had ever executed.
+
+    Every existing test either set `STACKWARD_PASSWORD` or monkeypatched
+    `_tty_available` away, so redirecting the probe from `/dev/tty` to
+    `/dev/null` -- which always opens -- passed the whole suite. That
+    substitution makes the function answer "yes, there is a terminal" in
+    every environment, including the ones it exists to refuse, so the path is
+    asserted here and not merely the boolean.
+
+    `/dev/tty` is the point: it is the controlling terminal, reachable
+    independently of `sys.stdin`, which for `exec`/`shell` belongs to the
+    child. Asking about anything else answers a different question.
+    """
+    opened: list[str] = []
+    closed: list[int] = []
+    real_open, real_close = os.open, os.close
+
+    def spy_open(path, flags, *args, **kwargs):
+        opened.append(path)
+        return real_open(os.devnull, os.O_RDWR)
+
+    def spy_close(fd):
+        closed.append(fd)
+        return real_close(fd)
+
+    monkeypatch.setattr(session.os, "open", spy_open)
+    monkeypatch.setattr(session.os, "close", spy_close)
+
+    assert session._tty_available() is True
+
+    assert opened == ["/dev/tty"]
+    assert closed, "the probe leaked its file descriptor"
+
+
+def test_tty_available_is_false_when_dev_tty_cannot_be_opened(monkeypatch):
+    """The refusal branch, exercised through the real function rather than
+    by patching it out."""
+
+    def refuse(path, *args, **kwargs):
+        raise OSError("simulated: no controlling terminal")
+
+    monkeypatch.setattr(session.os, "open", refuse)
+    assert session._tty_available() is False
+
+
 def test_password_from_env_var_is_used_without_prompting(monkeypatch):
     monkeypatch.setenv(ENV_STORE_PASSWORD, "from-the-environment")
 
@@ -569,6 +726,16 @@ def test_extra_names_beyond_the_three_required_are_accepted():
 
 
 def test_child_env_overlays_exactly_four_names_on_a_copy_of_the_parent(monkeypatch):
+    """Every one of the four names carries the *profile's* value, over an
+    otherwise untouched copy of the parent environment.
+
+    The parent already carries all three credential names, with different
+    values (see `no_real_pulumi_state`), so this is an assertion about
+    overwriting and not merely about setting: `env.setdefault(name, ...)`
+    leaves the ambient value in place and fails here. Without that seeding
+    the whole test reduced to a set-difference over key *names*, which
+    `setdefault` satisfies exactly.
+    """
     # Injected, not merely assumed absent: this is the exact non-interactive
     # path (`STACKWARD_PASSWORD=x stackward exec -- ...`) the scrubbing
     # protects, and a difference-based assertion that never puts the name in
@@ -581,20 +748,16 @@ def test_child_env_overlays_exactly_four_names_on_a_copy_of_the_parent(monkeypat
 
     parent_keys = set(parent_before)
     child_keys = set(env)
-    assert child_keys - parent_keys == {
-        AWS_ACCESS_KEY_ID,
-        AWS_SECRET_ACCESS_KEY,
-        PULUMI_CONFIG_PASSPHRASE,
-        PULUMI_BACKEND_URL,
-    }
+    # `PULUMI_BACKEND_URL` is the only name the parent does not already have.
+    assert child_keys - parent_keys == {PULUMI_BACKEND_URL}
     # The one name that must be *dropped*, not merely left alone.
     assert parent_keys - child_keys == {ENV_STORE_PASSWORD}
     assert ENV_STORE_PASSWORD not in env
-    for key in parent_keys - {ENV_STORE_PASSWORD}:
+    for key in parent_keys - {ENV_STORE_PASSWORD} - set(AMBIENT_CREDENTIALS):
         assert env[key] == parent_before[key]  # nothing else changed
-    assert env[AWS_ACCESS_KEY_ID] == MARKER_KEY
-    assert env[AWS_SECRET_ACCESS_KEY] == MARKER_SECRET
-    assert env[PULUMI_CONFIG_PASSPHRASE] == MARKER_PASSPHRASE
+    assert env[AWS_ACCESS_KEY_ID] == MARKER_KEY != AMBIENT_KEY
+    assert env[AWS_SECRET_ACCESS_KEY] == MARKER_SECRET != AMBIENT_SECRET
+    assert env[PULUMI_CONFIG_PASSPHRASE] == MARKER_PASSPHRASE != AMBIENT_PASSPHRASE
     assert env[PULUMI_BACKEND_URL] == "file:///backend"
     assert PASSWORD not in env.values()
 
@@ -918,6 +1081,42 @@ def test_prepare_env_profile_with_no_credentials_set_raises(store_directory, mon
 # ---------------------------------------------------------------------------
 
 
+def assert_expected_session_env(
+    child_env: dict[str, str], parent_before: dict[str, str], *, backend_url: str
+) -> None:
+    """The full contract `exec` and `shell` share, in one place.
+
+    Both commands overlay the same four names onto a copy of the caller's
+    environment and scrub the same one, so both get the same assertion block.
+    `shell` previously had no equivalent at all -- the one test on it checked
+    two keys, and popping `PULUMI_CONFIG_PASSPHRASE` out of `shell`'s child
+    environment passed the whole suite while failing two `exec` tests.
+
+    The four names are asserted by *value* against the profile's, and against
+    the different values the same names carry in the parent (see
+    `no_real_pulumi_state`), so an implementation that inherited rather than
+    overlaid them fails here rather than satisfying a set-difference over
+    names.
+    """
+    parent_keys = set(parent_before)
+    child_keys = set(child_env)
+    # `PULUMI_BACKEND_URL` is the only name the parent does not already carry.
+    assert child_keys - parent_keys == {PULUMI_BACKEND_URL}
+    # The one name that must be *dropped*, not merely left alone: the store
+    # master password unlocks every profile, not just this one, and must
+    # never reach caller-supplied code.
+    assert parent_keys - child_keys == {ENV_STORE_PASSWORD}
+    assert ENV_STORE_PASSWORD not in child_env
+    untouched = parent_keys - {"STUB_DUMP_ENV_TO", ENV_STORE_PASSWORD}
+    for key in untouched - set(AMBIENT_CREDENTIALS):
+        assert child_env[key] == parent_before[key]
+    assert child_env[AWS_ACCESS_KEY_ID] == MARKER_KEY != AMBIENT_KEY
+    assert child_env[AWS_SECRET_ACCESS_KEY] == MARKER_SECRET != AMBIENT_SECRET
+    assert child_env[PULUMI_CONFIG_PASSPHRASE] == MARKER_PASSPHRASE != AMBIENT_PASSPHRASE
+    assert child_env[PULUMI_BACKEND_URL] == backend_url
+    assert PASSWORD not in child_env.values()
+
+
 @pytest.fixture
 def cli_store(tmp_path, monkeypatch) -> Path:
     """Points the real config-home lookup (`XDG_CONFIG_HOME`) at an isolated
@@ -979,31 +1178,14 @@ def test_exec_runs_the_child_with_exactly_the_expected_environment_delta(
 
     assert code == 0
     child_env = json.loads(dump.read_text())
-    parent_keys = set(parent_before)
-    child_keys = set(child_env)
-    assert child_keys - parent_keys == {
-        AWS_ACCESS_KEY_ID,
-        AWS_SECRET_ACCESS_KEY,
-        PULUMI_CONFIG_PASSPHRASE,
-        PULUMI_BACKEND_URL,
-    }
-    # The one name that must be *dropped*, not merely left alone: the store
-    # master password unlocks every profile, not just this one, and must
-    # never reach caller-supplied code.
-    assert parent_keys - child_keys == {ENV_STORE_PASSWORD}
-    assert ENV_STORE_PASSWORD not in child_env
-    for key in parent_keys - {"STUB_DUMP_ENV_TO", ENV_STORE_PASSWORD}:
-        assert child_env[key] == parent_before[key]
-    assert child_env[AWS_ACCESS_KEY_ID] == MARKER_KEY
-    assert child_env[AWS_SECRET_ACCESS_KEY] == MARKER_SECRET
-    assert child_env[PULUMI_CONFIG_PASSPHRASE] == MARKER_PASSPHRASE
-    assert child_env[PULUMI_BACKEND_URL] == "file:///staging-backend"
-    assert PASSWORD not in child_env.values()
+    assert_expected_session_env(
+        child_env, parent_before, backend_url="file:///staging-backend"
+    )
 
     captured = capfd.readouterr()
     for marker in (*ALL_MARKERS, PASSWORD):
-        assert marker not in captured.out
-        assert marker not in captured.err
+        assert_no_leak(captured.out, marker, what="a credential")
+        assert_no_leak(captured.err, marker, what="a credential")
 
 
 def test_exec_passes_extra_flags_through_to_the_child_argv(
@@ -1092,6 +1274,62 @@ def test_exec_propagates_a_signal_terminated_child(cli_store, monkeypatch, stub,
         assert marker not in captured.err
 
 
+def test_exec_reports_a_missing_command_without_disclosing_the_environment(
+    cli_store, monkeypatch, tmp_path, stub, capfd
+):
+    """`stackward exec -- puluim up` -- an ordinary typo -- must not print
+    the credentials it had just put in that child's environment.
+
+    This is `exec`'s single most likely failure, and it was the one path
+    where a decrypted environment is fully built and live at the moment
+    something goes wrong. Nothing covered it: the only test on
+    `_run_child`'s `OSError` branch called it directly with `env=None`, and
+    no `exec` or `shell` test ever named a command that does not exist, so
+    adding `env={env}` to that message passed all 781 tests.
+
+    `capfd`, not `capsys`: the message is this process's own, but the whole
+    point of the path is a real spawn attempt, and this file's convention is
+    file-descriptor capture wherever a child is involved.
+    """
+    seed_profile(
+        cli_store, "staging", backend_url="file:///staging-backend", credentials=FULL_CREDENTIALS
+    )
+    monkeypatch.setenv(ENV_STORE_PASSWORD, PASSWORD)
+    missing = tmp_path / "puluim"
+
+    code = main(["exec", "--profile", "staging", "--", str(missing)])
+
+    assert code == 2
+    captured = capfd.readouterr()
+    # It still says which command it could not run -- the message has to stay
+    # useful, and the name is the caller's own argv, never a credential.
+    assert "puluim" in captured.err
+    for marker in (*ALL_MARKERS, PASSWORD):
+        assert_no_leak(captured.out, marker, what="a credential")
+        assert_no_leak(captured.err, marker, what="a credential")
+
+
+def test_shell_reports_a_missing_shell_without_disclosing_the_environment(
+    cli_store, monkeypatch, tmp_path, capfd
+):
+    """The same path through `shell`, whose `$SHELL` can equally name
+    something that is not there (a shell uninstalled since login)."""
+    seed_profile(
+        cli_store, "staging", backend_url="file:///staging-backend", credentials=FULL_CREDENTIALS
+    )
+    monkeypatch.setenv(ENV_STORE_PASSWORD, PASSWORD)
+    monkeypatch.setenv("SHELL", str(tmp_path / "no-such-shell"))
+
+    code = main(["shell", "--profile", "staging"])
+
+    assert code == 2
+    captured = capfd.readouterr()
+    assert "no-such-shell" in captured.err
+    for marker in (*ALL_MARKERS, PASSWORD):
+        assert_no_leak(captured.out, marker, what="a credential")
+        assert_no_leak(captured.err, marker, what="a credential")
+
+
 def test_exec_refuses_a_backend_mismatch_and_never_runs_the_child(
     cli_store, monkeypatch, tmp_path, stub, capsys
 ):
@@ -1161,6 +1399,92 @@ def test_exec_with_no_password_available_refuses_and_never_runs_the_child(
         assert marker not in captured.err
 
 
+def _run_detached(argv: list[str], env: dict[str, str], *, stdin: str, cwd: Path):
+    """Run `stackward <argv>` in a real process with **no controlling
+    terminal**, feeding `stdin` to it.
+
+    `start_new_session=True` is `setsid()`: the child gets a fresh session and
+    therefore no controlling terminal at all, so `open("/dev/tty")` fails with
+    `ENXIO` exactly as it does in a CI job, a git hook run from a GUI client,
+    or a `nohup`. That state cannot be produced inside the test process, which
+    has a terminal whenever the suite is run from one -- and monkeypatching
+    `_tty_available` to `False`, which is what every existing test does, is
+    assuming the answer rather than provoking it.
+
+    The environment is passed through wholesale (minus what the caller
+    changes) so that `PYTHONPATH` and the rest of the interpreter's own setup
+    reach the child.
+    """
+    program = "import sys; from stackward.cli import main; sys.exit(main(sys.argv[1:]))"
+    return subprocess.run(
+        [sys.executable, "-c", program, *argv],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(cwd),
+        start_new_session=True,
+        timeout=120,
+    )
+
+
+def test_no_tty_and_no_password_refuses_instead_of_reading_the_childs_stdin(
+    cli_store, tmp_path, stub
+):
+    """The fail-open `_tty_available` exists to prevent, provoked for real.
+
+    Without the check, `getpass.getpass` cannot open `/dev/tty` either -- and
+    falls back to reading `sys.stdin`, with echo. For `exec` and `shell` that
+    descriptor is the *child's*: the password is consumed before the child
+    ever sees it, and printed on screen on the way past. The refusal has to
+    happen first.
+
+    Two halves, and both are needed. The exit code alone does not
+    discriminate: with the probe pointed at `/dev/null` instead of
+    `/dev/tty`, `getpass` reads the password off the pipe below, the store
+    opens, and the child *runs* -- so the marker file is what says whether
+    the fallback happened. The positive control at the end proves the marker
+    file would have appeared, in this same detached setup, had a password
+    been available at all.
+    """
+    seed_profile(
+        cli_store, "staging", backend_url="file:///staging-backend", credentials=FULL_CREDENTIALS
+    )
+    marker_file = tmp_path / "the-child-ran"
+
+    env = dict(os.environ)
+    env.pop(ENV_STORE_PASSWORD, None)
+    env.pop(PULUMI_BACKEND_URL, None)
+    # An empty, per-test Pulumi home: otherwise the backend guard could refuse
+    # first, for an unrelated reason, and this test would pass having never
+    # reached the password at all.
+    env["PULUMI_HOME"] = str(tmp_path / "empty-pulumi-home")
+    env["STUB_DUMP_ARGV_TO"] = str(marker_file)
+
+    argv = ["exec", "--profile", "staging", "--", str(stub)]
+    result = _run_detached(argv, env, stdin=PASSWORD + "\n", cwd=tmp_path)
+
+    assert result.returncode == 2
+    # This module's own refusal, naming the non-interactive escape hatch --
+    # not a traceback, and not a generic fail-closed catch-all.
+    assert ENV_STORE_PASSWORD in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not marker_file.exists(), "the child ran: stdin was consumed as a password"
+    for marker in (*ALL_MARKERS, PASSWORD):
+        assert_no_leak(result.stdout, marker, what="a credential")
+        assert_no_leak(result.stderr, marker, what="a credential")
+
+    # Positive control: the same detached process, with the password supplied
+    # the way it is supposed to be, does run the child. Without this, the
+    # `not marker_file.exists()` assertion above would also be satisfied by a
+    # setup that could never have produced the file at all.
+    control = _run_detached(
+        argv, {**env, ENV_STORE_PASSWORD: PASSWORD}, stdin="", cwd=tmp_path
+    )
+    assert control.returncode == 0
+    assert marker_file.exists()
+
+
 def test_exec_reports_an_unexpected_exception_via_fail_closed(
     cli_store, monkeypatch, stub, capsys
 ):
@@ -1206,8 +1530,16 @@ def test_exec_uses_the_wired_repo_profile_tier_end_to_end(
 
 
 def test_shell_runs_stub_as_the_shell_with_the_expected_environment_delta(
-    cli_store, monkeypatch, tmp_path, stub
+    cli_store, monkeypatch, tmp_path, stub, capfd
 ):
+    """`shell` gets the same assertion block as `exec`, not a weaker one.
+
+    This test previously checked two keys despite its name, which left
+    `shell`'s child environment almost entirely unconstrained: popping
+    `PULUMI_CONFIG_PASSPHRASE` out of it before `_run_child` passed the whole
+    suite, while the identical pop in `cmd_exec` failed two tests. The two
+    commands make the same promise and now carry the same proof of it.
+    """
     seed_profile(
         cli_store, "staging", backend_url="file:///staging-backend", credentials=FULL_CREDENTIALS
     )
@@ -1215,13 +1547,55 @@ def test_shell_runs_stub_as_the_shell_with_the_expected_environment_delta(
     monkeypatch.setenv(ENV_STORE_PASSWORD, PASSWORD)
     dump = tmp_path / "env.json"
     monkeypatch.setenv("STUB_DUMP_ENV_TO", str(dump))
+    parent_before = dict(os.environ)
 
     code = main(["shell", "--profile", "staging"])
 
     assert code == 0
     child_env = json.loads(dump.read_text())
-    assert child_env[PULUMI_BACKEND_URL] == "file:///staging-backend"
-    assert child_env[AWS_ACCESS_KEY_ID] == MARKER_KEY
+    assert_expected_session_env(
+        child_env, parent_before, backend_url="file:///staging-backend"
+    )
+
+    captured = capfd.readouterr()
+    for marker in (*ALL_MARKERS, PASSWORD):
+        assert_no_leak(captured.out, marker, what="a credential")
+        assert_no_leak(captured.err, marker, what="a credential")
+
+
+@pytest.mark.parametrize("command", ["exec", "shell"])
+def test_a_userinfo_bearing_backend_url_reaches_the_child_verbatim(
+    cli_store, monkeypatch, tmp_path, stub, command
+):
+    """`PULUMI_BACKEND_URL` is delivered as written, never redacted.
+
+    `_redact_url` is for *printing* a backend URL. Applying it on the
+    injection path instead would hand `pulumi` a URL with `<redacted>@` where
+    the credentials belong, and the backend would simply not work. Nothing
+    caught that: every environment-dumping test used a `file://` URL, for
+    which `_redact_url` is the identity function, so
+    `env[PULUMI_BACKEND_URL] = _redact_url(backend_url)` passed the entire
+    suite -- in both `cmd_exec`'s helper and `cmd_login`.
+
+    A `postgres://user:password@host/db` backend, which `pulumi login --help`
+    documents, is the case that tells the two apart.
+    """
+    seed_profile(
+        cli_store, "staging", backend_url=USERINFO_BACKEND_URL, credentials=FULL_CREDENTIALS
+    )
+    monkeypatch.setenv("SHELL", str(stub))
+    monkeypatch.setenv(ENV_STORE_PASSWORD, PASSWORD)
+    dump = tmp_path / "env.json"
+    monkeypatch.setenv("STUB_DUMP_ENV_TO", str(dump))
+    argv = ["exec", "--profile", "staging", "--", str(stub)]
+    if command == "shell":
+        argv = ["shell", "--profile", "staging"]
+
+    assert main(argv) == 0
+
+    child_env = json.loads(dump.read_text())
+    assert child_env[PULUMI_BACKEND_URL] == USERINFO_BACKEND_URL
+    assert "<redacted>" not in child_env[PULUMI_BACKEND_URL]
 
 
 def test_shell_propagates_a_signal_terminated_child(cli_store, monkeypatch, stub, capfd):
@@ -1334,16 +1708,33 @@ def test_login_scrubs_the_store_password_from_pulumis_environment(
     assert PASSWORD not in child_env.values()
 
 
-def test_login_never_puts_a_userinfo_bearing_url_in_argv_or_stderr(
-    cli_store, monkeypatch, tmp_path, stub, capsys
+def test_login_never_puts_a_userinfo_bearing_url_in_argv_or_output(
+    cli_store, monkeypatch, tmp_path, stub, capfd
 ):
     """A `postgres://user:password@host/db` profile -- a form
     `pulumi login --help` documents -- must never put its password where
-    `ps` or a printed message could show it."""
-    secret_url = "postgres://dbuser:super-secret-password@db.invalid:5432/state"
-    seed_profile(cli_store, "staging", backend_url=secret_url)
+    `ps` or a printed message could show it.
+
+    `capfd`, not `capsys`. This is the one leak test in this file guarding a
+    real secret-bearing URL, and it drives a real child process: `capsys`
+    replaces this interpreter's `sys.stdout`/`sys.stderr` objects and sees
+    nothing the child writes to file descriptors 1 and 2. Against `capsys` a
+    `print(url, file=sys.stderr)` is caught and an `os.write(2, url)` -- or
+    anything the child itself prints -- is not, which is the wrong half to be
+    blind to for a test whose whole subject is a real subprocess. This file's
+    own header states `capfd` as the convention for exactly this reason.
+
+    The environment is dumped as well as argv, for two reasons: it proves the
+    URL was genuinely live in this run rather than the test passing because
+    nothing ever resolved (`assert_no_leak` against a run that never had the
+    secret proves nothing), and it pins the delivery mechanism -- via
+    `PULUMI_BACKEND_URL`, verbatim, never through `argv`.
+    """
+    seed_profile(cli_store, "staging", backend_url=USERINFO_BACKEND_URL)
     argv_dump = tmp_path / "argv.json"
+    env_dump = tmp_path / "env.json"
     monkeypatch.setenv("STUB_DUMP_ARGV_TO", str(argv_dump))
+    monkeypatch.setenv("STUB_DUMP_ENV_TO", str(env_dump))
     fake_pulumi(monkeypatch, stub)
 
     code = main(["login", "--profile", "staging"])
@@ -1351,11 +1742,16 @@ def test_login_never_puts_a_userinfo_bearing_url_in_argv_or_stderr(
     assert code == 0
     argv = json.loads(argv_dump.read_text())
     assert argv == ["login"]
-    for text in argv:
-        assert "super-secret-password" not in text
-    captured = capsys.readouterr()
-    assert "super-secret-password" not in captured.out
-    assert "super-secret-password" not in captured.err
+    assert_no_leak(json.dumps(argv), USERINFO_PASSWORD, what="the backend password")
+
+    # The secret really was in play: it reached the child, verbatim, by the
+    # one route that is not visible in `ps`.
+    child_env = json.loads(env_dump.read_text())
+    assert child_env[PULUMI_BACKEND_URL] == USERINFO_BACKEND_URL
+
+    captured = capfd.readouterr()
+    assert_no_leak(captured.out, USERINFO_PASSWORD, what="the backend password")
+    assert_no_leak(captured.err, USERINFO_PASSWORD, what="the backend password")
 
 
 def test_login_reports_a_missing_pulumi_executable(cli_store, monkeypatch, capsys):

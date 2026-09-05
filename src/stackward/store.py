@@ -3,14 +3,28 @@
 A profile is a Pulumi state backend plus the credentials that unlock it. That
 pairing is split across two files in `${XDG_CONFIG_HOME:-~/.config}/stackward/`:
 
-    config       TOML, mode 0644 — backend identity, and never a credential
+    config       TOML, mode 0600 — backend identity
     credentials  JSON, mode 0600 — one sealed envelope per profile
 
-The split is the point. `config` says *which* bucket, endpoint and region a
-profile names; it is safe to read, diff, paste into a ticket, and back up. Only
-`credentials` holds anything secret, so only it needs the restrictive mode, and
-a user who wants to check what a profile points at never has to open the file
-that would show them a key if they mistyped a command.
+The split is what makes `config` diffable, reviewable and safe to reason about
+without decrypting anything: it says *which* bucket, endpoint and region a
+profile names, and a user checking what a profile points at never has to open
+the file that would show them a key if they mistyped a command.
+
+**`config` is not, however, credential-free, and must not be treated as such.**
+It once carried mode 0644 on the stated grounds that it "holds backend identity
+and never a credential". That claim was wrong, and in the one place it mattered
+most: `pulumi login --help` documents `postgres://user:password@host/db` as a
+supported backend form, `Profile.backend_url` passes a URL through verbatim,
+and `commands.session` exists partly to redact exactly that password wherever
+it prints one. A supported, documented configuration therefore put a live
+credential in a world-readable file. Both files are 0600 now, and `config` is
+covered by the same permissiveness warning `credentials` always was. A
+`backend_url` carrying userinfo is still accepted — refusing it would make a
+Pulumi-supported backend unusable through this tool, and there is nowhere else
+to put it, since `credentials` holds only the sealed name/value envelopes the
+session commands inject — but it is a credential, in a file whose mode and
+error messages now assume so.
 
 **Everything else in this module follows from three refusals.**
 
@@ -69,7 +83,10 @@ CONFIG_FILENAME = "config"
 CREDENTIALS_FILENAME = "credentials"
 
 DIR_MODE = 0o700
-CONFIG_MODE = 0o644
+# 0600, not 0644: a `backend_url` of the documented `postgres://user:password@
+# host/db` form puts a live credential in `config`, so it gets the same
+# owner-only mode `credentials` has. See the module docstring.
+CONFIG_MODE = 0o600
 CREDENTIALS_MODE = 0o600
 
 ENV_PROFILE = "STACKWARD_PROFILE"
@@ -395,6 +412,44 @@ def _build_profile(name: str, raw: Any) -> Profile:
     return profile
 
 
+# The `(at line L, column C)` coordinate `tomllib` appends to every message
+# it raises, and the only part of that message safe to quote back — see
+# `_toml_position`.
+_TOML_POSITION = re.compile(r"\(at (?:line \d+, column \d+|end of document)\)")
+
+
+def _toml_position(exc: tomllib.TOMLDecodeError) -> str:
+    """Just the coordinate out of a `TOMLDecodeError`, as ` (at line L,
+    column C)`, or `""` when the message does not carry one.
+
+    This exists because `config` can hold a credential and the parser's own
+    message can quote the document. Both halves of that were previously
+    believed false, and this call site quoted `exc` in full on the strength
+    of it: "`config` holds backend identity and never a credential, so
+    quoting tomllib's message -- which may include the offending line -- is
+    safe here in a way it would not be for `credentials`."
+
+    Neither half survived checking. A `backend_url` of the documented
+    `postgres://user:password@host/db` form is a credential in `config` (see
+    the module docstring). And `tomllib` does echo document text: most of its
+    messages are a fixed description plus a coordinate, but not all of them
+    -- `tomllib.loads("[a]\\nx=1\\n[a]\\n")` raises `Cannot declare
+    ('a',) twice`, naming the key back. `credentials` is handled by exactly
+    this rule already, one function below, and for exactly this reason; the
+    two files differ in how *likely* a pasted secret is, not in whether the
+    parser can read one back.
+
+    The coordinate is kept because it is what makes the error actionable and
+    it is structural, not quoted text. `TOMLDecodeError` exposes no
+    `lineno`/`colno` before 3.13 and this project supports 3.11, so it is
+    matched out of the message rather than read off the exception; a message
+    shape this does not recognise simply yields no coordinate, which loses
+    diagnostics and never discloses anything.
+    """
+    match = _TOML_POSITION.search(str(exc))
+    return f" {match.group(0)}" if match else ""
+
+
 def load_store_config(directory: Path | None = None) -> StoreConfig:
     """Parse `config`, or return an empty one when the file does not exist.
 
@@ -415,10 +470,8 @@ def load_store_config(directory: Path | None = None) -> StoreConfig:
     except OSError as exc:
         raise StoreError(f"{path}: cannot read: {exc}") from exc
     except tomllib.TOMLDecodeError as exc:
-        # `config` holds backend identity and never a credential, so quoting
-        # tomllib's message — which may include the offending line — is safe
-        # here in a way it would not be for `credentials`.
-        raise StoreError(f"{path}: invalid TOML: {exc}") from exc
+        # Position only, never the parser's message — see `_toml_position`.
+        raise StoreError(f"{path}: invalid TOML{_toml_position(exc)}") from exc
 
     try:
         return _build_store_config(data)

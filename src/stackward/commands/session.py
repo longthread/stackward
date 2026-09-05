@@ -29,9 +29,14 @@ exactly four names onto a *copy* of the caller's own environment
 (`PATH`, `HOME`, `TERM` and everything else the child would otherwise need
 survive untouched); they never construct an environment from the four names
 alone. `tests/test_session.py` asserts this by diffing parent and child
-environments, not by counting keys in the child -- an implementation that
-happened to also inherit the right ambient variables by accident would still
-fail a diff-based test if it dropped or altered anything else.
+environments rather than by counting keys in the child -- and, since the
+diff alone proved less than it appeared to, by seeding all three credential
+names into the *parent* environment with different values, so that each of
+the four is asserted by value and not merely by presence. Without that
+seeding the diff was blind to the substitution that matters most:
+`env.setdefault(name, ...)` in place of `env[name] = ...` passed the entire
+suite, and hands a developer's own exported `AWS_ACCESS_KEY_ID` to a child
+pointed at a different profile's backend.
 
 **The backend guard applies to `exec` and `shell`, never to `login`.**
 `login` is the command that *sets* Pulumi's persisted backend; gating it on

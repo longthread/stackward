@@ -307,18 +307,6 @@ def _load_check_policy() -> CheckConfig:
     return load_config(config_path).check
 
 
-# TODO(final-review): `hooks install` should refuse, or at least warn, when
-# the repository has no `.stackward.toml` — a repo that installs the hook
-# before writing a policy now discovers that at someone's first blocked
-# commit rather than at install time. The change belongs in
-# `commands.install_hooks.cmd_install_hooks` (not owned by this wave): after
-# the hook is written, call `config.find_repo_config()` and, on `None`,
-# print a warning naming the minimal file (`check_config.MINIMAL_POLICY`).
-# A warning rather than a refusal, because installing the hook first and
-# writing the policy second is a legitimate order to do things in, and
-# `install_hooks` exits 1/2 only for reasons that make the *install* wrong.
-
-
 @fail_closed
 def cmd_check_config(args: argparse.Namespace) -> int:
     """Entry point for `stackward check-config FILE...`.

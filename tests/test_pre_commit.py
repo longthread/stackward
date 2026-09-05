@@ -11,6 +11,7 @@ git would hide exactly the bugs this suite exists to catch.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from pathlib import Path
 
@@ -37,7 +38,42 @@ MINIMAL_POLICY = '[check]\nmodel_net = "none"\n'
 
 
 @pytest.fixture
-def bare_repo(tmp_path: Path) -> Path:
+def isolated_git(tmp_path: Path, monkeypatch) -> Path:
+    """Cut every `git` these tests run off from the machine's own git config.
+
+    Without this, a developer (or a CI image) with a *global*
+    `core.hooksPath` -- what husky, lefthook and the `pre-commit` framework
+    all set, and precisely the configuration `hooks install` exists to
+    handle -- makes `git init`/`git commit` here inherit that hook, and
+    sixty-odd tests across this file and `test_install_hooks.py` error out
+    for a reason that has nothing to do with the code under test. A suite
+    whose result depends on the developer's `~/.gitconfig` is not testing
+    what it claims to.
+
+    All four sources git consults are redirected, not only the global one:
+    `GIT_CONFIG_SYSTEM` covers `/etc/gitconfig`, which is exactly where an
+    org-wide `hooksPath` lives; `HOME` and `XDG_CONFIG_HOME` cover
+    `~/.gitconfig` and `$XDG_CONFIG_HOME/git/config`, which git still reads
+    on a path that leaves `GIT_CONFIG_GLOBAL` unset. `/dev/null` is git's
+    own documented spelling of "this configuration file does not exist" for
+    the two `GIT_CONFIG_*` variables.
+
+    The redirect is set with `monkeypatch`, so it is still in place while
+    the *test body* runs `git commit` -- not only while the fixture built
+    the repository. `test_install_hooks.py` has its own copy for the same
+    reason, rather than importing this one across test modules.
+    """
+    home = tmp_path / "git-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "config"))
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
+    return home
+
+
+@pytest.fixture
+def bare_repo(tmp_path: Path, isolated_git: Path) -> Path:
     """A real git repository with one empty commit and **no** policy file.
 
     What every repository looked like before `.stackward.toml` was a
