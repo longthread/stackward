@@ -806,6 +806,85 @@ def test_a_graph_the_matcher_could_not_read_is_refused_before_it_is_written(
     assert "undefined model" in str(excinfo.value)
 
 
+def external_result(repo: Path) -> dict:
+    """A generator result whose marks came partly from outside the repository
+    — a base model or a marking alias imported from a dependency."""
+    return {
+        "roots": {},
+        "models": {},
+        "files": [str(repo / "declared.py")],
+        "external": ["outside.package.conventions"],
+    }
+
+
+def test_an_out_of_repo_contributor_is_pinned_by_the_dependency_lockfile(repo):
+    """`git show` cannot reach site-packages, so the lockfile that decides
+    which version is installed is the closest thing to that module's identity
+    the index holds."""
+    write(repo, "declared.py", RECURSIVE_MODEL)
+    write(repo, "uv.lock", "# a lockfile\n")
+    git(repo, "add", "-A")
+
+    sources = build_artifact(repo, external_result(repo))["sources"]
+    assert "uv.lock" in sources
+    # Recorded by blob id, exactly like every other source.
+    expected = git(repo, "rev-parse", ":uv.lock").stdout.strip()
+    assert sources["uv.lock"] == expected
+
+
+def test_every_tracked_lockfile_is_recorded_not_only_the_first(repo):
+    """A repository can carry two. Pinning one while ignoring the other would
+    leave a real dependency change invisible."""
+    write(repo, "declared.py", RECURSIVE_MODEL)
+    write(repo, "uv.lock", "# a lockfile\n")
+    write(repo, "requirements.txt", "somepackage==1.0\n")
+    git(repo, "add", "-A")
+
+    sources = build_artifact(repo, external_result(repo))["sources"]
+    assert "uv.lock" in sources
+    assert "requirements.txt" in sources
+
+
+def test_an_untracked_lockfile_does_not_pin_an_out_of_repo_contributor(repo):
+    """A lockfile on disk but not in the index has no blob id to compare
+    against later, so it pins nothing and must not be treated as though it
+    did."""
+    write(repo, "declared.py", RECURSIVE_MODEL)
+    write(repo, "uv.lock", "# a lockfile\n")
+    git(repo, "add", "declared.py")  # the lockfile is deliberately left out
+
+    with pytest.raises(SyncError) as excinfo:
+        build_artifact(repo, external_result(repo))
+    assert "outside.package.conventions" in str(excinfo.value)
+
+
+def test_an_out_of_repo_contributor_with_no_lockfile_is_refused(repo):
+    """There would be nothing at all pinning that module's identity, so the
+    artifact could never be found stale on account of it."""
+    write(repo, "declared.py", RECURSIVE_MODEL)
+    git(repo, "add", "-A")
+
+    with pytest.raises(SyncError) as excinfo:
+        build_artifact(repo, external_result(repo))
+    message = str(excinfo.value)
+    assert "outside.package.conventions" in message
+    assert "uv.lock" in message  # the message names what it looked for
+
+
+def test_no_lockfile_is_recorded_when_nothing_came_from_outside_the_repo(repo):
+    """The lockfile is evidence about a dependency, and a repository whose
+    marks are all its own has no dependency to pin."""
+    write(repo, "declared.py", RECURSIVE_MODEL)
+    write(repo, "uv.lock", "# a lockfile\n")
+    git(repo, "add", "-A")
+
+    sources = build_artifact(
+        repo,
+        {"roots": {}, "models": {}, "files": [str(repo / "declared.py")], "external": []},
+    )["sources"]
+    assert sources == {"declared.py": sources["declared.py"]}
+
+
 def test_an_untracked_contributing_file_is_refused(repo, monkeypatch, capsys):
     """A file git does not track has no blob id, so its marks could change
     forever without the freshness check seeing anything."""
