@@ -64,8 +64,13 @@ instance.
 Pin the version in CI; a build should not move underneath you:
 
 ```sh
-STACKWARD_VERSION=v0.1.0 sh install.sh
+STACKWARD_VERSION=v0.1.1 sh install.sh
 ```
+
+`releases/latest/download/` is also served through a cache that can lag a
+release by around a minute, so immediately after publishing it may still hand
+back the previous version. Another reason a pipeline should name the version it
+wants rather than asking for whatever is newest.
 
 | Platform | Requirement |
 |---|---|
