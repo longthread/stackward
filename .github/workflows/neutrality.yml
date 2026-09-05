@@ -49,7 +49,13 @@ jobs:
           # later step, and removed on exit either way.
           LIST="$(mktemp)"
           trap 'rm -f "$LIST"' EXIT
-          printf '%s\n' "${DENYLIST}" | grep -v '^[[:space:]]*$' > "$LIST"
+          # Strip blank lines and # comments. Without this a comment line would
+          # be searched for literally — and "#" matches nearly every file, so
+          # the gate would fail on everything. Comments matter here: the list
+          # has to be reviewable by someone who did not write it.
+          printf '%s\n' "${DENYLIST}" \
+            | sed 's/[[:space:]]*#.*$//' \
+            | grep -v '^[[:space:]]*$' > "$LIST"
           echo "Checking against $(wc -l < "$LIST") denied terms."
 
           # Report locations only, never the matching text: printing the match
