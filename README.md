@@ -95,6 +95,33 @@ uv run pytest
 uv run stackward doctor
 ```
 
+### Install this repository's own hooks
+
+Run once per clone — git does not version hooks:
+
+```sh
+./scripts/install-hooks.sh /path/to/denylist.txt
+```
+
+This repository is public and was extracted from a private environment, so it
+must not name anything belonging to it. Two layers enforce that, and they are
+not interchangeable:
+
+- **`scripts/pre-push`** refuses to push a commit containing a denied term.
+  This is the layer that *prevents* a leak, because it runs before anything
+  leaves the machine.
+- **The `neutrality` CI job** checks the same thing on pull requests, as a
+  backstop for a clone that never installed the hook.
+
+CI alone would not be enough. It runs after a commit exists, so on a direct
+push it can only report a leak that is already published — and a later commit
+does not unpublish it. `main` therefore requires a pull request with that check
+green, enforced for administrators too.
+
+The denied terms are not stored here; the list would name everything it blocks.
+Keep it somewhere private and point `STACKWARD_DENYLIST` at it. Both the hook
+and the CI job refuse to run without one rather than passing by default.
+
 ## Licence
 
 Apache-2.0. See [LICENSE](LICENSE).
