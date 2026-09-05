@@ -11,6 +11,16 @@ passphrase has had the search space cut by orders of magnitude.
 So the check is: the value, any run of it long enough to be identifying,
 and the encodings it plausibly passes through on its way to an output
 stream.
+
+**Choose opaque markers.** The partial-run check compares against the text
+a command legitimately prints, and a marker built out of real words will
+collide with it. `marker-db-password-1a2b3c4d` shares the run "password"
+with the config path `db.password` that the same test asserts is reported,
+so the helper fires on output that discloses nothing. That is the helper
+working, not a bug in it -- a credential really can be recovered a run at a
+time, and the checker cannot know which run was a coincidence. Give the
+marker no substring in common with any path, flag or message under test,
+and put the reason in the variable name rather than in the value.
 """
 
 from __future__ import annotations
@@ -23,6 +33,24 @@ import urllib.parse
 # hex-ish credential appears in unrelated text often enough to make the
 # assertion flaky, which is how a leak check gets deleted.
 MIN_IDENTIFYING_RUN = 8
+
+# A *truncated* encoding is still a disclosure, and the whole-string check
+# above cannot see one: `value.encode("utf-8").hex()[:16]` contains neither
+# the raw value nor the complete hex encoding, yet `bytes.fromhex` turns it
+# straight back into the first eight characters of the credential. That is
+# not hypothetical -- it is the exact shape of the passphrase-fingerprint
+# defect this branch shipped and the tautological test that hid it.
+#
+# So the run check applies to the byte-aligned encodings too, at run
+# lengths that each recover about the same amount of plaintext as
+# MIN_IDENTIFYING_RUN does. Runs are NOT checked for the URL-quoted forms:
+# percent-encoding is variable-width, so a run boundary can land mid-escape
+# and the recovered text is not what the run implies.
+RUN_LENGTHS = {
+    "raw": MIN_IDENTIFYING_RUN,
+    "hex": MIN_IDENTIFYING_RUN * 2,          # 2 hex characters per byte
+    "base64": ((MIN_IDENTIFYING_RUN + 2) // 3) * 4,   # 4 characters per 3 bytes
+}
 
 
 def _encodings(value: str) -> dict[str, str]:
@@ -64,16 +92,18 @@ def assert_no_leak(text: str, value: str, *, what: str = "value") -> None:
                 f"(at offset {text.index(encoded)})"
             )
 
-    # Partial disclosure: any identifying-length run of the raw value.
-    # Only the raw form -- a run of a base64 encoding is not recoverable
-    # without its alignment, and checking it produces false positives.
-    for start in range(0, max(1, len(value) - MIN_IDENTIFYING_RUN + 1)):
-        run = value[start : start + MIN_IDENTIFYING_RUN]
-        if len(run) < MIN_IDENTIFYING_RUN:
-            break
-        if run in text:
-            raise AssertionError(
-                f"{what} partially leaked into output: a "
-                f"{MIN_IDENTIFYING_RUN}-character run starting at index "
-                f"{start} of the value appears at offset {text.index(run)}"
-            )
+    # Partial disclosure: an identifying-length run of the value, or of an
+    # encoding a reader can decode a fragment of.
+    encodings = _encodings(value)
+    for name, run_length in RUN_LENGTHS.items():
+        candidate = encodings[name]
+        for start in range(0, max(1, len(candidate) - run_length + 1)):
+            run = candidate[start : start + run_length]
+            if len(run) < run_length:
+                break
+            if run in text:
+                raise AssertionError(
+                    f"{what} partially leaked into output: a {run_length}-"
+                    f"character run of its {name} form, starting at index "
+                    f"{start}, appears at offset {text.index(run)}"
+                )
