@@ -132,14 +132,41 @@ def _is_tracked(path: Path) -> bool:
     working directory happens to be. Git's own `.git/hooks`, unredirected,
     never matches: paths under `.git/` are not part of the tracked
     namespace at all, so this reliably distinguishes that default location
-    from a `core.hooksPath` deliberately pointed at a tracked directory."""
+    from a `core.hooksPath` deliberately pointed at a tracked directory.
+
+    A non-zero exit is deliberately *not* read as "not tracked" on its
+    own -- only two specific, recognised git failures are: the ordinary
+    in-repository case (`error: pathspec '...' did not match any
+    file(s) known to git`, exit 1) and a `core.hooksPath` that resolves
+    outside the repository entirely (`fatal: '...' is outside repository
+    at '...'`, exit 128 -- reachable because `_hooks_dir` resolves
+    symlinks, which can make the resolved path diverge from git's own
+    notion of the repository root). Both are matched on git's own
+    reported text, not the exit code alone, because exit 128 in
+    particular is shared with a broad class of unrelated fatal errors
+    (a corrupt index, a permissions problem) where whether the directory
+    is tracked is genuinely unanswered. Treating *any* of those as "safe
+    to write here" would be exactly the silent bypass of a mandated
+    refusal this function exists to prevent, and would make this the one
+    place in the module that inverts `_run_git`'s own rule of raising on
+    any non-zero exit rather than guessing -- so an unrecognised failure
+    raises `InstallError` here too, mapped by the caller to the same
+    could-not-determine exit code as every other git failure in this
+    command."""
     proc = subprocess.run(
         ["git", "ls-files", "--error-unmatch", str(path)],
         capture_output=True,
         text=True,
         check=False,
     )
-    return proc.returncode == 0
+    if proc.returncode == 0:
+        return True
+    stderr = proc.stderr
+    if "did not match any file" in stderr or "is outside repository" in stderr:
+        return False
+    raise InstallError(
+        f"could not determine whether {path} is tracked by git: {stderr.strip()}"
+    )
 
 
 def _running_executable() -> str:
@@ -269,8 +296,10 @@ def cmd_install_hooks(_args: argparse.Namespace) -> int:
     Exit codes: **0** installed (fresh, updated in place, or an existing
     foreign hook backed up first); **1** refused because the resolved hooks
     directory is tracked by git (see the module docstring for why writing
-    there is unsafe); **2** could not even determine where to install --
-    `git` missing, or the current directory not inside a git working tree.
+    there is unsafe); **2** could not even determine where to install, or
+    whether the resolved hooks directory is tracked -- `git` missing, the
+    current directory not inside a git working tree, or an unrecognised
+    `git ls-files` failure (see `_is_tracked`).
     Reusing `check_config.fail_closed` here for the same reason it wraps
     `cmd_check_config` and `cmd_pre_commit`: an unanticipated exception
     must not fall through to Python's own default exit code of 1, which
@@ -283,7 +312,13 @@ def cmd_install_hooks(_args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
-    if _is_tracked(hooks_dir):
+    try:
+        tracked = _is_tracked(hooks_dir)
+    except InstallError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    if tracked:
         print(f"error: hooks directory is tracked by git: {hooks_dir}", file=sys.stderr)
         print(
             "Installing here would commit a hook that execs a stackward binary "

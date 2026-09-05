@@ -62,14 +62,27 @@ def _real_stackward_executable() -> str:
     file at the right path that git never actually runs is precisely the
     "silent no-op" this command's own hooks-directory resolution exists to
     prevent, and asserting on the file alone cannot catch that failure
-    mode."""
+    mode.
+
+    Skipping when nothing is found keeps a local run convenient (an
+    interpreter not launched through this project's own `uv`-managed venv
+    genuinely may not have one), but `uv sync` always produces
+    `.venv/bin/stackward`, so CI must never quietly go green having lost
+    exactly the coverage the rest of this test file's real-git-repository
+    approach leans on hardest. Skip locally; fail loudly under `CI`.
+    """
     candidate = Path(sys.executable).parent / "stackward"
     if candidate.is_file() and os.access(candidate, os.X_OK):
         return str(candidate)
     found = shutil.which("stackward")
     if found:
         return found
-    pytest.skip("no installed `stackward` console script found for an end-to-end test")
+    message = (
+        "no installed `stackward` console script found for an end-to-end test"
+    )
+    if os.environ.get("CI"):
+        pytest.fail(f"{message} -- `uv sync` should have installed one")
+    pytest.skip(message)
 
 
 @pytest.fixture
@@ -163,8 +176,8 @@ def test_hooks_path_absolute_and_outside_the_worktree_is_treated_as_untracked(
     """`git ls-files --error-unmatch` on a path outside the repository
     fails with "is outside repository", a different git error than the
     in-repo untracked case (`did not match any file(s)`) exercised
-    elsewhere in this file. `_is_tracked` treats any non-zero exit as "not
-    tracked" -- this proves that answer is still correct for this
+    elsewhere in this file. `_is_tracked` recognises both messages as
+    "not tracked" -- this proves that answer is still correct for this
     differently-shaped git failure, not merely right by accident of a
     single error message this suite happens to have checked."""
     external = tmp_path / "external-hooks"
@@ -173,6 +186,58 @@ def test_hooks_path_absolute_and_outside_the_worktree_is_treated_as_untracked(
 
     assert install(repo, monkeypatch) == 0
     assert (external / "pre-commit").is_file()
+
+
+def test_unrecognised_ls_files_failure_exits_2_rather_than_installing(
+    repo, monkeypatch, capsys
+):
+    """`_is_tracked` must not treat *every* non-zero `git ls-files` exit
+    as "not tracked" -- only the two recognised, specifically-worded
+    failures. A `git ls-files` failure for an unrelated reason (a corrupt
+    index, a permissions problem -- simulated here) leaves the question
+    genuinely unanswered, and installing anyway would be exactly the
+    silent bypass of a mandated refusal `_is_tracked` exists to prevent.
+    This must exit 2 (could not determine), never 0 (installed) or 1
+    (the different, definitive "is tracked" refusal)."""
+    real_run = subprocess.run
+
+    def failing_run(args, **kwargs):
+        if args[:2] == ["git", "ls-files"]:
+            return subprocess.CompletedProcess(
+                args,
+                returncode=128,
+                stdout="",
+                stderr="fatal: index file corrupt (simulated)\n",
+            )
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", failing_run)
+    assert install(repo, monkeypatch) == 2
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "index file corrupt" in captured.err
+    # Refused to guess either way: no hook was written.
+    assert not (repo / ".git" / "hooks" / "pre-commit").exists()
+
+
+def test_is_tracked_raises_install_error_for_an_unrecognised_failure(
+    tmp_path, monkeypatch
+):
+    """Direct unit test of the boundary `_is_tracked` itself draws,
+    independent of the command-level wiring covered above."""
+    real_run = subprocess.run
+
+    def failing_run(args, **kwargs):
+        if args[:2] == ["git", "ls-files"]:
+            return subprocess.CompletedProcess(
+                args, returncode=128, stdout="", stderr="fatal: something else\n"
+            )
+        return real_run(args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", failing_run)
+    with pytest.raises(install_hooks_module.InstallError, match="something else"):
+        install_hooks_module._is_tracked(tmp_path)
 
 
 def test_redirected_hooks_path_hook_actually_runs_on_a_real_commit(
