@@ -10,22 +10,31 @@ at the top of the file is what makes it safe. What makes it *un*safe is a value
 hand-edited in as plaintext, which looks exactly like every other line in the
 diff. `stackward` exists to make that mistake hard.
 
-> **Status: early.** `v0.1.0` ships `--version` and `doctor` only. It exists to
-> prove the release and install path before features are built on top of it.
+> **Status: early.** `v0.1.0` shipped `--version` and `doctor` alone, to prove
+> the release and install path before anything was built on top of it. That
+> path held, and every command in the table below is now implemented. One gap
+> remains, noted under it: there is still no command for *writing* to the
+> credential store. Interfaces may change.
 
-## What it will do
+## What it does
 
 | Command | Purpose |
 |---|---|
 | `check-config` | Refuse plaintext credentials in a stack config file |
 | `pre-commit` | The above, over staged content, as a git hook |
 | `hooks install` | Install that hook, honouring `core.hooksPath` |
-| `credentials` | Keep backend credentials in one encrypted, profile-scoped store |
-| `exec` / `shell` | Run `pulumi` with those credentials injected into the child process |
 | `login` | Point Pulumi at a profile's backend |
+| `exec` / `shell` | Run `pulumi` with a profile's credentials injected into the child process |
 | `set-secrets` | Publish stack secrets from a declared manifest, values on stdin |
 | `check-passphrase` | Verify a passphrase actually decrypts a stack, rather than merely exiting 0 |
 | `sync-declared-secrets` | Regenerate the committed graph of secrets a repo's own models declare |
+| `doctor` | Report the resolved configuration and environment |
+
+The encrypted, profile-scoped credential store those three session commands
+read from is implemented, but **nothing on the command line writes to it
+yet** — there is no `credentials` subcommand. Until there is, a profile's
+secrets have to be sealed by another route, or supplied through the `env`
+provider, which reads them straight from the process environment.
 
 ## Design commitments
 
@@ -39,9 +48,21 @@ These are constraints, not aspirations — each has a test.
   mechanism; which keys are sensitive, which paths are managed and which model
   declares them are all read from the repo's `.stackward.toml`. The tool ships
   no defaults about anyone's infrastructure.
-- **No backend assumptions.** A profile carries a Pulumi backend URL and it is
-  passed through, so `s3://`, `gs://`, `azblob://` and `file://` all work. No
-  storage vendor is named anywhere in this codebase.
+- **A backend URL is passed through, not interpreted.** A profile carrying
+  `backend_url` gets exactly that string handed to Pulumi, so `s3://`, `gs://`,
+  `azblob://` and `file://` all work without this tool knowing which is which.
+  The exception is the optional *component* form (`bucket`, `prefix`,
+  `endpoint`, `region`), which is a convenience for S3-compatible storage and
+  can only ever compose an `s3://` URL — use `backend_url` for anything else.
+- **Nobody's own infrastructure is named here.** No bucket, region, endpoint,
+  account, domain, namespace or model class appears anywhere in this
+  repository, and the hook and CI job described under *Development* below are
+  what enforce that. Two de-facto-standard names do appear, and are not
+  choices this tool makes: `exec` and `shell` inject `AWS_ACCESS_KEY_ID` and
+  `AWS_SECRET_ACCESS_KEY`, because that is the vocabulary Pulumi's own DIY
+  backend reads out of a child process's environment; and the component form
+  above composes an `s3://` URL, because that is the scheme Pulumi uses for
+  every S3-compatible store.
 - **Values reach the Pulumi CLI on stdin**, never in a command line, so they do
   not appear in `ps` or in shell history.
 - **Failures are closed.** If the tool cannot determine whether a file is safe,
