@@ -20,6 +20,7 @@ from . import __version__
 from .commands.check_config import cmd_check_config
 from .commands.install_hooks import cmd_install_hooks
 from .commands.pre_commit import cmd_pre_commit
+from .commands.session import cmd_exec, cmd_login, cmd_shell
 from .config import find_repo_config
 
 # Commands that must keep working even when a repo demands a newer stackward
@@ -133,6 +134,25 @@ def build_parser() -> argparse.ArgumentParser:
         "install", help="install the pre-commit gate into this repository's hooks"
     )
     hooks_install.set_defaults(func=cmd_install_hooks)
+
+    login = sub.add_parser("login", help="point pulumi at a profile's backend")
+    login.add_argument("--profile", help="profile to use (overrides selection precedence)")
+    login.set_defaults(func=cmd_login)
+
+    exec_ = sub.add_parser(
+        "exec", help="run a command with a profile's credentials injected"
+    )
+    exec_.add_argument("--profile", help="profile to use (overrides selection precedence)")
+    exec_.add_argument(
+        "argv", nargs="*", metavar="COMMAND", help="command to run, after --"
+    )
+    exec_.set_defaults(func=cmd_exec)
+
+    shell = sub.add_parser(
+        "shell", help="open $SHELL with a profile's credentials injected"
+    )
+    shell.add_argument("--profile", help="profile to use (overrides selection precedence)")
+    shell.set_defaults(func=cmd_shell)
 
     return parser
 
