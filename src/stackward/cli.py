@@ -64,6 +64,37 @@ def _tool_version(name: str) -> str:
     return f"{first[0] if first else '?'}  [{path}]"
 
 
+def crypto_selftest() -> str:
+    """Prove the cryptography backend works, rather than merely importing.
+
+    Every credential feature depends on this, and the characteristic PyInstaller
+    failure is a bundle that builds cleanly and then cannot load a native
+    extension on a machine that is not the build machine. An import check would
+    miss a broken backend; a real round-trip does not. `doctor` is therefore the
+    smoke test a release runs in a clean container.
+    """
+    try:
+        import cryptography
+        from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+        from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
+
+        key = Argon2id(
+            salt=b"stackward-selftest",
+            length=32,
+            iterations=1,
+            lanes=1,
+            memory_cost=8,
+        ).derive(b"selftest")
+
+        nonce, plaintext = b"\0" * 12, b"ok"
+        sealed = AESGCM(key).encrypt(nonce, plaintext, b"selftest")
+        if AESGCM(key).decrypt(nonce, sealed, b"selftest") != plaintext:
+            return "FAILED: AES-GCM round trip did not reproduce the plaintext"
+        return f"cryptography {cryptography.__version__}  (Argon2id + AES-256-GCM ok)"
+    except Exception as exc:  # noqa: BLE001 - report any failure, never crash doctor
+        return f"UNAVAILABLE: {type(exc).__name__}: {exc}"
+
+
 def cmd_doctor(_args: argparse.Namespace) -> int:
     """Report what stackward can see. Never prints a credential value."""
     config = find_repo_config()
@@ -79,7 +110,12 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
     print()
     print(f"pulumi          {_tool_version('pulumi')}")
     print(f"git             {_tool_version('git')}")
-    return 0
+    print()
+    crypto = crypto_selftest()
+    print(f"crypto          {crypto}")
+    # Exit non-zero when the credential layer could not work here. doctor is
+    # what a release smoke test runs, so it has to fail rather than narrate.
+    return 1 if crypto.startswith(("UNAVAILABLE", "FAILED")) else 0
 
 
 def build_parser() -> argparse.ArgumentParser:

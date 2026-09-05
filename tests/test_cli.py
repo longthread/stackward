@@ -8,6 +8,7 @@ from stackward import __version__
 from stackward.cli import (
     VERSION_CHECK_EXEMPT,
     config_home,
+    crypto_selftest,
     find_repo_config,
     main,
 )
@@ -42,6 +43,28 @@ def test_upgrade_instruction_is_not_self_blocking():
     instruction it had just made impossible to follow.
     """
     assert {"doctor", "self-update"} <= VERSION_CHECK_EXEMPT
+
+
+def test_crypto_selftest_exercises_the_backend():
+    """A real round-trip, not an import check.
+
+    The characteristic PyInstaller failure is a bundle that builds cleanly and
+    then cannot load a native extension on a machine that is not the build
+    machine — which an import check can still pass.
+    """
+    result = crypto_selftest()
+    assert result.startswith("cryptography ")
+    assert "Argon2id" in result and "AES-256-GCM" in result
+
+
+def test_doctor_fails_when_crypto_is_unavailable(monkeypatch, capsys):
+    """doctor is what a release smoke test runs, so a broken credential layer
+    must make it exit non-zero rather than print a line and return success."""
+    monkeypatch.setattr(
+        "stackward.cli.crypto_selftest", lambda: "UNAVAILABLE: ImportError: boom"
+    )
+    assert main(["doctor"]) == 1
+    assert "UNAVAILABLE" in capsys.readouterr().out
 
 
 def test_config_home_follows_xdg(monkeypatch, tmp_path):
