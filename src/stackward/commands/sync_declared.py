@@ -231,7 +231,20 @@ def build_artifact(
 
     The artifact never records **itself**: its own blob id changes on every
     regeneration, so a self-reference would make every artifact stale the
-    moment it was written.
+    moment it was written. (A recorded hash of everything *except* the
+    `sources` entry would be self-consistent, but it would be a second
+    integrity scheme to specify, generate and verify, and a wrong one would
+    fail closed on correct artifacts — the exclusion is the cheaper trade.)
+
+    That exclusion has a price, and it is paid in `nets.model.parse_net`: the
+    committed JSON's own bytes are checked by nothing else, so a hand edit or
+    a bad three-way merge in it meets no freshness check at all. Every
+    parse-time guard on the reading side is therefore load-bearing rather
+    than defensive, and must stay exhaustive — a shape the parser accepts is
+    a shape an edit can introduce and no other check will ever question. The
+    call to `parse_net` below is the same idea applied to the writing side:
+    the artifact this command produces is read back through the reader's own
+    parser before it is written.
     """
     files = _relative_sources(
         root,

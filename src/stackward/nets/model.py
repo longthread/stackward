@@ -239,6 +239,19 @@ def parse_net(payload: Any) -> tuple[ModelNet, dict[str, str]]:
     unrecognised version, a missing or misshapen section, a root or a child
     naming a model the artifact does not define, or an empty `sources` map
     (which would leave freshness unverifiable, and so unverified).
+
+    **These guards are the artifact's only integrity check, not a second
+    one.** `sync_declared.build_artifact` deliberately removes the artifact
+    from its own `sources` map (a self-reference would make every artifact
+    stale the moment it was written), so the committed file's own bytes are
+    compared against nothing: `verify_sources` checks the files that
+    *contributed* to it, and every one of them can be untouched while the
+    artifact itself has been hand-edited or badly merged. Everything this
+    function accepts is therefore something an edit can introduce and nothing
+    downstream will question — which is why a shape that merely *reads*
+    wrong, such as `"secret": 0` for `false` or a null container interior, is
+    refused here rather than tolerated. Both of those quietly shrink the net;
+    neither is anything the generator can emit.
     """
     document = _require_mapping(payload, "top level")
 
@@ -668,14 +681,32 @@ def _verify_roots(net: ModelNet, check: CheckConfig) -> None:
     """The artifact must start from exactly the namespaces the policy declares.
 
     A second, independent guard on the same drift the recorded blob id of
-    `.stackward.toml` catches — and it needs no blob id at all, so it still
-    holds if that file is somehow not among the sources. A namespace declared
-    in `check.stack_models` with no root in the artifact is not a smaller
-    answer; it is *no* answer for that namespace, silently.
+    `.stackward.toml` catches. A namespace declared in `check.stack_models`
+    with no root in the artifact is not a smaller answer; it is *no* answer
+    for that namespace, silently.
 
-    **Key sets only.** A model id is `module:QualName` while the config names
-    `module:Class`, and those diverge for a nested class — comparing values
-    would refuse a correct artifact.
+    **When it is the only guard left.** `build_artifact` records
+    `.stackward.toml` as a source, so for any artifact this tool generated,
+    `verify_sources` runs first and catches a changed policy before this
+    function is reached. What it does not cover is the artifact's own bytes,
+    which it deliberately does not record (see `parse_net`): an edit that
+    removes `.stackward.toml` from `sources` *and* a namespace from `roots`
+    leaves every remaining recorded source matching the index exactly. This
+    comparison is what still refuses that file.
+
+    **Key sets only.** A root's model id is `module:QualName` — what the
+    class says about itself — while `check.stack_models` names whatever
+    attribute the operator imported it as. A module-level alias, or a class
+    re-exported from a package `__init__`, makes the two diverge for a
+    completely correct artifact, and comparing pairs would refuse it while
+    calling it staleness. Regenerating would then produce the identical file
+    and the refusal would repeat forever.
+
+    (This previously justified the same choice by nested classes. That case
+    cannot arise: `bootstrap.regen._import_object` resolves a target with a
+    flat `getattr`, so `declared:Outer.Inner` is refused at sync time and
+    never reaches an artifact. The alias form is the one that does occur, and
+    `tests/test_model_net.py` exercises it end to end.)
     """
     declared = set(check.stack_models)
     present = set(net.roots)

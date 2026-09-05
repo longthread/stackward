@@ -394,6 +394,55 @@ def test_an_artifact_with_an_unknown_child_kind_is_refused():
     )
 
 
+def test_a_non_boolean_secret_mark_is_refused_rather_than_silently_unmarking():
+    """`"secret": 0` where `false` belongs -- and, just as importantly, where
+    `true` belonged.
+
+    The artifact records no blob id for **itself** (see
+    `sync_declared.build_artifact`: a self-reference would make every artifact
+    stale the moment it was written), so a hand edit or a bad three-way merge
+    in the committed JSON is checked by nothing except this parser. That makes
+    every guard here load-bearing rather than defensive.
+
+    This one in particular: `0` is falsy, so an accepted `"secret": 0` leaves
+    the field unmarked and every credential at or beneath it unreported --
+    while reading, in a diff, as a one-character change to a line that still
+    says `secret`.
+    """
+    message = parse_should_fail(
+        {
+            "version": ARTIFACT_VERSION,
+            "models": {"declared:Root": {"token": {"secret": 0}}},
+            "roots": {"app:app": "declared:Root"},
+            "sources": {"declared.py": "0" * 40},
+        }
+    )
+    assert "must be a boolean" in message
+    assert "token" in message
+
+
+def test_a_null_container_interior_is_refused_rather_than_dropping_the_subtree():
+    """`{"kind": "list", "item": null}`.
+
+    The generator never writes this: a container that cannot hold a model is
+    written as an ordinary scalar field, so a null interior can only come from
+    an edit. Accepted, it produces `ListOf(None)` and the walk has nowhere to
+    go -- every model below that field disappears from the net, silently, and
+    the same document that used to be refused now reports clean.
+    """
+    message = parse_should_fail(
+        {
+            "version": ARTIFACT_VERSION,
+            "models": {
+                "declared:Root": {"peers": {"child": {"kind": "list", "item": None}}}
+            },
+            "roots": {},
+            "sources": {"declared.py": "0" * 40},
+        }
+    )
+    assert "must not be null" in message
+
+
 def test_an_artifact_with_no_sources_is_refused():
     """An artifact recording no sources can never be found stale, so it would
     be trusted forever."""
@@ -1718,6 +1767,165 @@ def test_a_malformed_artifact_in_the_index_exits_2(repo, monkeypatch, capsys):
 
     assert check(repo, monkeypatch) == 2
     assert "invalid JSON" in capsys.readouterr().err
+
+
+def test_a_recorded_source_removed_from_the_index_is_refused_and_named(
+    repo, monkeypatch, capsys
+):
+    """The sibling of "blob changed": a recorded source that is not in the
+    index at all.
+
+    Both branches of `verify_sources` end in exit 2 naming the regeneration
+    command, so an exit-code assertion cannot tell them apart -- and with the
+    `None` branch removed the comparison below it fires instead, reporting a
+    file as *changed* when it has actually been deleted or unstaged. So the
+    wording is what this test asserts: the reader is told which of the two
+    things happened, because the fix differs.
+    """
+    write(repo, "declared.py", RECURSIVE_MODEL)
+    declare(repo)
+    git(repo, "add", "-A")
+    sync_and_commit(repo, monkeypatch, capsys)
+
+    write(repo, "Pulumi.dev.yaml", "name: myproject\n")
+    git(repo, "add", "Pulumi.dev.yaml")
+    git(repo, "rm", "-q", "--cached", "declared.py")
+
+    assert check(repo, monkeypatch) == 2
+    captured = capsys.readouterr()
+    assert "declared.py" in captured.err
+    assert "no longer in the index" in captured.err
+    assert "sync-declared-secrets" in captured.err
+    assert captured.out == ""
+
+
+def test_an_empty_stack_models_is_refused_rather_than_covering_nothing(
+    repo, monkeypatch, capsys
+):
+    """`model_net = "artifact"` with nothing declared to walk.
+
+    Without this refusal the whole chain reads as success: `sync` writes an
+    artifact whose `roots` is `{}`, `_verify_roots` compares `set() == set()`
+    and passes, and `check-config` exits 0 having scanned with a net that
+    covers nothing -- a silent fallback to no model net at all, in a
+    repository that explicitly asked for one. That is the single outcome this
+    tool's fail-closed rule exists to forbid, and it is invisible.
+
+    The artifact's *absence*, not the exit code, is what proves the refusal
+    happened before anything was written: a run that generated an empty net
+    and then failed for some other reason would exit 2 as well.
+    """
+    write(repo, "declared.py", HEURISTIC_BLIND_MODEL)
+    write(
+        repo,
+        ".stackward.toml",
+        f"""
+        python = "{sys.executable}"
+
+        [check]
+        model_net = "artifact"
+        stack_models = {{}}
+        """,
+    )
+    git(repo, "add", "-A")
+
+    assert sync(repo, monkeypatch) == 2
+    assert not (repo / ARTIFACT_PATH).exists()
+    error = capsys.readouterr().err
+    assert "stack_models is empty" in error
+    assert 'model_net = "none"' in error
+
+    # And the consequence, end to end, on a credential only the model net
+    # could ever name: with no artifact there is nothing to scan with, and
+    # `check-config` says so instead of reporting clean.
+    write(repo, "Pulumi.dev.yaml", BLIND_DOCUMENT)
+    git(repo, "add", "-A")
+    assert check(repo, monkeypatch) == 2
+    captured = capsys.readouterr()
+    assert ARTIFACT_PATH in captured.err
+    assert captured.out == ""
+
+
+def test_a_hand_edited_artifact_that_drops_a_root_is_refused_by_the_roots_check(
+    repo, monkeypatch, capsys
+):
+    """The scenario `_verify_roots` is the only remaining defence for.
+
+    Ordinarily it is unreachable: `build_artifact` records `.stackward.toml`
+    as a source, so any change to `check.stack_models` trips the blob-id check
+    in `verify_sources` first -- which is exactly why `return` as this guard's
+    first statement costs nothing but its own unit test.
+
+    The artifact records no blob id for itself, though, so a hand edit or a
+    bad merge in the committed JSON meets nothing but the parser. Drop
+    `.stackward.toml` from `sources` *and* a namespace from `roots`, and
+    `verify_sources` has nothing left to disagree with: every source still
+    recorded matches the index exactly. Only the roots comparison can still
+    say the artifact covers less than the repository declares -- and the
+    credential in the dropped namespace is one the heuristic net cannot name.
+    """
+    write(repo, "declared.py", TWO_MODELS)
+    write(
+        repo,
+        ".stackward.toml",
+        f"""
+        python = "{sys.executable}"
+
+        [check]
+        model_net = "artifact"
+        stack_models = {{ "app:app" = "declared:Root", "app:other" = "declared:Other" }}
+        """,
+    )
+    git(repo, "add", "-A")
+    sync_and_commit(repo, monkeypatch, capsys)
+
+    edited = artifact(repo)
+    del edited["sources"][".stackward.toml"]
+    del edited["roots"]["app:other"]
+    (repo / ARTIFACT_PATH).write_text(json.dumps(edited, sort_keys=True, indent=2) + "\n")
+    write(repo, "Pulumi.dev.yaml", "config:\n  app:other:\n    binding: leaked\n")
+    git(repo, "add", "-A")
+
+    assert check(repo, monkeypatch) == 2
+    captured = capsys.readouterr()
+    assert "app:other" in captured.err
+    assert "sync-declared-secrets" in captured.err
+    # Nothing reported: without this guard the namespace is simply skipped and
+    # its credential never looked at, and the command exits 0.
+    assert captured.out == ""
+
+
+def test_a_root_declared_through_a_module_level_alias_still_verifies(
+    repo, monkeypatch, capsys
+):
+    """Why `_verify_roots` compares **key sets** and not `(namespace, model)`
+    pairs.
+
+    A root's model id is `module:QualName` -- what the class says about itself
+    -- while `check.stack_models` names whatever attribute the operator
+    actually imported it as. A module-level alias, or a class re-exported from
+    a package's `__init__`, makes the two diverge for a completely correct
+    artifact. Comparing pairs would refuse it, and would call it staleness,
+    which is not what happened; regenerating would produce the identical file
+    and the refusal would repeat forever.
+
+    (The docstring here used to justify the same choice by nested classes.
+    That case is unreachable: `bootstrap.regen._import_object` resolves a
+    target with a flat `getattr`, so `declared:Outer.Inner` is refused at sync
+    time and never reaches an artifact. An alias is the form that does occur.)
+    """
+    write(repo, "declared.py", TWO_MODELS + "\n    Alias = Root\n")
+    declare(repo, models="declared:Alias")
+    git(repo, "add", "-A")
+    written = sync_and_commit(repo, monkeypatch, capsys)
+
+    # The divergence itself, made explicit: the config asked for `Alias`, the
+    # artifact records what the class calls itself.
+    assert written["roots"] == {"app:app": "declared:Root"}
+
+    write(repo, "Pulumi.dev.yaml", "config:\n  app:app:\n    binding: \"\"\n")
+    assert check(repo, monkeypatch) == 0
+    assert capsys.readouterr().out == ""
 
 
 def test_none_mode_skips_cleanly_with_no_artifact_present(repo, monkeypatch, capsys):
