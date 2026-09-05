@@ -1,0 +1,174 @@
+"""Tests for the config-path grammar: findings, manifests and matching all
+depend on `parse`/`render` agreeing with each other in both directions."""
+
+from __future__ import annotations
+
+import pytest
+
+from stackward.paths import parse, render
+
+# Canonical texts: render(parse(x)) must reproduce x exactly. Every entry
+# here is already in the form `render` would itself produce.
+CANONICAL_TEXTS = [
+    "a.b.c",
+    "a[0]",
+    "a.b[3].c",
+    'a["b.c"]',
+    'a["b[c]"]',
+    'a["b\\"c"]',
+    'a[""]',
+    "a.1",
+    "[0]",
+    "a[0][1]",
+]
+
+# Segment lists: parse(render(y)) must reproduce y exactly. Includes forms
+# `render` would not itself choose (e.g. a quoted digit key), which is fine —
+# the round trip only requires equality, not that the text be canonical.
+SEGMENT_LISTS: list[list[str | int]] = [
+    ["a", "b", "c"],
+    ["a", 0],
+    ["a", "b", 3, "c"],
+    ["a", "b.c"],
+    ["a", "b[c]"],
+    ['a', 'b"c'],
+    ["a", ""],
+    ["a", "1"],
+    [0],
+    ["1"],
+    [1],
+    ["a", 0, "b"],  # dot must be restored after a bracket
+    ["a", 0, 1],  # two indices in a row, no dot between brackets
+    ["a", 0, "b.c"],  # a quoted bracket right after another bracket
+]
+
+
+def test_parses_a_plain_dotted_path():
+    assert parse("a.b.c") == ["a", "b", "c"]
+
+
+def test_parses_a_list_index_as_int():
+    segments = parse("a[0]")
+    assert segments == ["a", 0]
+    assert type(segments[1]) is int
+
+
+def test_key_containing_a_dot_round_trips_through_bracket_form():
+    segments = ["a", "b.c"]
+    text = render(segments)
+    assert text == 'a["b.c"]'
+    assert parse(text) == segments
+
+
+def test_key_containing_a_bracket_round_trips_through_bracket_form():
+    segments = ["a", "b[c]"]
+    text = render(segments)
+    assert text == 'a["b[c]"]'
+    assert parse(text) == segments
+
+
+def test_key_containing_a_quote_is_escaped_as_backslash_quote():
+    segments = ["a", 'b"c']
+    text = render(segments)
+    assert text == 'a["b\\"c"]'
+    assert parse(text) == segments
+
+
+def test_empty_string_key_round_trips_through_bracket_form():
+    segments = ["a", ""]
+    text = render(segments)
+    assert text == 'a[""]'
+    assert parse(text) == segments
+
+
+def test_quoted_string_digit_key_and_unquoted_list_index_do_not_collapse_on_parse():
+    """`["1"]` is the string "1"; `[1]` is the index 1 — parsing must keep
+    them apart, not just the segment lists' equality but their types too."""
+    string_segments = parse('a["1"]')
+    index_segments = parse("a[1]")
+
+    assert string_segments == ["a", "1"]
+    assert type(string_segments[1]) is str
+
+    assert index_segments == ["a", 1]
+    assert type(index_segments[1]) is int
+
+    assert string_segments != index_segments
+
+
+def test_string_digit_key_and_list_index_do_not_collapse_on_render():
+    """The same distinction, the other way: rendering a string "1" must not
+    produce the same text as rendering the index 1."""
+    string_text = render(["a", "1"])
+    index_text = render(["a", 1])
+
+    assert string_text == "a.1"
+    assert index_text == "a[1]"
+    assert string_text != index_text
+
+    # And each parses back to the segment it came from, not the other one.
+    assert parse(string_text) == ["a", "1"]
+    assert parse(index_text) == ["a", 1]
+
+
+@pytest.mark.parametrize("text", CANONICAL_TEXTS)
+def test_render_of_parse_reproduces_canonical_text(text):
+    assert render(parse(text)) == text
+
+
+@pytest.mark.parametrize("segments", SEGMENT_LISTS)
+def test_parse_of_render_reproduces_segment_list(segments):
+    assert parse(render(segments)) == segments
+
+
+def test_dot_is_restored_after_a_bracket_for_the_next_bare_segment():
+    assert render(["a", 0, "b"]) == "a[0].b"
+
+
+def test_no_dot_between_two_consecutive_indices():
+    assert render(["a", 0, 1]) == "a[0][1]"
+
+
+def test_no_dot_before_a_quoted_bracket_that_follows_another_bracket():
+    assert render(["a", 0, "b.c"]) == 'a[0]["b.c"]'
+
+
+def test_unterminated_bracket_raises_value_error_naming_the_position():
+    with pytest.raises(ValueError) as exc_info:
+        parse("a[0")
+    message = str(exc_info.value)
+    assert "position 1" in message  # the unclosed '['
+    assert "a[0" not in message
+
+
+def test_empty_key_between_dots_raises_value_error_naming_the_position():
+    with pytest.raises(ValueError) as exc_info:
+        parse("a..b")
+    message = str(exc_info.value)
+    assert "position 2" in message
+    assert "a..b" not in message
+
+
+def test_non_digit_list_index_raises_value_error_naming_the_position():
+    with pytest.raises(ValueError) as exc_info:
+        parse("a[x]")
+    message = str(exc_info.value)
+    assert "position 2" in message
+    assert "a[x]" not in message
+
+
+def test_render_rejects_bool_segment_rather_than_silently_treating_it_as_an_index():
+    """bool is an int subclass; letting one through would make `render([True])`
+    silently produce `[1]`."""
+    with pytest.raises(ValueError):
+        render(["a", True])
+
+
+def test_render_rejects_negative_index():
+    with pytest.raises(ValueError):
+        render(["a", -1])
+
+
+def test_render_rejects_empty_segment_list():
+    with pytest.raises(ValueError):
+        render([])
