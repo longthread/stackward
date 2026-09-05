@@ -10,11 +10,35 @@ wrong implementation it would catch.
 from __future__ import annotations
 
 import pytest
+import yaml
 
 from stackward.cli import main
+from stackward.commands import check_config as check_config_module
 from stackward.commands.check_config import CheckError, scan_file
 from stackward.config import CheckConfig
 from stackward.nets.heuristic import DocumentError, find_plaintext_credentials
+
+# Characters that flow through PyYAML's `%r` interpolation into a scanner
+# or parser message. `_YAML_TRIGGER_CHARACTERS`'s point is exactly that it
+# is a *set*, not one instance: the apostrophe is the one character whose
+# `repr()` switches delimiter (`"'"`, not `'''`), and a redaction pattern
+# that only matched `'...'` passed every test built from the others.
+_YAML_TRIGGER_CHARACTERS = [
+    pytest.param("'", id="apostrophe"),
+    pytest.param('"', id="double_quote"),
+    pytest.param("\\", id="backslash"),
+    pytest.param("\n", id="newline"),
+    pytest.param("\x01", id="non_printable"),
+]
+
+
+def _marked_yaml_error(problem: str) -> yaml.MarkedYAMLError:
+    """A `MarkedYAMLError` shaped like the ones PyYAML's scanner/parser
+    actually raise, with a fixed, recognisable line/column so a test can
+    assert position survives redaction alongside the interpolated
+    character not surviving it."""
+    mark = yaml.Mark("<unicode string>", 0, 4, 17, None, None)
+    return yaml.MarkedYAMLError(problem=problem, problem_mark=mark)
 
 # ---------------------------------------------------------------------------
 # find_plaintext_credentials — the content-level net.
@@ -316,6 +340,59 @@ def test_invalid_yaml_reserved_leading_character_error_redacts_the_leaked_charac
     assert "that cannot start any token" in message
     assert "line 1" in message
     assert "column 11" in message
+
+
+def test_scan_file_redacts_an_apostrophe_that_flips_reprs_delimiter(tmp_path):
+    """Regression for the specific gap the two tests above could not
+    catch: when the character PyYAML interpolates via `%r` is itself an
+    apostrophe, Python's `repr()` switches to double quotes (`"'"`, not
+    `'''`) — a redaction pattern that only matched `'...'` left exactly
+    this one character unredacted, end to end through the real CLI path,
+    not just a synthetic exception."""
+    path = write_yaml(tmp_path, "Pulumi.leak.yaml", "password: \"s3cr3t\\'value\"\n")
+    with pytest.raises(CheckError) as exc_info:
+        scan_file(path, CheckConfig())
+    message = str(exc_info.value)
+    assert "'" not in message
+    assert "s3cr3t" not in message
+    assert "value" not in message
+    assert "<redacted>" in message
+    assert "found unknown escape character" in message
+
+
+@pytest.mark.parametrize("trigger_char", _YAML_TRIGGER_CHARACTERS)
+def test_yaml_error_redaction_removes_any_percent_r_escape_character(trigger_char):
+    """The property, not an instance: redaction must hold for *any*
+    character PyYAML's scanner interpolates via `%r` into "found unknown
+    escape character %r" — not just the one or two a hand-picked
+    reproduction happens to trigger. Two instance-pinned tests (`'2'`,
+    `` '`' ``) both passed while this exact class of gap — the apostrophe
+    flipping `repr()`'s delimiter to `"'"` — was still open, which is
+    precisely what a test quantified over characters, rather than fixed to
+    one, is for."""
+    exc = _marked_yaml_error(f"found unknown escape character {trigger_char!r}")
+    message = check_config_module._describe_yaml_error(exc)
+    assert trigger_char not in message
+    assert "<redacted>" in message
+    assert "found unknown escape character" in message
+    assert "line 5" in message
+    assert "column 18" in message
+
+
+@pytest.mark.parametrize("trigger_char", _YAML_TRIGGER_CHARACTERS)
+def test_yaml_error_redaction_removes_any_percent_r_reserved_character(trigger_char):
+    """The same property, for the other PyYAML message family that
+    interpolates a raw character: "found character %r that cannot start
+    any token"."""
+    problem = f"found character {trigger_char!r} that cannot start any token"
+    exc = _marked_yaml_error(problem)
+    message = check_config_module._describe_yaml_error(exc)
+    assert trigger_char not in message
+    assert "<redacted>" in message
+    assert "found character" in message
+    assert "that cannot start any token" in message
+    assert "line 5" in message
+    assert "column 18" in message
 
 
 def test_scan_file_raises_check_error_on_non_mapping_document(tmp_path):

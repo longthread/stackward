@@ -20,10 +20,14 @@ import yaml
 from ..config import CheckConfig, ConfigError, find_repo_config, load_config
 from ..nets.heuristic import DocumentError, find_plaintext_credentials
 
-# Matches a `'...'`-quoted fragment the way PyYAML's `%r` interpolation
-# produces one (e.g. `'2'`, `` '`' ``, `'id001'`) — see `_describe_yaml_error`
-# for why every such fragment gets redacted rather than trusted.
-_QUOTED_FRAGMENT = re.compile(r"'[^']*'")
+# Matches a repr-quoted fragment the way PyYAML's `%r` interpolation
+# produces one — e.g. `'2'`, `` '`' ``, `'id001'`. Python's `repr()` flips
+# to double quotes whenever the value contains `'` and no `"` (so `%r` on a
+# lone apostrophe is `"'"`, not `'''`), which is why both delimiter forms
+# are matched here: matching only `'...'` leaves exactly that one trigger
+# character unredacted. See `_describe_yaml_error` for why every such
+# fragment gets redacted rather than trusted.
+_QUOTED_FRAGMENT = re.compile(r"'[^']*'|\"[^\"]*\"")
 
 
 class CheckError(Exception):
@@ -66,8 +70,8 @@ def scan_file(path: Path, check: CheckConfig) -> list[str]:
 
 def _describe_yaml_error(exc: yaml.YAMLError) -> str:
     """A `YAMLError` message built only from PyYAML's own description and
-    position, with every `'...'`-quoted fragment in it redacted — never
-    from `str(exc)`.
+    the error position, with every repr-quoted fragment in it redacted —
+    never from `str(exc)`.
 
     `str(exc)` on a `MarkedYAMLError` calls `Mark.__str__`, which calls
     `Mark.get_snippet()` and emits the *whole source line* around the
@@ -81,15 +85,21 @@ def _describe_yaml_error(exc: yaml.YAMLError) -> str:
     token", "found unknown escape character %r", an anchor/alias/tag-handle
     name in a duplicate/undefined-alias error. A value like `"hunter\2ok"`
     yields `found unknown escape character '2'` — one character of a real
-    credential. Rather than whitelisting which PyYAML message shapes are
-    safe (which varies by version and is not this module's job to track),
-    every single-quoted run is replaced with `<redacted>` before use. The
-    message keeps its diagnostic value (error kind, line, column) while
-    never carrying document content, current or future PyYAML wording
-    notwithstanding. Contrast `config.py`'s `load_config`, which safely
-    echoes tomllib's message in full because `.stackward.toml` holds only
-    path and key *names* — this file holds the opposite, so it gets the
-    more careful treatment.
+    credential; `repr()` flips to double quotes whenever that character is
+    itself an apostrophe (`"'"`, not `'''`), which is why `_QUOTED_FRAGMENT`
+    matches both delimiter forms rather than only `'...'`.
+
+    This removes every document character PyYAML is *currently known* to
+    interpolate via `%r`, by shape (any repr-quoted run) rather than by
+    enumerating today's message text — that is a mechanism with a stated
+    boundary, not a guarantee that no PyYAML wording could ever leak a
+    character some other way. `tests/test_heuristic.py`'s parameterized
+    redaction test is what would catch a future wording change that
+    escapes this pattern; this docstring does not promise it can't happen.
+    Contrast `config.py`'s `load_config`, which safely echoes tomllib's
+    message in full because `.stackward.toml` holds only path and key
+    *names* — this file holds the opposite, so it gets the more careful,
+    still-bounded treatment.
     """
     if isinstance(exc, yaml.MarkedYAMLError) and exc.problem is not None:
         problem = _QUOTED_FRAGMENT.sub("<redacted>", exc.problem)
