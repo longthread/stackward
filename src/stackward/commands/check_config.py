@@ -11,6 +11,7 @@ reads the same way this one does: "the gate did not get to answer".
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -18,6 +19,11 @@ import yaml
 
 from ..config import CheckConfig, ConfigError, find_repo_config, load_config
 from ..nets.heuristic import DocumentError, find_plaintext_credentials
+
+# Matches a `'...'`-quoted fragment the way PyYAML's `%r` interpolation
+# produces one (e.g. `'2'`, `` '`' ``, `'id001'`) — see `_describe_yaml_error`
+# for why every such fragment gets redacted rather than trusted.
+_QUOTED_FRAGMENT = re.compile(r"'[^']*'")
 
 
 class CheckError(Exception):
@@ -59,26 +65,40 @@ def scan_file(path: Path, check: CheckConfig) -> list[str]:
 
 
 def _describe_yaml_error(exc: yaml.YAMLError) -> str:
-    """A `YAMLError` message that never includes a source-line snippet.
+    """A `YAMLError` message built only from PyYAML's own description and
+    position, with every `'...'`-quoted fragment in it redacted — never
+    from `str(exc)`.
 
-    `MarkedYAMLError.__str__` (and the `Mark.__str__` it calls for
-    `problem_mark`/`context_mark`) includes `Mark.get_snippet()` — a slice
-    of the *actual file content* around the error. This is the one file in
-    the whole system expected to contain a credential, so that snippet is
-    exactly the value this module must never print. `exc.problem` and
-    `exc.problem_mark`'s `line`/`column` carry no source text; that is all
-    this reports. Contrast `config.py`'s `load_config`, which safely echoes
-    tomllib's message in full because `.stackward.toml` holds only path and
-    key *names* — this file holds the opposite, so it gets the more
-    careful treatment.
+    `str(exc)` on a `MarkedYAMLError` calls `Mark.__str__`, which calls
+    `Mark.get_snippet()` and emits the *whole source line* around the
+    error — reason enough on its own never to use it here, in the one file
+    in the whole system expected to hold a credential.
+
+    But `exc.problem` is not unconditionally safe either, which an earlier
+    version of this docstring claimed and which a review disproved: several
+    PyYAML scanner/parser messages interpolate one raw character or a
+    user-chosen name via `%r` — "found character %r that cannot start any
+    token", "found unknown escape character %r", an anchor/alias/tag-handle
+    name in a duplicate/undefined-alias error. A value like `"hunter\2ok"`
+    yields `found unknown escape character '2'` — one character of a real
+    credential. Rather than whitelisting which PyYAML message shapes are
+    safe (which varies by version and is not this module's job to track),
+    every single-quoted run is replaced with `<redacted>` before use. The
+    message keeps its diagnostic value (error kind, line, column) while
+    never carrying document content, current or future PyYAML wording
+    notwithstanding. Contrast `config.py`'s `load_config`, which safely
+    echoes tomllib's message in full because `.stackward.toml` holds only
+    path and key *names* — this file holds the opposite, so it gets the
+    more careful treatment.
     """
     if isinstance(exc, yaml.MarkedYAMLError) and exc.problem is not None:
+        problem = _QUOTED_FRAGMENT.sub("<redacted>", exc.problem)
         if exc.problem_mark is not None:
             return (
-                f"{exc.problem} (line {exc.problem_mark.line + 1}, "
+                f"{problem} (line {exc.problem_mark.line + 1}, "
                 f"column {exc.problem_mark.column + 1})"
             )
-        return exc.problem
+        return problem
     return "invalid YAML syntax"
 
 

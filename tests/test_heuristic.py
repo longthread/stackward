@@ -278,6 +278,46 @@ def test_invalid_yaml_error_never_prints_a_credential_shaped_value(tmp_path):
     assert "hunter2" not in str(exc_info.value)
 
 
+def test_invalid_yaml_bad_escape_error_redacts_the_leaked_character(tmp_path):
+    """`exc.problem` is not unconditionally free of document content:
+    PyYAML's scanner interpolates one raw character via `%r` into
+    "found unknown escape character %r" for a bad backslash escape. A
+    value like `"hunter\\2ok"` (a plausible fragment of a real password)
+    would otherwise leak the digit `2` into the error message. The error
+    kind and position must survive redaction even though the character
+    does not."""
+    path = write_yaml(tmp_path, "Pulumi.leak.yaml", 'password: "hunter\\2ok"\n')
+    with pytest.raises(CheckError) as exc_info:
+        scan_file(path, CheckConfig())
+    message = str(exc_info.value)
+    assert "'2'" not in message
+    assert "hunter" not in message
+    assert "<redacted>" in message
+    assert "found unknown escape character" in message
+    assert "line 1" in message
+    assert "column 19" in message
+
+
+def test_invalid_yaml_reserved_leading_character_error_redacts_the_leaked_character(
+    tmp_path,
+):
+    """The same `%r` leak, from a different PyYAML message: a character
+    that cannot start any token — a backtick right before what looks like
+    a plaintext credential — interpolates that character into
+    "found character %r that cannot start any token"."""
+    path = write_yaml(tmp_path, "Pulumi.leak.yaml", "password: `s3cr3tPass99\n")
+    with pytest.raises(CheckError) as exc_info:
+        scan_file(path, CheckConfig())
+    message = str(exc_info.value)
+    assert "'`'" not in message
+    assert "s3cr3tPass99" not in message
+    assert "<redacted>" in message
+    assert "found character" in message
+    assert "that cannot start any token" in message
+    assert "line 1" in message
+    assert "column 11" in message
+
+
 def test_scan_file_raises_check_error_on_non_mapping_document(tmp_path):
     path = write_yaml(tmp_path, "Pulumi.dev.yaml", "- a\n- b\n")
     with pytest.raises(CheckError):
