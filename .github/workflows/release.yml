@@ -6,9 +6,16 @@
 #     builds the name from `uname -s` and `uname -m`, so the matrix uses those
 #     values verbatim (Linux-x86_64, Darwin-arm64) rather than prettier ones.
 #
-#   * The Linux build runs in a manylinux container, not on ubuntu-latest. A
-#     bundle links against the glibc it was built on, so building on the newest
-#     runner silently produces a binary that will not start on an older distro.
+#   * A frozen bundle links against the glibc it was built on, so the Linux
+#     build pins the oldest runner available rather than using ubuntu-latest.
+#     That sets the floor at glibc 2.35 (Ubuntu 22.04, Debian 12, RHEL 9), which
+#     is stated in the release notes rather than left to be discovered.
+#
+#     manylinux would give a lower floor and was tried first: its CPython is
+#     built without a shared library, which PyInstaller requires, so the build
+#     fails outright. Lowering the floor means a container with a shared-library
+#     Python, not a manylinux image. Worth doing only if something actually
+#     needs it.
 name: release
 
 on:
@@ -31,32 +38,28 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
-            container: quay.io/pypa/manylinux_2_28_x86_64
+          - os: ubuntu-22.04
             asset: Linux-x86_64
-            python: /opt/python/cp311-cp311/bin/python
           - os: macos-14
-            container: ""
             asset: Darwin-arm64
-            python: python3
     runs-on: ${{ matrix.os }}
-    container: ${{ matrix.container }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Trust the workspace
-        # The manylinux image ships a git that refuses a repo owned by another
-        # uid; without this, later git calls fail with "dubious ownership".
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+      - uses: actions/setup-python@v5
+        # Not the system interpreter. macOS runners ship a PEP 668
+        # externally-managed Python that refuses `pip install` outright, and
+        # these builds are compiled with --enable-shared, which PyInstaller
+        # needs and several distribution Pythons lack.
+        with:
+          python-version: "3.11"
 
       - name: Build the bundle
-        env:
-          PYTHON: ${{ matrix.python }}
         run: |
           set -euo pipefail
-          "$PYTHON" -m pip install --quiet --upgrade pip
-          "$PYTHON" -m pip install --quiet . pyinstaller
-          "$PYTHON" -m PyInstaller --noconfirm --clean --onedir \
+          python -m pip install --quiet --upgrade pip
+          python -m pip install --quiet . pyinstaller
+          python -m PyInstaller --noconfirm --clean --onedir \
             --name stackward --paths src --distpath dist --workpath build entry.py
 
       - name: It must actually run
