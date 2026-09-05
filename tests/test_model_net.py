@@ -21,6 +21,7 @@ Every model here is synthetic and named for its role in the test.
 
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 import sys
@@ -29,7 +30,9 @@ from pathlib import Path
 
 import pytest
 
+from stackward import cli as cli_module
 from stackward.bootstrap import generator_source
+from stackward.cli import cmd_doctor
 from stackward.cli import main
 from stackward.commands.sync_declared import SyncError, build_artifact, serialise
 from stackward.config import CheckConfig
@@ -731,6 +734,91 @@ def test_an_unwalkable_annotation_is_refused_rather_than_silently_skipped(
     assert "declared:Root.peer" in capsys.readouterr().err
 
 
+def test_a_root_model_is_refused_rather_than_covering_nothing(
+    repo, monkeypatch, capsys
+):
+    """A RootModel appears in a document as its inner value, with no `root`
+    key, so walking it as an ordinary model would look up a field name that
+    can never occur and produce no coverage while saying nothing about it.
+    By R1's own principle, unknowable coverage refuses."""
+    write(
+        repo,
+        "declared.py",
+        """
+        from pydantic import BaseModel, Field, RootModel
+
+
+        class Wrapped(RootModel[str]):
+            root: str = Field(default="", json_schema_extra={"secret": True})
+
+
+        class Root(BaseModel):
+            wrapped: Wrapped = Wrapped(root="")
+        """,
+    )
+    declare(repo)
+    git(repo, "add", "-A")
+    assert sync(repo, monkeypatch) == 2
+    assert not (repo / ARTIFACT_PATH).exists()
+    error = capsys.readouterr().err
+    assert "declared:Wrapped" in error
+    assert "RootModel" in error
+
+
+def test_a_root_model_declared_as_a_stack_root_is_refused_too(
+    repo, monkeypatch, capsys
+):
+    """The refusal lives where every model passes through, so a root model
+    reached as a declared root and one reached through a field are refused by
+    the same line rather than by two that could drift apart."""
+    write(
+        repo,
+        "declared.py",
+        """
+        from pydantic import RootModel
+
+
+        class Root(RootModel[dict[str, str]]):
+            pass
+        """,
+    )
+    declare(repo)
+    git(repo, "add", "-A")
+    assert sync(repo, monkeypatch) == 2
+    assert "RootModel" in capsys.readouterr().err
+
+
+def test_a_refusal_names_the_field_the_class_the_annotation_and_the_way_out(
+    repo, monkeypatch, capsys
+):
+    """A refusal a reader cannot act on is a refusal that gets silenced with
+    `model_net = "none"`, which loses the whole net -- and first adoption is
+    exactly when several of these arrive at once."""
+    write(
+        repo,
+        "declared.py",
+        """
+        from typing import Any
+
+        from pydantic import BaseModel
+
+
+        class Root(BaseModel):
+            settings: dict[str, Any] = {}
+        """,
+    )
+    declare(repo)
+    git(repo, "add", "-A")
+    assert sync(repo, monkeypatch) == 2
+    error = capsys.readouterr().err
+    assert "settings" in error                    # the field
+    assert "declared:Root" in error               # the class
+    assert "Any" in error                         # the annotation
+    assert "narrow the annotation" in error       # remedy 1
+    assert "json_schema_extra" in error           # remedy 2
+    assert "declared_paths_fn" in error           # remedy 3
+
+
 def test_a_marked_field_may_carry_an_annotation_that_cannot_be_walked(
     repo, monkeypatch, capsys
 ):
@@ -1218,6 +1306,125 @@ def test_none_mode_still_runs_the_heuristic_net(repo, monkeypatch, capsys):
 
 
 # ---------------------------------------------------------------------------
+# The hook: the layer that actually prevents publication.
+#
+# `check-config` invoked by hand reports a leak that may already be committed;
+# only `pre-commit` stops one entering history. A model net that ran only on
+# manual invocation would be absent at the one moment it counts, so these
+# drive a real `git commit` rather than asserting on command output.
+# ---------------------------------------------------------------------------
+
+
+def install_hook(repo: Path, monkeypatch) -> None:
+    monkeypatch.chdir(repo)
+    assert main(["hooks", "install"]) == 0
+
+
+def attempt_commit(repo: Path, message: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "commit", "-m", message], cwd=repo, capture_output=True, text=True
+    )
+
+
+def declared_repo(repo: Path, monkeypatch, capsys, model: str) -> None:
+    """A repository with `model` declared, generated and committed, and the
+    gate installed as a real git hook."""
+    write(repo, "declared.py", model)
+    declare(repo)
+    git(repo, "add", "-A")
+    sync_and_commit(repo, monkeypatch, capsys)
+    install_hook(repo, monkeypatch)
+
+
+def test_a_model_net_only_finding_blocks_a_real_commit(
+    repo, monkeypatch, capsys, real_executable
+):
+    """The headline claim of wiring the model net into the hook.
+
+    `binding` matches none of the heuristic net's built-in key patterns, and
+    it sits two levels down a recursive model. Its companion below proves the
+    same commit succeeds with the model net switched off, so this test cannot
+    be passing because something else blocked the commit.
+    """
+    declared_repo(repo, monkeypatch, capsys, HEURISTIC_BLIND_MODEL)
+    write(repo, "Pulumi.dev.yaml", BLIND_DOCUMENT)
+    git(repo, "add", "Pulumi.dev.yaml")
+
+    result = attempt_commit(repo, "add a declared secret")
+    assert result.returncode != 0
+    output = result.stdout + result.stderr
+    assert "config.app:app.children[0].children[0].binding" in output
+    assert "deeply-nested" not in output
+
+
+def test_the_same_commit_succeeds_with_the_model_net_switched_off(
+    repo, monkeypatch, capsys, real_executable
+):
+    """The other half of the pair. Without it, the test above would pass just
+    as well if the hook blocked every commit."""
+    declared_repo(repo, monkeypatch, capsys, HEURISTIC_BLIND_MODEL)
+    write(repo, ".stackward.toml", '[check]\nmodel_net = "none"\n')
+    write(repo, "Pulumi.dev.yaml", BLIND_DOCUMENT)
+    git(repo, "add", ".stackward.toml", "Pulumi.dev.yaml")
+
+    assert attempt_commit(repo, "add the same document").returncode == 0
+
+
+def test_a_stale_artifact_blocks_a_real_commit(
+    repo, monkeypatch, capsys, real_executable
+):
+    """The hook reads the artifact from the index and refuses when it no
+    longer matches its sources -- it does not fall back to the heuristic net
+    alone, which would be a silent downgrade at commit time."""
+    declared_repo(repo, monkeypatch, capsys, RECURSIVE_MODEL)
+    write(repo, "declared.py", RECURSIVE_MODEL_EDITED)
+    write(repo, "Pulumi.dev.yaml", "config:\n  app:app:\n    plain: ordinary\n")
+    git(repo, "add", "declared.py", "Pulumi.dev.yaml")
+
+    result = attempt_commit(repo, "change a model without regenerating")
+    assert result.returncode != 0
+    assert "sync-declared-secrets" in result.stdout + result.stderr
+
+
+def test_the_hook_exits_2_on_a_stale_artifact_not_1(repo, monkeypatch, capsys):
+    """Driven in-process, because a `git commit` reports only "the hook said
+    no" and cannot distinguish the two codes -- and the distinction is the
+    whole reason exit 2 exists."""
+    write(repo, "declared.py", RECURSIVE_MODEL)
+    declare(repo)
+    git(repo, "add", "-A")
+    sync_and_commit(repo, monkeypatch, capsys)
+    write(repo, "declared.py", RECURSIVE_MODEL_EDITED)
+    write(repo, "Pulumi.dev.yaml", "config:\n  app:app:\n    token: value\n")
+    git(repo, "add", "declared.py", "Pulumi.dev.yaml")
+
+    monkeypatch.chdir(repo)
+    assert main(["pre-commit"]) == 2
+    captured = capsys.readouterr()
+    assert "sync-declared-secrets" in captured.err
+    # Nothing reported: the command does not know what the repository declared.
+    assert captured.out == ""
+
+
+def test_the_hook_reports_a_leaf_both_nets_name_once(repo, monkeypatch, capsys):
+    write(repo, "declared.py", RECURSIVE_MODEL)
+    declare(repo)
+    git(repo, "add", "-A")
+    sync_and_commit(repo, monkeypatch, capsys)
+    write(repo, "Pulumi.dev.yaml", "config:\n  app:app:\n    token: value\n")
+    git(repo, "add", "Pulumi.dev.yaml")
+
+    monkeypatch.chdir(repo)
+    assert main(["pre-commit"]) == 1
+    lines = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if "plaintext credential at" in line
+    ]
+    assert len(lines) == 1
+
+
+# ---------------------------------------------------------------------------
 # Global Constraint 1: pydantic is test-only.
 # ---------------------------------------------------------------------------
 
@@ -1263,6 +1470,46 @@ def test_the_gate_path_reaches_no_credential_code():
         check=True,
     )
     assert proc.stdout.strip() == "[]"
+
+
+def test_doctor_reports_the_model_walker_as_readable(capsys):
+    """`regen.py` is carried into the frozen bundle by an explicit
+    `--add-data` entry rather than by import analysis, so dropping that entry
+    produces a binary that builds, starts, and then fails only at
+    `sync-declared-secrets`. `doctor` is the release smoke test, so it checks
+    the real accessor -- and the release workflow greps for this exact line,
+    which is why the prefix is asserted verbatim rather than loosely.
+    """
+    assert cmd_doctor(argparse.Namespace()) == 0
+    reported = [
+        line
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("model walker    regen.py readable")
+    ]
+    assert len(reported) == 1
+
+
+def test_doctor_fails_when_the_model_walker_cannot_be_read(monkeypatch, capsys):
+    """The check has to discriminate, or the release workflow's grep is
+    decoration. Verified against a real frozen bundle built without the
+    `--add-data` entry as well; this is the version that runs every time."""
+    monkeypatch.setattr(
+        cli_module,
+        "generator_source",
+        lambda: (_ for _ in ()).throw(FileNotFoundError("regen.py")),
+    )
+    assert cmd_doctor(argparse.Namespace()) == 1
+    assert "model walker    UNAVAILABLE" in capsys.readouterr().out
+
+
+def test_doctor_fails_when_the_bundled_file_is_not_the_generator(
+    monkeypatch, capsys
+):
+    """Present but wrong is a distinct failure from absent, and it would
+    otherwise read as success."""
+    monkeypatch.setattr(cli_module, "generator_source", lambda: "# not it\n")
+    assert cmd_doctor(argparse.Namespace()) == 1
+    assert "model walker    FAILED" in capsys.readouterr().out
 
 
 def test_the_generator_is_read_through_the_accessor_the_shipped_code_uses():

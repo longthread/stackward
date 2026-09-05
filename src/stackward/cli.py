@@ -17,6 +17,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
+from .bootstrap import GENERATOR_NAME, generator_source
 from .commands.check_config import cmd_check_config
 from .commands.check_passphrase import cmd_check_passphrase
 from .commands.install_hooks import cmd_install_hooks
@@ -85,6 +86,34 @@ def crypto_selftest() -> str:
         return f"UNAVAILABLE: {type(exc).__name__}: {exc}"
 
 
+def generator_selftest() -> str:
+    """Prove the model walker's source is reachable, rather than assuming it.
+
+    `sync-declared-secrets` ships `bootstrap/regen.py` as a **data** file and
+    pipes its text to the consuming repository's interpreter; nothing imports
+    it, which is what keeps pydantic out of the bundle. The cost of that is
+    that PyInstaller's import analysis cannot see it either, so it is carried
+    by an explicit `--add-data` entry in the release workflow -- and if that
+    entry is ever dropped, the binary builds cleanly, starts cleanly, and
+    then `sync-declared-secrets` fails in the one artifact everyone installs
+    and nowhere else.
+
+    That is the same failure shape as `crypto_selftest`'s: something that
+    works everywhere except the shipped bundle. So it gets the same treatment
+    -- `doctor` is what a release smoke test runs, and it checks the real
+    accessor the shipped code uses rather than the file's path on disk, which
+    does not exist in a bundle. It can only fail if the packaging is wrong:
+    an installed wheel and a source checkout both carry the file already.
+    """
+    try:
+        source = generator_source()
+    except Exception as exc:  # noqa: BLE001 - report any failure, never crash doctor
+        return f"UNAVAILABLE: {type(exc).__name__}: {exc}"
+    if "def generate(" not in source:
+        return f"FAILED: {GENERATOR_NAME} is present but is not the generator"
+    return f"{GENERATOR_NAME} readable ({len(source)} bytes)"
+
+
 def cmd_doctor(_args: argparse.Namespace) -> int:
     """Report what stackward can see. Never prints a credential value."""
     config = find_repo_config()
@@ -103,9 +132,13 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
     print()
     crypto = crypto_selftest()
     print(f"crypto          {crypto}")
-    # Exit non-zero when the credential layer could not work here. doctor is
-    # what a release smoke test runs, so it has to fail rather than narrate.
-    return 1 if crypto.startswith(("UNAVAILABLE", "FAILED")) else 0
+    generator = generator_selftest()
+    print(f"model walker    {generator}")
+    # Exit non-zero when the credential layer or the model walker could not
+    # work here. doctor is what a release smoke test runs, so it has to fail
+    # rather than narrate -- and both of these can only break in a bundle.
+    broken = ("UNAVAILABLE", "FAILED")
+    return 1 if crypto.startswith(broken) or generator.startswith(broken) else 0
 
 
 def build_parser() -> argparse.ArgumentParser:

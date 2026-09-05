@@ -10,8 +10,6 @@ tracked hooks directory, an existing foreign hook -- so, exactly as in
 
 from __future__ import annotations
 
-import os
-import shutil
 import stat
 import subprocess
 import sys
@@ -52,47 +50,6 @@ def install(repo: Path, monkeypatch) -> int:
 
 def backups(hooks_dir: Path) -> list[Path]:
     return sorted(hooks_dir.glob("pre-commit.backup.*"))
-
-
-def _real_stackward_executable() -> str:
-    """The actual installed `stackward` console script for this test
-    interpreter -- not a stub. Used only by the end-to-end tests below,
-    which prove the generated hook body really gets invoked by a real
-    `git commit`, not merely that a file landed at the expected path: a
-    file at the right path that git never actually runs is precisely the
-    "silent no-op" this command's own hooks-directory resolution exists to
-    prevent, and asserting on the file alone cannot catch that failure
-    mode.
-
-    Skipping when nothing is found keeps a local run convenient (an
-    interpreter not launched through this project's own `uv`-managed venv
-    genuinely may not have one), but `uv sync` always produces
-    `.venv/bin/stackward`, so CI must never quietly go green having lost
-    exactly the coverage the rest of this test file's real-git-repository
-    approach leans on hardest. Skip locally; fail loudly under `CI`.
-    """
-    candidate = Path(sys.executable).parent / "stackward"
-    if candidate.is_file() and os.access(candidate, os.X_OK):
-        return str(candidate)
-    found = shutil.which("stackward")
-    if found:
-        return found
-    message = (
-        "no installed `stackward` console script found for an end-to-end test"
-    )
-    if os.environ.get("CI"):
-        pytest.fail(f"{message} -- `uv sync` should have installed one")
-    pytest.skip(message)
-
-
-@pytest.fixture
-def real_executable(monkeypatch) -> str:
-    """Make `_install_hook` embed the real `stackward` console script
-    instead of whatever `sys.argv[0]` happens to be under pytest (its own
-    interpreter) -- see `_real_stackward_executable`."""
-    executable = _real_stackward_executable()
-    monkeypatch.setattr(install_hooks_module, "_running_executable", lambda: executable)
-    return executable
 
 
 # ---------------------------------------------------------------------------

@@ -73,10 +73,20 @@ jobs:
         # A bundle that builds is not a bundle that works. doctor performs a
         # real Argon2id + AES-GCM round trip, so this catches a native
         # extension that failed to freeze — the classic failure of this route.
+        #
+        # doctor also reads `regen.py` back out of the bundle through the same
+        # accessor `sync-declared-secrets` uses. That file is carried by the
+        # `--add-data` entry above rather than by import analysis, so dropping
+        # it would produce a binary that builds, starts, and then fails at the
+        # one command that needs it — in the shipped artifact and nowhere
+        # else. doctor exits non-zero on that, and the grep below states the
+        # expectation so a future edit to doctor's output cannot silently
+        # retire this check.
         run: |
           set -euo pipefail
           ./dist/stackward/stackward --version
-          ./dist/stackward/stackward doctor
+          ./dist/stackward/stackward doctor | tee doctor.txt
+          grep -q "^model walker    regen.py readable" doctor.txt
 
       - name: Sign for macOS
         if: runner.os == 'macOS'

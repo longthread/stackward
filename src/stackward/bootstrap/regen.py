@@ -80,6 +80,34 @@ def _is_model(annotation: Any) -> bool:
     return isinstance(annotation, type) and issubclass(annotation, BaseModel)
 
 
+def _is_root_model(model: type) -> bool:
+    """A model whose whole value *is* its single `root` field.
+
+    Refused, because its coverage is unknowable rather than empty. In the
+    document such a model appears as the inner value directly, with no `root`
+    key — so walking it as an ordinary model would look up field names that
+    can never occur, produce no coverage at all, and say nothing about having
+    done so. That is exactly the silent under-coverage this artifact exists to
+    eliminate, so it gets the same treatment as an unwalkable annotation.
+
+    Walking one correctly is not the small change it looks. A mark on the
+    `root` field means the whole value at the *parent* position is covered,
+    and there is no way to say that in this schema when the model is reached
+    through a `list[...]` or `dict[str, ...]` — the mark would have to
+    propagate through a container node, which carries no `secret` of its own.
+    Refusing is the honest answer until the schema can express it.
+
+    Imported defensively: `RootModel` exists in every pydantic 2.x, but a
+    generator that crashed on an unexpected import would fail *less* clearly
+    than one that reports what it could not decide.
+    """
+    try:
+        from pydantic import RootModel
+    except ImportError:  # pragma: no cover - pydantic 2.x always has it
+        return False
+    return isinstance(model, type) and issubclass(model, RootModel)
+
+
 def _model_id(model: type) -> str:
     """`module:QualName` — stable, readable, and meaningful in a diff of the
     committed artifact, which synthetic indices would not be."""
@@ -145,6 +173,18 @@ class _GraphBuilder:
         model_id = _model_id(model)
         if model_id in self.models:
             return model_id
+        if _is_root_model(model):
+            # Checked here rather than at each call site, so a root model
+            # reached as a declared root and one reached through a field are
+            # refused by the same line. See `_is_root_model`.
+            raise Unwalkable(
+                f"{model_id}: a RootModel appears in a document as its inner "
+                "value, with no field name to match, so any mark it carries "
+                "would cover nothing. Declare an ordinary BaseModel with named "
+                "fields, or mark the field that holds it "
+                "(json_schema_extra={'secret': True}), which covers everything "
+                "beneath it whatever its type"
+            )
         # Registered before its fields are walked, so a self-reference
         # resolves to this same id instead of recursing forever.
         self.models[model_id] = {}
@@ -165,7 +205,7 @@ class _GraphBuilder:
                 # refuse a declaration that is already complete.
                 entry["secret"] = True
             else:
-                child = self._resolve(info.annotation, where)
+                child = self._resolve(info.annotation, where, model_id)
                 if child is not None:
                     entry["child"] = child
             for key in _data_keys(name, info, where):
@@ -184,7 +224,9 @@ class _GraphBuilder:
                     fields[key] = entry
         return fields
 
-    def _resolve(self, annotation: Any, where: str) -> dict[str, Any] | None:
+    def _resolve(
+        self, annotation: Any, where: str, model_id: str
+    ) -> dict[str, Any] | None:
         """One annotation, as a graph node — or `None` when nothing beneath it
         is a declared model, which is the common case and is written as the
         absence of a `child` entry."""
@@ -203,7 +245,7 @@ class _GraphBuilder:
                 # `Optional[X]` / `X | None`: one real member, so there is
                 # exactly one thing to walk. `None` itself is not a mapping
                 # and has nothing beneath it.
-                return self._resolve(present[0], where)
+                return self._resolve(present[0], where, model_id)
             if any(_may_hold_model(member) for member in present):
                 raise Unwalkable(
                     f"{where}: a union of more than one type cannot be walked, "
@@ -212,22 +254,44 @@ class _GraphBuilder:
                 )
             return None
         if origin is list and len(args) == 1:
-            item = self._resolve(args[0], where)
+            item = self._resolve(args[0], where, model_id)
             return None if item is None else {"kind": "list", "item": item}
         if origin is dict and len(args) == 2 and _strip_annotated(args[0]) is str:
-            value = self._resolve(args[1], where)
+            value = self._resolve(args[1], where, model_id)
             return None if value is None else {"kind": "dict", "value": value}
 
         if _may_hold_model(annotation):
+            # Names the field, its class and the annotation itself, then every
+            # way forward. A refusal a reader cannot act on is a refusal that
+            # gets silenced with model_net = "none", which loses the whole net
+            # -- and first adoption of this tool is exactly when several of
+            # these arrive at once.
             raise Unwalkable(
-                f"{where}: this annotation may hold a declared model but is not "
-                "one this tool can walk. Walkable forms are a model, list[X], "
-                "dict[str, X] and Optional[X]. Either narrow the annotation to "
-                "one of those, or mark the field "
+                f"{where}: annotation {_describe(annotation)} may hold a "
+                f"declared model, and {model_id} cannot be walked through it. "
+                "Walkable forms are a model, list[X], dict[str, X] and "
+                "Optional[X]. Three ways forward: narrow the annotation to one "
+                "of those; or mark the field "
                 "(json_schema_extra={'secret': True}), which covers everything "
-                "beneath it whatever its type"
+                "beneath it whatever its type; or, if this repository's marking "
+                "convention is not this tool's, declare "
+                "check.declared_paths_fn"
             )
         return None
+
+
+def _describe(annotation: Any) -> str:
+    """An annotation as a reader would recognise it in their own source.
+
+    `repr` on a bare class is `<class 'str'>`, which reads as noise in a
+    message whose whole job is to point at a line of code; typing constructs
+    already repr as they were written. Carries type names from the consuming
+    repository, which are not credentials -- the same category as the module
+    and class names its `.stackward.toml` already states in the clear.
+    """
+    if isinstance(annotation, type):
+        return getattr(annotation, "__qualname__", None) or repr(annotation)
+    return repr(annotation)
 
 
 def _data_keys(name: str, info: Any, where: str) -> list[str]:

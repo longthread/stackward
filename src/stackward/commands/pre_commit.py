@@ -22,14 +22,29 @@ through, and a working-tree file that merely *looks* clean must not be
 mistaken for what will actually be committed.
 
 **Content-level, not file-level.** `_scan_staged_config` calls
-`nets.heuristic.find_plaintext_credentials` directly with an
-already-parsed document, the same content-level entry point
+`nets.heuristic.find_plaintext_credentials` and
+`nets.model.find_declared_credentials` directly with an already-parsed
+document, the same content-level entry points
 `commands.check_config.scan_file` calls for a file on disk. Neither this
 module nor that one ever round-trips a blob through a temporary file to
 reuse the other's file-path wrapper -- doing that here specifically would
 write staged (possibly credential-bearing) content to disk outside the
 index, and would reintroduce the working-tree-vs-index confusion this
 module exists to avoid.
+
+**Both nets run here, not only the heuristic one.** This is the layer that
+prevents publication; `check-config`, invoked by hand, reports a leak that
+may already be committed. A model net running only on manual invocation
+would be absent at the one moment it counts, so the stronger of the two nets
+would not be protecting anything. The two are unioned through a set, so a
+leaf both name is reported once.
+
+**The declared-secrets artifact is read from the index too**, by
+`nets.model.load_model_net` -- the same rule as every other path this module
+reads, and for the same reason: an unstaged regeneration must not vouch for
+the stale artifact that is actually about to be committed. A missing,
+malformed or stale artifact under `model_net = "artifact"` exits 2, never 1;
+`model_net = "none"` skips that net without reading anything at all.
 
 **No credential resolution.** This module imports `yaml`, `..config` and
 `..nets.heuristic` -- never `cryptography` and never any credential
@@ -63,6 +78,12 @@ import yaml
 
 from ..config import CheckConfig, ConfigError, find_repo_config, load_config
 from ..nets.heuristic import DocumentError, find_plaintext_credentials
+from ..nets.model import (
+    ModelNet,
+    ModelNetError,
+    find_declared_credentials,
+    load_model_net,
+)
 from .check_config import CheckError, describe_yaml_error, fail_closed
 
 _STATE_EXPORT_NAME = "state.json"
@@ -188,17 +209,23 @@ def _read_staged_blob(path: str) -> str:
         raise CheckError(f"{path}: staged content is not valid UTF-8: {exc}") from exc
 
 
-def _scan_staged_config(path: str, check: CheckConfig) -> list[str]:
-    """Content-level scan of `path`'s *staged* blob.
+def _scan_staged_config(
+    path: str, check: CheckConfig, net: ModelNet | None
+) -> list[str]:
+    """Content-level scan of `path`'s *staged* blob, by both nets.
 
     Mirrors `check_config.scan_file` exactly, except the source of text is
     `_read_staged_blob` (the index) rather than `Path.read_text()` (the
-    working tree): both parse with `yaml.safe_load` and hand the resulting
-    document straight to `find_plaintext_credentials`, and both wrap
+    working tree): both parse with `yaml.safe_load`, hand the resulting
+    document straight to the two content-level nets, union the results
+    through a set (a leaf both name is one problem, not two), and wrap
     every way that can fail in `CheckError` -- unreadable/undecodable
     content, invalid YAML (via `describe_yaml_error`, which redacts what
     PyYAML would otherwise interpolate into its own message), or a
     document that is not a mapping.
+
+    `net` is `None` when the repository declares `model_net = "none"`, or
+    has no `[check]` policy at all; the heuristic net always runs.
     """
     text = _read_staged_blob(path)
     try:
@@ -206,9 +233,12 @@ def _scan_staged_config(path: str, check: CheckConfig) -> list[str]:
     except yaml.YAMLError as exc:
         raise CheckError(f"{path}: invalid YAML: {describe_yaml_error(exc)}") from exc
     try:
-        return find_plaintext_credentials(document, check)
+        found = set(find_plaintext_credentials(document, check))
+        if net is not None:
+            found |= set(find_declared_credentials(document, net, check))
     except DocumentError as exc:
         raise CheckError(f"{path}: {exc}") from exc
+    return sorted(found)
 
 
 def _load_check_policy() -> CheckConfig:
@@ -233,13 +263,14 @@ def cmd_pre_commit(_args: argparse.Namespace) -> int:
 
     Exit codes, never conflated (see the module docstring in
     `check_config.py` for why this distinction matters to a later,
-    fail-closed refusal): **0** clean; **1** a credential was found by the
-    heuristic net, or a Pulumi state export was staged (refused outright,
-    since a state export is credentials by construction, not by finding);
+    fail-closed refusal): **0** clean; **1** a credential was found by either
+    net, or a Pulumi state export was staged (refused outright, since a
+    state export is credentials by construction, not by finding);
     **2** the check could not run at all -- an unmerged index entry, a git
     command failing, staged content that is not decodable or not valid
     YAML, a document that is not a mapping, an invalid `.stackward.toml`,
-    or an unanticipated exception. Python's own default for an uncaught
+    a missing or stale declared-secrets artifact under
+    `model_net = "artifact"`, or an unanticipated exception. Python's own default for an uncaught
     exception is exit 1, which here would misreport "a credential was
     found" for a file this command never actually finished evaluating --
     every per-file scan below is wrapped accordingly, and the `@fail_closed`
@@ -269,7 +300,12 @@ def cmd_pre_commit(_args: argparse.Namespace) -> int:
        refusal.
     2. Staged Pulumi state exports (`state.json`, `*.stack-export.json`) --
        refused outright, before the credential scan below even starts.
-    3. The heuristic net, over every staged `Pulumi.<stack>.yaml`.
+    3. The declared-secrets artifact, loaded from the index. Loaded once,
+       before the scan loop, and a failure to load it exits 2 having
+       reported nothing: a stale artifact means this command does not know
+       what the repository declared, so printing the *other* net's findings
+       and exiting 1 would claim a complete answer it does not have.
+    4. Both nets, unioned, over every staged `Pulumi.<stack>.yaml`.
 
     Never prints a credential value: a finding is reported only by its
     rendered config path, exactly like `check-config`.
@@ -309,13 +345,19 @@ def cmd_pre_commit(_args: argparse.Namespace) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
+    try:
+        net = load_model_net(check)
+    except ModelNetError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
     stack_configs = sorted(path for path in staged if _is_pulumi_stack_config(path))
 
     findings: list[tuple[str, str]] = []
     errored = False
     for path in stack_configs:
         try:
-            found = _scan_staged_config(path, check)
+            found = _scan_staged_config(path, check, net)
         except CheckError as exc:
             print(f"error: {exc}", file=sys.stderr)
             errored = True

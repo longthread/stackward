@@ -477,7 +477,7 @@ def test_unanticipated_scan_exception_exits_2_not_1(repo, monkeypatch, capsys):
     write(repo, "Pulumi.dev.yaml", "name: myproject\n")
     stage(repo, "Pulumi.dev.yaml")
 
-    def boom(_path, _check):
+    def boom(_path, _check, _net):
         raise RuntimeError("unanticipated failure, not a CheckError")
 
     monkeypatch.setattr(pre_commit_module, "_scan_staged_config", boom)
