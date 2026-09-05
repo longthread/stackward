@@ -44,6 +44,7 @@ from stackward.commands.set_secrets import (
     _publish_entries,
     parse_env_file,
     parse_project_manifest,
+    resolve_source_files,
     select_project,
     substitute_stack,
 )
@@ -256,6 +257,53 @@ def test_substitute_stack_raises_when_no_stack_was_given():
 
 
 # ---------------------------------------------------------------------------
+# `resolve_source_files`
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_source_files_absent_source_table_is_an_empty_list(tmp_path):
+    assert resolve_source_files(Config(secrets={}), tmp_path, None) == []
+
+
+def test_resolve_source_files_absent_files_key_is_an_empty_list(tmp_path):
+    config = Config(secrets={"source": {}})
+    assert resolve_source_files(config, tmp_path, None) == []
+
+
+def test_resolve_source_files_rejects_a_non_list_files_value(tmp_path):
+    config = Config(secrets={"source": {"files": "not-a-list"}})
+    with pytest.raises(SetSecretsError):
+        resolve_source_files(config, tmp_path, None)
+
+
+def test_resolve_source_files_rejects_a_files_list_of_non_strings(tmp_path):
+    config = Config(secrets={"source": {"files": [1, 2]}})
+    with pytest.raises(SetSecretsError):
+        resolve_source_files(config, tmp_path, None)
+
+
+def test_resolve_source_files_resolves_a_relative_entry_against_repo_root(tmp_path):
+    config = Config(secrets={"source": {"files": [".env"]}})
+    assert resolve_source_files(config, tmp_path, None) == [tmp_path / ".env"]
+
+
+def test_resolve_source_files_leaves_an_absolute_entry_unchanged(tmp_path):
+    absolute = tmp_path / "elsewhere" / ".env"
+    config = Config(secrets={"source": {"files": [str(absolute)]}})
+    # A repo root that is NOT an ancestor of `absolute` -- proves the
+    # absolute entry is not joined onto it at all, not merely that the join
+    # happens to produce the same path by coincidence.
+    unrelated_root = tmp_path / "a-different-repo-root"
+    assert resolve_source_files(config, unrelated_root, None) == [absolute]
+
+
+def test_resolve_source_files_substitutes_stack_per_entry(tmp_path):
+    config = Config(secrets={"source": {"files": [".env.{stack}.local"]}})
+    resolved = resolve_source_files(config, tmp_path, "placeholder-stack")
+    assert resolved == [tmp_path / ".env.placeholder-stack.local"]
+
+
+# ---------------------------------------------------------------------------
 # `_parse_required` -- the one canonical `[required]` shape
 # ---------------------------------------------------------------------------
 
@@ -398,6 +446,19 @@ def test_parse_project_manifest_required_path_in_plaintext_is_accepted():
     }
     manifest = parse_project_manifest(raw, ".")
     assert manifest.required == frozenset({"registry.user"})
+
+
+def test_parse_project_manifest_rejects_a_path_declared_in_both_secret_and_plaintext():
+    """The split between `secret` and `plaintext` *is* the declaration of
+    whether a value is a credential -- a path in both tables is a
+    contradiction in that declaration, and must be refused rather than
+    silently resolved toward the more dangerous (plaintext) reading."""
+    raw = {
+        "secret": {"db.password": "DB_PASSWORD"},
+        "plaintext": {"db.password": "DB_PASSWORD_AGAIN"},
+    }
+    with pytest.raises(SetSecretsError, match="db.password"):
+        parse_project_manifest(raw, ".")
 
 
 def test_parse_project_manifest_secret_value_must_be_a_string():
@@ -574,6 +635,73 @@ def test_no_repo_config_is_a_clean_failure(repo, monkeypatch, capfd):
     err = capfd.readouterr().err
     assert "error:" in err
     assert "Traceback" not in err
+
+
+def test_source_files_are_read_from_disk_through_the_full_manifest_pipeline(
+    repo, monkeypatch, stub_pulumi, tmp_path
+):
+    """`resolve_source_files` is real logic -- default-to-empty, type
+    validation, `{stack}` substitution per entry, repo-root-relative
+    resolution -- and this is the one test that exercises it through the
+    actual manifest-to-disk path, rather than through hand-built
+    `LocalSecretSource` dicts (as `test_full_precedence_chain_across_env_and_
+    two_files` does for the resolver itself). One test closes four gaps at
+    once: two *real* files on disk where the second overrides a name from
+    the first; `--stack` supplied so `{stack}` substitution is exercised as
+    it is actually wired, not just as a standalone function call; a third
+    declared file that is genuinely absent from disk, proving the
+    silent-skip ruling end-to-end; and the result is read off a real child
+    process's stdin, not this module's own belief about what it resolved.
+    """
+    write_repo_config(
+        repo,
+        '[secrets.source]\n'
+        'files = [".env.base", ".env.{stack}.local", ".env.absent"]\n\n'
+        '[secrets."."]\n'
+        'secret = { "db.password" = "DB_PASSWORD" }\n',
+    )
+    (repo / ".env.base").write_text("DB_PASSWORD=from-base-file\n")
+    (repo / ".env.base").chmod(0o600)
+    (repo / ".env.placeholder-stack.local").write_text("DB_PASSWORD=from-stack-local-file\n")
+    (repo / ".env.placeholder-stack.local").chmod(0o600)
+    # ".env.absent" is deliberately never created.
+
+    monkeypatch.chdir(repo)
+    monkeypatch.delenv("DB_PASSWORD", raising=False)
+    fake_pulumi(monkeypatch, stub_pulumi)
+
+    stdin_dump = tmp_path / "stdin.log"
+    monkeypatch.setenv("STUB_DUMP_STDIN_TO", str(stdin_dump))
+
+    assert main(["set-secrets", "--stack", "placeholder-stack"]) == 0
+
+    stdin_content = stdin_dump.read_bytes()
+    assert b"from-stack-local-file" in stdin_content
+    assert b"from-base-file" not in stdin_content
+
+
+def test_an_absolute_source_file_path_is_read_regardless_of_repo_root(
+    repo, monkeypatch, stub_pulumi, tmp_path
+):
+    outside = tmp_path / "outside-the-repo" / ".env"
+    outside.parent.mkdir(parents=True)
+    outside.write_text("DB_PASSWORD=from-an-absolute-path\n")
+    outside.chmod(0o600)
+
+    write_repo_config(
+        repo,
+        f'[secrets.source]\nfiles = ["{outside}"]\n\n'
+        '[secrets."."]\nsecret = { "db.password" = "DB_PASSWORD" }\n',
+    )
+    monkeypatch.chdir(repo)
+    monkeypatch.delenv("DB_PASSWORD", raising=False)
+    fake_pulumi(monkeypatch, stub_pulumi)
+
+    stdin_dump = tmp_path / "stdin.log"
+    monkeypatch.setenv("STUB_DUMP_STDIN_TO", str(stdin_dump))
+
+    assert main(["set-secrets"]) == 0
+    assert b"from-an-absolute-path" in stdin_dump.read_bytes()
 
 
 def test_dry_run_never_invokes_a_subprocess(repo, monkeypatch, capfd):
@@ -817,6 +945,34 @@ def test_a_non_canonical_required_shape_is_rejected_not_silently_ignored(
     assert "paths" in captured.err
 
 
+def test_a_path_declared_in_both_secret_and_plaintext_is_rejected_not_downgraded(
+    repo, monkeypatch, capfd, stub_pulumi
+):
+    """End-to-end version of the overlap check: without it, `_publish_entries`
+    would publish 'db.password' twice -- `--secret` first, `--plaintext`
+    last, with the last write winning -- leaving a value its author declared
+    a credential sitting unencrypted in Pulumi's config. This must fail
+    before either write happens, not merely end up correct by luck of write
+    order."""
+    write_repo_config(
+        repo,
+        '[secrets."."]\n'
+        'secret = { "db.password" = "DB_PASSWORD" }\n'
+        'plaintext = { "db.password" = "DB_PASSWORD_AGAIN" }\n',
+    )
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("DB_PASSWORD", MARKER_DB_PASSWORD)
+    monkeypatch.setenv("DB_PASSWORD_AGAIN", MARKER_DB_PASSWORD)
+    fake_pulumi(monkeypatch, stub_pulumi)
+
+    assert main(["set-secrets"]) == 2
+    captured = capfd.readouterr()
+    assert "summary:" not in captured.out
+    assert "db.password" in captured.err
+    assert MARKER_DB_PASSWORD not in captured.out
+    assert MARKER_DB_PASSWORD not in captured.err
+
+
 def test_a_missing_pulumi_binary_fails_that_entry_and_is_reported(repo, monkeypatch, capfd):
     write_repo_config(
         repo,
@@ -926,6 +1082,17 @@ _AMBIGUOUS_DRIFT_MANIFEST = (
     'managed = "MANAGED_NAME"\n'
 )
 
+# `managed` lives in `plaintext`, not `secret` -- proves the inversion in
+# `_check_drift` covers both publishable tables (Also-fix 3), not just
+# `secret`.
+_PLAINTEXT_MANAGED_DRIFT_MANIFEST = (
+    '[secrets."."]\n'
+    'plaintext = { "managed.path" = "MANAGED_NAME" }\n\n'
+    '[[secrets.".".drift_pairs]]\n'
+    'bootstrap = "BOOTSTRAP_NAME"\n'
+    'managed = "MANAGED_NAME"\n'
+)
+
 
 def test_drift_warns_when_the_values_differ(repo, monkeypatch, capfd, stub_pulumi):
     write_repo_config(repo, _DRIFT_MANIFEST)
@@ -963,6 +1130,33 @@ def test_drift_is_silent_when_the_values_agree(repo, monkeypatch, capfd, stub_pu
     assert "warning" not in captured.err
 
 
+def test_drift_comparison_removes_only_the_clis_own_trailing_newline(
+    repo, monkeypatch, capfd, stub_pulumi
+):
+    """Also-fix 4: a published value that itself legitimately ends in a
+    newline must still compare equal to a local value that also does --
+    `.removesuffix("\\n")` removes exactly the one trailing newline `pulumi
+    config get` itself appends, where `.rstrip("\\n")` would also eat the
+    value's own, firing a spurious warning over a difference that was never
+    real. The stub appends its own trailing newline on top of the value
+    (simulating the CLI), so this only passes if exactly one newline is
+    stripped, not every one."""
+    write_repo_config(repo, _DRIFT_MANIFEST)
+    monkeypatch.chdir(repo)
+    value_ending_in_newline = "value-with-its-own-trailing-newline\n"
+    monkeypatch.setenv("MANAGED_NAME", value_ending_in_newline)
+    monkeypatch.setenv("BOOTSTRAP_NAME", value_ending_in_newline)
+    fake_pulumi(monkeypatch, stub_pulumi)
+    monkeypatch.setenv(
+        "STUB_GET_VALUES", json.dumps({"managed.path": value_ending_in_newline})
+    )
+
+    assert main(["set-secrets"]) == 0
+    captured = capfd.readouterr()
+    assert "drift" not in captured.err
+    assert "warning" not in captured.err
+
+
 def test_drift_is_silent_when_the_published_value_is_unreadable(
     repo, monkeypatch, capfd, stub_pulumi
 ):
@@ -987,6 +1181,29 @@ def test_drift_warns_when_the_managed_name_is_ambiguous(repo, monkeypatch, capfd
     assert main(["set-secrets"]) == 0
     captured = capfd.readouterr()
     assert "MANAGED_NAME" in captured.err
+    assert MARKER_BOOTSTRAP not in captured.err
+
+
+def test_drift_finds_a_managed_name_declared_in_plaintext(repo, monkeypatch, capfd, stub_pulumi):
+    """Also-fix 3: `_check_drift` inverts over `secret ∪ plaintext`, since
+    both are published now (Ruling 1). Before the fix, this exact manifest
+    -- `managed` correctly and unambiguously declared, just under
+    `plaintext` -- would wrongly hit the "does not name exactly one declared
+    secret" branch instead of comparing the values at all."""
+    write_repo_config(repo, _PLAINTEXT_MANAGED_DRIFT_MANIFEST)
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("MANAGED_NAME", "a-plaintext-value")
+    monkeypatch.setenv("BOOTSTRAP_NAME", MARKER_BOOTSTRAP)
+    fake_pulumi(monkeypatch, stub_pulumi)
+    monkeypatch.setenv(
+        "STUB_GET_VALUES", json.dumps({"managed.path": "a-different-published-value"})
+    )
+
+    assert main(["set-secrets"]) == 0
+    captured = capfd.readouterr()
+    assert "does not name exactly one" not in captured.err
+    assert "drift" in captured.err
+    assert "managed.path" in captured.err
     assert MARKER_BOOTSTRAP not in captured.err
 
 

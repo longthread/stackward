@@ -63,16 +63,18 @@ state — not merely "nothing to report".** `[[secrets."<dir>".drift_pairs]]`
 declares a `bootstrap` and a `managed` logical name; the check compares the
 *local* value of `bootstrap` (resolved the same way any other entry is)
 against the *published* value at whichever config path `managed` names in
-`secret` (read with `pulumi config get`, which decrypts — the list form,
-`pulumi config`, renders every secret as `[secret]` without decrypting and
-exits 0 under any passphrase, so it cannot answer this question at all). Three
-states are silent on purpose, not merely "no branch happened to fire": the
-local `bootstrap` value not resolving (nothing to compare against),
-`managed`'s published value not being readable (a timeout, a non-zero exit, a
-missing `pulumi`), and the two values actually agreeing. Only an *unreadable*
-name — `managed` naming zero or more than one declared secret, which is a
-manifest problem rather than a state-of-the-world one — warns, since that one
-is worth a human's attention regardless of what the values turn out to be.
+`secret` **or** `plaintext` (both are published now, per Ruling 1 — the
+inversion is over their disjoint union; see `_check_drift`), read with
+`pulumi config get`, which decrypts — the list form, `pulumi config`, renders
+every secret as `[secret]` without decrypting and exits 0 under any
+passphrase, so it cannot answer this question at all. Three states are
+silent on purpose, not merely "no branch happened to fire": the local
+`bootstrap` value not resolving (nothing to compare against), `managed`'s
+published value not being readable (a timeout, a non-zero exit, a missing
+`pulumi`), and the two values actually agreeing. Only an *unreadable* name —
+`managed` naming zero or more than one published entry, which is a manifest
+problem rather than a state-of-the-world one — warns, since that one is
+worth a human's attention regardless of what the values turn out to be.
 """
 
 from __future__ import annotations
@@ -139,8 +141,10 @@ class ProjectManifest:
     on: `secret` and `plaintext` (each config path -> logical name; both are
     published, see the module docstring), `required` (a subset of `secret`'s
     and `plaintext`'s paths that must resolve), and `drift_pairs`.
-    `unmanaged` is read by `config.py`'s shape check and never reaches this
-    dataclass at all — it is documentation-only, by design.
+    `unmanaged` is never parsed by this module at all — `config.py` validates
+    only that the *project* table itself is a table and defers every key
+    inside it, `unmanaged` included, to here; this module simply chooses not
+    to look at it, since it is documentation-only, by design.
     """
 
     secret: dict[str, str] = field(default_factory=dict)
@@ -304,6 +308,22 @@ def parse_project_manifest(raw: dict[str, Any], project: str) -> ProjectManifest
                 raise SetSecretsError(
                     f"secrets.{project!r}.{table_name}: invalid config path {path!r}: {exc}"
                 ) from exc
+
+    # The split between `secret` and `plaintext` *is* the declaration of
+    # whether a value is a credential (see the module docstring) -- a path in
+    # both tables is a contradiction in that declaration, not a preference to
+    # resolve one way or the other. Left unchecked, `_publish_entries`
+    # publishes `secret` first and `plaintext` second, so the `--plaintext`
+    # write would win and a value its author explicitly declared a
+    # credential would end up unencrypted in Pulumi's config -- silently, in
+    # the more dangerous direction. Refused here instead, at load time,
+    # naming the offending path.
+    overlap = set(secret) & set(plaintext)
+    if overlap:
+        raise SetSecretsError(
+            f"secrets.{project!r}: {sorted(overlap)[0]!r} is declared under both "
+            "'secret' and 'plaintext' -- a path must be exactly one"
+        )
 
     required = _parse_required(raw.get("required"), f"secrets.{project!r}.required")
     unknown = required - set(secret) - set(plaintext)
@@ -509,10 +529,14 @@ def _pulumi_config_get(
         return None
     if completed.returncode != 0:
         return None
-    # `pulumi config get` terminates its output with a trailing newline;
-    # stripping it is what makes the comparison in `_check_drift` compare the
-    # actual value rather than failing on every equal pair.
-    return completed.stdout.rstrip("\n")
+    # `pulumi config get` terminates its output with exactly one trailing
+    # newline; stripping it is what makes the comparison in `_check_drift`
+    # compare the actual value rather than failing on every equal pair.
+    # `removesuffix`, not `rstrip`, is what "exactly one" requires: `rstrip`
+    # would also eat every newline of a published value that legitimately
+    # ends in one (or more), silently changing what is being compared and
+    # firing a spurious warning over a difference that was never real.
+    return completed.stdout.removesuffix("\n")
 
 
 # ---------------------------------------------------------------------------
@@ -581,11 +605,15 @@ def _publish_entries(
     return outcomes
 
 
-def _config_path_for_name(secret: dict[str, str], name: str) -> str | None:
-    """The one config path in `secret` mapping to `name`, or `None` when zero
-    or more than one do — `managed` in a drift pair must name exactly one
-    declared secret for `pulumi config get` to have anything to read."""
-    matches = [path for path, mapped in secret.items() if mapped == name]
+def _config_path_for_name(entries: dict[str, str], name: str) -> str | None:
+    """The one config path in `entries` mapping to `name`, or `None` when
+    zero or more than one do — `managed` in a drift pair must name exactly
+    one *published* entry for `pulumi config get` to have anything to read.
+    `entries` is `_check_drift`'s merge of `secret` and `plaintext` — both
+    are published now (Ruling 1), so `managed` may legitimately name either
+    one, and inverting only `secret` would wrongly warn on a `managed` name
+    that lives in `plaintext`."""
+    matches = [path for path, mapped in entries.items() if mapped == name]
     return matches[0] if len(matches) == 1 else None
 
 
@@ -604,12 +632,17 @@ def _check_drift(
     invocation, and dry-run's contract is to run nothing at all."""
     if pulumi is None:
         return
+    # `secret` and `plaintext` are guaranteed disjoint by
+    # `parse_project_manifest`, so this merge cannot silently drop or shadow
+    # an entry from either side -- `managed` may name a path in either table,
+    # since both are published (Ruling 1).
+    published = {**manifest.secret, **manifest.plaintext}
     for pair in manifest.drift_pairs:
         bootstrap_value = source.resolve(pair.bootstrap)
         if not bootstrap_value:
             continue
 
-        managed_path = _config_path_for_name(manifest.secret, pair.managed)
+        managed_path = _config_path_for_name(published, pair.managed)
         if managed_path is None:
             print(
                 f"warning: drift pair {pair.bootstrap!r}/{pair.managed!r}: "
