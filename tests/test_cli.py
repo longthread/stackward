@@ -75,3 +75,23 @@ def test_config_home_falls_back_to_dot_config(monkeypatch, tmp_path):
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
     assert config_home() == tmp_path / ".config" / "stackward"
+
+
+def test_check_config_is_registered_and_dispatches(tmp_path):
+    """Wiring only — the rules `check-config` enforces are covered in
+    tests/test_heuristic.py."""
+    clean = tmp_path / "Pulumi.dev.yaml"
+    clean.write_text("name: myproject\n")
+    assert main(["check-config", str(clean)]) == 0
+
+
+def test_doctor_still_works_when_repo_config_is_malformed(tmp_path, monkeypatch, capsys):
+    """`doctor` is the command you run to diagnose a broken
+    `.stackward.toml`, so dispatch must not load it before routing to
+    `doctor` — that would make the one command that reports the problem
+    unable to run at all."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".stackward.toml").write_text("this is not valid toml [[[")
+    monkeypatch.chdir(tmp_path)
+    assert main(["doctor"]) == 0
+    assert str(tmp_path / ".stackward.toml") in capsys.readouterr().out

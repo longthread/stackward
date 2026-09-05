@@ -17,6 +17,7 @@ import sys
 from pathlib import Path
 
 from . import __version__
+from .commands.check_config import cmd_check_config
 from .config import find_repo_config
 
 # Commands that must keep working even when a repo demands a newer stackward
@@ -111,6 +112,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     doctor = sub.add_parser("doctor", help="report resolved configuration and environment")
     doctor.set_defaults(func=cmd_doctor)
+
+    check_config = sub.add_parser(
+        "check-config", help="scan stack config file(s) for a plaintext credential"
+    )
+    check_config.add_argument("files", nargs="+", metavar="FILE")
+    check_config.set_defaults(func=cmd_check_config)
 
     return parser
 
