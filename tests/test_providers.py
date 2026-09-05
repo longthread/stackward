@@ -56,16 +56,27 @@ from stackward.providers.env import EnvCredentialStore, EnvSecretSource
 from stackward.providers.file import FileCredentialStore
 from stackward.store import Profile, StoreError
 
+from leakcheck import assert_no_leak
+
 PASSWORD = "the store password"
 WRONG_PASSWORD = "not the store password"
 
-# Placeholder values only -- see GC4. Distinctive enough that an accidental
-# substring match elsewhere in captured output would be implausible.
-MARKER_KEY = "marker-access-key-1a2b3c4d"
-MARKER_SECRET = "marker-secret-key-5e6f7a8b"
-MARKER_PASSPHRASE = "marker-passphrase-9c0d1e2f"
-MARKER_DB_PASSWORD = "marker-db-password-1a2b3c4d"
-MARKER_API_TOKEN = "marker-api-token-5e6f7a8b"
+# Placeholder values only -- see GC4.
+#
+# Opaque rather than descriptive, and deliberately so: the absence assertions
+# below go through `leakcheck.assert_no_leak`, which fails on any
+# eight-character run of the value as well as on the whole string. A marker
+# spelled `marker-db-password-...` shares the run `password` with the config
+# path `db.password` that the same output legitimately prints, so the check
+# would fire on output disclosing nothing -- and a leak check that cries wolf
+# is a leak check that gets deleted. No two of these share an eight-character
+# run with each other either. `tests/test_set_secrets.py` carries the same
+# constraint for the same reason.
+MARKER_KEY = "kp2v9s-4x7b1m6e-8t3j5c0z"
+MARKER_SECRET = "vn6h3q-9d1f8k4r-2y7l5w0a"
+MARKER_PASSPHRASE = "bz4j8t-6m2c9p1s-5g7v3n0k"
+MARKER_DB_PASSWORD = "rf6t2y-8w4q1n7v-3m5k9b0x"
+MARKER_API_TOKEN = "sl8g4d-1c7z5j2p-6h3n0r9e"
 
 # The one backend URL every profile in the three-provider contract test
 # carries. Named so the contract assertion can be anchored to it rather than
@@ -432,7 +443,7 @@ def test_command_secret_source_never_prints_the_resolved_value(monkeypatch, remo
     monkeypatch.setenv("STUB_VALUES", json.dumps({"DB_PASSWORD": MARKER_DB_PASSWORD}))
     provider = CommandSecretSource(remote_command(remote_stub))
     provider.resolve("DB_PASSWORD")
-    assert MARKER_DB_PASSWORD not in capfd.readouterr().out
+    assert_no_leak(capfd.readouterr().out, MARKER_DB_PASSWORD, what="the fetched value")
 
 
 def test_command_credential_store_parses_a_json_object_from_stdout(monkeypatch, remote_stub):
@@ -776,9 +787,13 @@ def test_dotenv_and_a_fake_remote_produce_identical_dry_run_outcomes(
     assert dotenv_output == command_output
     assert "would set" in dotenv_output
     assert "skip" in dotenv_output
+    # `assert_no_leak`, not `not in`: a dry run that helpfully printed the
+    # first few characters of what it would set -- so an operator could
+    # confirm it was the right value -- passes a whole-string check while
+    # disclosing the credential.
     for marker in (MARKER_DB_PASSWORD, MARKER_API_TOKEN):
-        assert marker not in dotenv_output
-        assert marker not in command_output
+        assert_no_leak(dotenv_output, marker, what="the resolved value")
+        assert_no_leak(command_output, marker, what="the resolved value")
 
 
 def test_dotenv_and_a_fake_remote_produce_identical_pulumi_invocations(
