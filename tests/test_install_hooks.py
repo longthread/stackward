@@ -33,13 +33,27 @@ def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
 
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
-    """A real, minimal git repository with one initial commit."""
+    """A real, minimal git repository with one initial commit that declares
+    a `.stackward.toml`.
+
+    The policy file is committed rather than merely written because
+    `pre-commit` -- which the end-to-end tests here drive through a real
+    `git commit` -- now reads its policy from the index and refuses a
+    repository that declares none (Global Constraint 3: "A missing policy
+    file is a refusal, not a skip"). Without it, the commit-blocking tests
+    below would still see a non-zero exit, but for the wrong reason, and the
+    clean-commit test would fail outright. `hooks install` itself reads no
+    policy, so the tests that only assert on installation are unaffected
+    either way.
+    """
     path = tmp_path / "repo"
     path.mkdir()
     _git(path, "init", "-q")
     _git(path, "config", "user.email", "test@example.com")
     _git(path, "config", "user.name", "Test")
-    _git(path, "commit", "-q", "--allow-empty", "-m", "init")
+    (path / ".stackward.toml").write_text('[check]\nmodel_net = "none"\n')
+    _git(path, "add", ".stackward.toml")
+    _git(path, "commit", "-q", "-m", "init")
     return path
 
 

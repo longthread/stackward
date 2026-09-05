@@ -49,7 +49,7 @@ def test_clean_config_has_no_findings():
     document = {
         "name": "myproject",
         "runtime": "nodejs",
-        "config": {"aws:region": "us-east-1"},
+        "config": {"placeholder:region": "placeholder-region"},
     }
     assert find_plaintext_credentials(document, CheckConfig()) == []
 
@@ -66,16 +66,16 @@ def test_plaintext_value_flagged_by_key_match():
 def test_plaintext_value_flagged_by_sensitive_parent():
     """The leaf's own key ("DB_USER") matches no built-in sensitive key —
     only a declared `sensitive_parents` ancestor makes it a finding."""
-    check = CheckConfig(sensitive_parents=frozenset({"environment_variables"}))
-    document = {"environment_variables": {"DB_USER": "admin"}}
-    assert find_plaintext_credentials(document, check) == ["environment_variables.DB_USER"]
+    check = CheckConfig(sensitive_parents=frozenset({"placeholder_parent"}))
+    document = {"placeholder_parent": {"DB_USER": "admin"}}
+    assert find_plaintext_credentials(document, check) == ["placeholder_parent.DB_USER"]
 
 
 def test_encrypted_leaf_passes():
     """A leaf made sensitive only by its `sensitive_parents` ancestor, whose
     parent mapping is exactly `{"secure": ...}`, must not be flagged."""
-    check = CheckConfig(sensitive_parents=frozenset({"environment_variables"}))
-    document = {"environment_variables": {"DB_PASS": {"secure": "v1:AAAA"}}}
+    check = CheckConfig(sensitive_parents=frozenset({"placeholder_parent"}))
+    document = {"placeholder_parent": {"DB_PASS": {"secure": "v1:AAAA"}}}
     assert find_plaintext_credentials(document, check) == []
 
 
@@ -84,16 +84,16 @@ def test_malformed_secure_wrapper_with_extra_sibling_is_flagged():
     both children must be flagged. A `path.endswith(".secure")` check would
     wrongly exclude the first of the two; asserting it is present is the
     point of this test."""
-    check = CheckConfig(sensitive_parents=frozenset({"environment_variables"}))
+    check = CheckConfig(sensitive_parents=frozenset({"placeholder_parent"}))
     document = {
-        "environment_variables": {
+        "placeholder_parent": {
             "DB_PASS": {"secure": "v1:AAAA", "other": "leaked-plaintext"}
         }
     }
     findings = find_plaintext_credentials(document, check)
     assert findings == [
-        "environment_variables.DB_PASS.other",
-        "environment_variables.DB_PASS.secure",
+        "placeholder_parent.DB_PASS.other",
+        "placeholder_parent.DB_PASS.secure",
     ]
 
 
@@ -307,6 +307,25 @@ def write_yaml(tmp_path, name: str, text: str):
     return path
 
 
+@pytest.fixture
+def policy_repo(tmp_path, monkeypatch):
+    """`tmp_path` set up as a repository root that declares a policy, with
+    the process's working directory inside it.
+
+    Every `check-config` invocation below needs one. A repository with no
+    `.stackward.toml` is now refused outright (Global Constraint 3: "A
+    missing policy file is a refusal, not a skip"), so without this fixture
+    the exit-0 and exit-1 tests here would fail and — worse — every exit-2
+    test would pass for the wrong reason, never reaching the condition it
+    names. Returns `tmp_path` unchanged, so each test's own `write_yaml`
+    call still builds its fixture file where it always did.
+    """
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".stackward.toml").write_text('[check]\nmodel_net = "none"\n')
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
 def test_scan_file_returns_no_findings_for_a_clean_file(tmp_path):
     path = write_yaml(tmp_path, "Pulumi.dev.yaml", "name: myproject\nruntime: nodejs\n")
     assert scan_file(path, CheckConfig(), None) == []
@@ -446,13 +465,13 @@ def test_scan_file_raises_check_error_on_missing_file(tmp_path):
         scan_file(tmp_path / "does-not-exist.yaml", CheckConfig(), None)
 
 
-def test_check_config_exits_0_when_clean(tmp_path, capsys):
+def test_check_config_exits_0_when_clean(policy_repo, tmp_path, capsys):
     path = write_yaml(tmp_path, "Pulumi.dev.yaml", "name: myproject\nruntime: nodejs\n")
     assert main(["check-config", str(path)]) == 0
     assert capsys.readouterr().out == ""
 
 
-def test_check_config_exits_1_and_prints_the_finding_format(tmp_path, capsys):
+def test_check_config_exits_1_and_prints_the_finding_format(policy_repo, tmp_path, capsys):
     path = write_yaml(
         tmp_path, "Pulumi.dev.yaml", "config:\n  myproject:dbPassword: hunter2\n"
     )
@@ -462,7 +481,7 @@ def test_check_config_exits_1_and_prints_the_finding_format(tmp_path, capsys):
     assert "hunter2" not in out
 
 
-def test_check_config_findings_print_sorted(tmp_path, capsys):
+def test_check_config_findings_print_sorted(policy_repo, tmp_path, capsys):
     """Insertion order in the file is zebra-then-apple; output must be
     sorted regardless."""
     path = write_yaml(
@@ -478,13 +497,13 @@ def test_check_config_findings_print_sorted(tmp_path, capsys):
     ]
 
 
-def test_check_config_exits_2_on_invalid_yaml(tmp_path, capsys):
+def test_check_config_exits_2_on_invalid_yaml(policy_repo, tmp_path, capsys):
     path = write_yaml(tmp_path, "Pulumi.dev.yaml", "key: [unclosed\n")
     assert main(["check-config", str(path)]) == 2
     assert capsys.readouterr().out == ""
 
 
-def test_check_config_exits_2_on_non_mapping_document(tmp_path):
+def test_check_config_exits_2_on_non_mapping_document(policy_repo, tmp_path):
     path = write_yaml(tmp_path, "Pulumi.dev.yaml", "- a\n- b\n")
     assert main(["check-config", str(path)]) == 2
 
@@ -497,7 +516,7 @@ def test_check_config_exits_2_with_no_files_given():
     assert exit_info.value.code == 2
 
 
-def test_check_config_exits_2_on_non_utf8_file(tmp_path, capsys):
+def test_check_config_exits_2_on_non_utf8_file(policy_repo, tmp_path, capsys):
     """`Path.read_text()` raises `UnicodeDecodeError` for a file that is
     not valid UTF-8 — not an `OSError`, and previously uncaught, which
     would exit 1 (Python's default for an uncaught exception): the code
@@ -509,7 +528,7 @@ def test_check_config_exits_2_on_non_utf8_file(tmp_path, capsys):
     assert capsys.readouterr().out == ""
 
 
-def test_check_config_exits_2_on_unanticipated_scan_error(tmp_path, monkeypatch, capsys):
+def test_check_config_exits_2_on_unanticipated_scan_error(policy_repo, tmp_path, monkeypatch, capsys):
     """Any exception a per-file scan raises other than `CheckError` must
     still map to exit 2, not propagate and exit 1 (Python's default for an
     uncaught exception) — regardless of what raised it. Simulated here
@@ -518,7 +537,7 @@ def test_check_config_exits_2_on_unanticipated_scan_error(tmp_path, monkeypatch,
     non-UTF8 regressions covered elsewhere."""
     path = write_yaml(tmp_path, "Pulumi.dev.yaml", "name: myproject\n")
 
-    def boom(_path, _check):
+    def boom(_path, _check, _net):
         raise RuntimeError("unanticipated failure, not a CheckError")
 
     monkeypatch.setattr("stackward.commands.check_config.scan_file", boom)
@@ -527,7 +546,7 @@ def test_check_config_exits_2_on_unanticipated_scan_error(tmp_path, monkeypatch,
 
 
 def test_check_config_exits_2_when_policy_loading_raises_an_unexpected_error(
-    tmp_path, monkeypatch, capsys
+    policy_repo, tmp_path, monkeypatch, capsys
 ):
     """A bare exception from policy loading -- not `ConfigError`, which
     `cmd_check_config`'s own `except ConfigError` already handles -- must
@@ -552,7 +571,7 @@ def test_check_config_exits_2_when_policy_loading_raises_an_unexpected_error(
 
 
 def test_check_config_prints_a_real_finding_even_when_another_file_errors(
-    tmp_path, capsys
+    policy_repo, tmp_path, capsys
 ):
     """A parse error on one file must never hide a genuine finding on
     another: the exit code (2, since a check-could-not-run error always
@@ -562,3 +581,91 @@ def test_check_config_prints_a_real_finding_even_when_another_file_errors(
     assert main(["check-config", str(good), str(broken)]) == 2
     out = capsys.readouterr().out
     assert out == f"{good}: plaintext credential at 'password'\n"
+
+
+# ---------------------------------------------------------------------------
+# A missing or unloadable policy file is a refusal, not a skip.
+#
+# Global Constraint 3: "A missing policy file is a refusal, not a skip." The
+# plan's Task 3 adds the reason it has to be: heuristic-only is a *declared*
+# mode (`model_net = "none"`), never a silent fallback — and an absent config
+# defaulting to `CheckConfig()` is precisely that fallback, since `"none"` is
+# what `CheckConfig()` carries.
+# ---------------------------------------------------------------------------
+
+
+def test_check_config_refuses_when_no_policy_file_is_found(tmp_path, monkeypatch, capsys):
+    """No `.stackward.toml` anywhere at or above the working directory. Exit
+    2, naming the file and the key that has to be in it — a refusal that
+    does not say what to create is not actionable."""
+    (tmp_path / ".git").mkdir()
+    monkeypatch.chdir(tmp_path)
+    path = write_yaml(tmp_path, "Pulumi.dev.yaml", "name: myproject\n")
+
+    assert main(["check-config", str(path)]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert ".stackward.toml" in captured.err
+    assert "model_net" in captured.err
+
+
+def test_check_config_refuses_rather_than_reporting_when_there_is_no_policy(
+    tmp_path, monkeypatch, capsys
+):
+    """Exit 2, not 1, even for a file the heuristic net alone would have
+    flagged. Without a policy this command does not know what the repository
+    considers sensitive, and exit 1 would claim a complete answer it does
+    not have — the same reasoning that makes a stale model net exit 2."""
+    (tmp_path / ".git").mkdir()
+    monkeypatch.chdir(tmp_path)
+    path = write_yaml(
+        tmp_path, "Pulumi.dev.yaml", "config:\n  myproject:dbPassword: hunter2\n"
+    )
+
+    assert main(["check-config", str(path)]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "hunter2" not in captured.err
+
+
+def test_check_config_exits_2_on_a_policy_file_that_will_not_parse(
+    tmp_path, monkeypatch, capsys
+):
+    """The `except ConfigError` branch in `cmd_check_config`. Nothing pinned
+    it: mutating its `return 2` to `return 0` survived the whole suite, so a
+    repository with a typo in its policy could be reported clean."""
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".stackward.toml").write_text("this is not valid toml [[[")
+    monkeypatch.chdir(tmp_path)
+    path = write_yaml(
+        tmp_path, "Pulumi.dev.yaml", "config:\n  myproject:dbPassword: hunter2\n"
+    )
+
+    assert main(["check-config", str(path)]) == 2
+    captured = capsys.readouterr()
+    # Not scanned at all: the finding must not print, or the exit code and
+    # the output would be telling two different stories.
+    assert captured.out == ""
+    assert "invalid TOML" in captured.err
+
+
+def test_check_config_reads_the_policy_from_the_working_tree_by_design(
+    tmp_path, monkeypatch, capsys
+):
+    """The deliberate asymmetry with `pre-commit`, pinned so a later change
+    cannot "fix" it into matching. `check-config` scans files from disk and
+    reads its policy from disk, and needs no git repository at all: it
+    answers "is this file clean right now?", which is a question about the
+    working tree. `pre-commit` answers "is what I am about to commit
+    clean?", and reads both from the index — see tests/test_pre_commit.py.
+    """
+    (tmp_path / ".stackward.toml").write_text(
+        '[check]\nmodel_net = "none"\nallowed_references = ["password"]\n'
+    )
+    monkeypatch.chdir(tmp_path)
+    path = write_yaml(tmp_path, "Pulumi.dev.yaml", 'password: "hunter2"\n')
+
+    # No `git init`, nothing staged: the policy still applies.
+    assert not (tmp_path / ".git").exists()
+    assert main(["check-config", str(path)]) == 0
+    assert capsys.readouterr().out == ""

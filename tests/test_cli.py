@@ -77,9 +77,19 @@ def test_config_home_falls_back_to_dot_config(monkeypatch, tmp_path):
     assert config_home() == tmp_path / ".config" / "stackward"
 
 
-def test_check_config_is_registered_and_dispatches(tmp_path):
+def test_check_config_is_registered_and_dispatches(tmp_path, monkeypatch):
     """Wiring only — the rules `check-config` enforces are covered in
-    tests/test_heuristic.py."""
+    tests/test_heuristic.py.
+
+    The `.stackward.toml` and the `chdir` are what make this a dispatch
+    test rather than a policy test: a repository that declares no policy is
+    now refused with exit 2 before any file is opened, so without them this
+    would assert the wrong exit code for a reason that has nothing to do
+    with whether the subcommand is registered.
+    """
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".stackward.toml").write_text('[check]\nmodel_net = "none"\n')
+    monkeypatch.chdir(tmp_path)
     clean = tmp_path / "Pulumi.dev.yaml"
     clean.write_text("name: myproject\n")
     assert main(["check-config", str(clean)]) == 0

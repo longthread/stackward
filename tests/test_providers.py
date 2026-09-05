@@ -688,58 +688,16 @@ def test_exec_reports_a_failing_command_credential_store_rather_than_running_wit
 # ---------------------------------------------------------------------------
 
 
-def test_the_check_config_entry_point_never_loads_a_provider_module():
-    """The brief's own literal requirement: importing `check-config`'s
-    module must never bring in a `stackward.providers*` module. Checked in a
-    subprocess -- this test process has already imported half the tool via
-    other test modules in the same session, so asserting against its own
-    `sys.modules` would prove nothing. Enumerated by prefix, not a fixed
-    tuple, so a provider module added later is covered without editing this
-    test.
-    """
-    proc = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import sys; "
-            "import stackward.commands.check_config; "
-            "import stackward.commands.pre_commit; "
-            "print(sorted(m for m in sys.modules if m == 'stackward.providers' "
-            "or m.startswith('stackward.providers.')))",
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    assert proc.stdout.strip() == "[]"
-
-
-def test_running_check_config_through_the_real_cli_never_loads_a_provider_module(tmp_path):
-    """The stronger form: `cli.py` imports `commands.session` and
-    `commands.set_secrets` at its own module scope, unconditionally, so a
-    module-scope provider import in *either* of those (rather than the
-    function-local imports this task actually uses) would make a plain
-    `stackward check-config` reach provider code even though the weaker,
-    literal test above stays green. This runs the real dispatch path
-    (`cli.main`) a `git commit` actually takes, not just a bare module
-    import, so it would catch that regression where the weaker form cannot.
-    """
-    target = tmp_path / "config.yaml"
-    target.write_text("key: value\n")
-    proc = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import sys; from stackward.cli import main; "
-            f"main(['check-config', {str(target)!r}]); "
-            "print(sorted(m for m in sys.modules if m == 'stackward.providers' "
-            "or m.startswith('stackward.providers.')))",
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    assert proc.stdout.strip().splitlines()[-1] == "[]"
+# The two tests that used to live here -- "importing `check-config`'s module
+# loads no `stackward.providers*`" and its stronger form through `cli.main`
+# -- are now one test in `tests/test_gate_isolation.py`. Splitting the
+# property in two is what hid the real defect: this file went through
+# `cli.main` but grepped only for `stackward.providers*`, while
+# `tests/test_model_net.py` looked for `cryptography` and `stackward.store`
+# but imported the command modules directly, bypassing `cli.py` -- which was
+# where `cryptography` was reaching the gate path all along. One assertion
+# over the union of every forbidden module, taken through the real dispatch
+# path, is the only shape that could have caught it.
 
 
 # ---------------------------------------------------------------------------

@@ -3,8 +3,9 @@
 Registered in `cli.build_parser` as `stackward check-config FILE...`. Exit
 codes are deliberately distinct: 0 clean, 1 a credential was found, 2 the
 check could not run at all (an unreadable path, unparsable YAML, a
-`.stackward.toml` this module could not load, a document that is not a
-mapping, or a model-net artifact that is missing, malformed or stale) —
+`.stackward.toml` this module could not load *or could not find*, a document
+that is not a mapping, or a model-net artifact that is missing, malformed or
+stale) —
 never conflated, so a fail-closed refusal reads the same way whichever check
 made it: "the gate did not get to answer".
 
@@ -14,6 +15,25 @@ the repository *declared*, by walking a committed graph of its own pydantic
 models against the document. A leaf either net names is a finding, and a leaf
 both name is reported once — `scan_file` unions the two through a set, so a
 path found twice does not print twice.
+
+**A missing `.stackward.toml` is exit 2, not a scan under defaults.** Global
+Constraint 3 states it directly: "A missing policy file is a refusal, not a
+skip." `CheckConfig()`'s own defaults carry `model_net = "none"`, so
+defaulting on absence would turn the *declared* heuristic-only mode into a
+silent fallback — the exact shape of "passed because a check could not run"
+that fail-closed exists to prevent. Both gate commands refuse instead, and
+name the minimal file to create.
+
+**This command reads the working tree; `pre-commit` reads the index.** That
+asymmetry is deliberate and is not the bug it looks like. `check-config`
+takes file paths on the command line and scans them from disk, so its policy
+has to come from disk too: a policy read out of the index would describe a
+commit the caller may not be making, and would make `check-config` unable to
+answer "is the file I am looking at right now clean?" — which is the whole
+question it exists to answer, most often on a file that is not staged at all.
+`pre-commit` answers a different question ("is what I am about to commit
+clean?") and so reads both content *and* policy from the index; see
+`pre_commit._load_check_policy` for why anything else there fails open.
 
 **A stale model net is exit 2, not exit 1.** `load_model_net` raises rather
 than returning an empty net when the artifact is missing, unreadable or no
@@ -35,7 +55,13 @@ from pathlib import Path
 
 import yaml
 
-from ..config import CheckConfig, ConfigError, find_repo_config, load_config
+from ..config import (
+    CONFIG_FILENAME,
+    CheckConfig,
+    ConfigError,
+    find_repo_config,
+    load_config,
+)
 from ..nets.heuristic import DocumentError, find_plaintext_credentials
 from ..nets.model import (
     ModelNet,
@@ -54,6 +80,17 @@ from ..nets.model import (
 _QUOTED_FRAGMENT = re.compile(r"'[^']*'|\"[^\"]*\"")
 
 
+# The minimal policy file both gate commands name when there is none. An
+# explicit `model_net` is part of the minimum on purpose: it is the one key
+# whose default ("none") silently drops a whole net, so a repository has to
+# have chosen it rather than inherited it.
+MINIMAL_POLICY = '[check]\nmodel_net = "none"'
+
+_MINIMAL_POLICY_BLOCK = "\n".join(
+    f"    {line}" for line in MINIMAL_POLICY.splitlines()
+)
+
+
 class CheckError(Exception):
     """A file could not be checked at all: an unreadable path, unparsable
     YAML, or a document that is not a mapping. Maps to exit code 2, never
@@ -64,6 +101,39 @@ class CheckError(Exception):
     non-mapping document, an unmerged index entry, a git command that
     failed) — one exception type for one meaning, not a second class that
     would have to be kept consistent with this one by hand."""
+
+
+class MissingPolicyError(CheckError):
+    """The repository declares no `.stackward.toml` at all.
+
+    A subclass of `CheckError` because it means exactly what `CheckError`
+    means — the check could not run, exit 2 — while still being
+    distinguishable from "this file would not parse" for a caller that wants
+    to say something more useful. Deliberately *not* a `config.ConfigError`:
+    that type's own contract is "present but unusable", and `config` reports
+    absence by returning `None` rather than raising, because `doctor` has to
+    keep working in a repository that has no policy yet.
+    """
+
+
+def missing_policy_message(*, where: str, remedy: str) -> str:
+    """The refusal text for a missing policy file, in one place.
+
+    Both gate commands print it, and they must not drift: they differ only
+    in where they looked (`where`) and what closes the gap (`remedy`). The
+    shape follows `sync_declared._load_repo_config`, the precedent already
+    in the tree for "absence is a refusal here" — say what is missing, say
+    why this command cannot proceed without it, and name the file to create.
+    """
+    return (
+        f"no {CONFIG_FILENAME} {where}; a repository must declare its "
+        "credential policy before this gate will scan under one — defaulting "
+        "would make the weaker net a silent fallback rather than a declared "
+        f"mode.\ncreate {CONFIG_FILENAME} at the repository root with at "
+        f"least:\n\n{_MINIMAL_POLICY_BLOCK}\n\n"
+        '(use model_net = "artifact" instead to also run the declared-secrets '
+        f"net)\n{remedy}"
+    )
 
 
 def fail_closed(
@@ -122,8 +192,9 @@ def scan_file(path: Path, check: CheckConfig, net: ModelNet | None) -> list[str]
     than going through this wrapper, and never round-trips a blob through a
     temp file to get there.
 
-    `net` is `None` when the repository declares `model_net = "none"`, or
-    has no `[check]` policy at all; the heuristic net always runs. It has no
+    `net` is `None` when the repository declares `model_net = "none"`; the
+    heuristic net always runs, and a repository that declared no policy at
+    all never reaches here (it is refused). It has no
     default, deliberately: a caller that simply forgot it would silently get
     the heuristic net alone, which is the whole failure this parameter
     exists to prevent. `pre_commit._scan_staged_config` takes it the same
@@ -209,12 +280,43 @@ def describe_yaml_error(exc: yaml.YAMLError) -> str:
 
 def _load_check_policy() -> CheckConfig:
     """The `[check]` policy for the repository containing the current
-    working directory, or the built-in defaults when there is none —
-    absence is a normal state (see `config.py`), not an error."""
+    working directory, read from the **working tree**.
+
+    Working-tree by design, not by oversight — see the module docstring.
+    This is the one deliberate difference from `pre_commit`'s helper of the
+    same name, which reads the identical file out of the git index; a reader
+    comparing the two should see two answers to two different questions, not
+    a copy that was missed.
+
+    Absence is a refusal (`MissingPolicyError`), never the built-in
+    defaults: `CheckConfig()` carries `model_net = "none"`, so returning it
+    here would silently drop the stronger net in exactly the repositories
+    that had not yet said anything about it.
+    """
     config_path = find_repo_config()
     if config_path is None:
-        return CheckConfig()
+        raise MissingPolicyError(
+            missing_policy_message(
+                where="found at or above the current directory",
+                remedy=(
+                    "then re-run this command from inside the repository "
+                    "it belongs to."
+                ),
+            )
+        )
     return load_config(config_path).check
+
+
+# TODO(final-review): `hooks install` should refuse, or at least warn, when
+# the repository has no `.stackward.toml` — a repo that installs the hook
+# before writing a policy now discovers that at someone's first blocked
+# commit rather than at install time. The change belongs in
+# `commands.install_hooks.cmd_install_hooks` (not owned by this wave): after
+# the hook is written, call `config.find_repo_config()` and, on `None`,
+# print a warning naming the minimal file (`check_config.MINIMAL_POLICY`).
+# A warning rather than a refusal, because installing the hook first and
+# writing the policy second is a legitimate order to do things in, and
+# `install_hooks` exits 1/2 only for reasons that make the *install* wrong.
 
 
 @fail_closed
@@ -241,11 +343,14 @@ def cmd_check_config(args: argparse.Namespace) -> int:
     unanticipated exception's text is not something this module can vouch
     for as free of file content.
 
-    That per-file guard only covers the scan loop. Anything policy-loading
-    raises other than `ConfigError` — this function's own `except
-    ConfigError` below only catches that one type — is caught instead by
-    the `@fail_closed` decorator wrapping this function, for the same
-    "never exit 1 for a reason other than a real finding" guarantee.
+    That per-file guard only covers the scan loop. Policy loading is
+    guarded separately: `ConfigError` (a `.stackward.toml` that will not
+    parse) and `CheckError` (via `MissingPolicyError`, no `.stackward.toml`
+    at all) both print and exit 2 before any file is opened, and anything
+    *else* it raises is caught by the `@fail_closed` decorator wrapping this
+    function, for the same "never exit 1 for a reason other than a real
+    finding" guarantee. Nothing scans under default policy: a repository
+    with no declared policy is refused, not scanned with the weaker net.
 
     The model net is loaded once, before the loop, and a failure to load it
     exits 2 without scanning anything. That ordering is the point: a stale
@@ -255,7 +360,7 @@ def cmd_check_config(args: argparse.Namespace) -> int:
     """
     try:
         check = _load_check_policy()
-    except ConfigError as exc:
+    except (ConfigError, CheckError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

@@ -16,6 +16,20 @@ that means for the command at hand) and **present but invalid**
 invalid file quietly falls back to defaults — a typo that silently disabled
 part of a credential gate would be worse than one that refused to run at
 all.
+
+What the gate commands decide for the absent case is: refuse. `check-config`
+and `pre-commit` both exit 2 naming the minimal file to create, because
+`CheckConfig()`'s own defaults include `model_net = "none"`, and defaulting
+to that would make the weaker of the two nets a *silent fallback* rather
+than the declared mode it is meant to be. This module still reports absence
+rather than raising, because `cli.cmd_doctor` genuinely needs to run in a
+repository that has no policy yet — reporting that fact is most of what it
+is for.
+
+**Reading and parsing are separate.** `load_config_text` validates text;
+`load_config` is the thin file reader in front of it. `commands.pre_commit`
+needs the second half without the first, because its policy comes out of the
+git index rather than the working tree.
 """
 
 from __future__ import annotations
@@ -51,12 +65,12 @@ BUILTIN_SENSITIVE_KEYS: frozenset[str] = frozenset(
 
 # No parent key is sensitive by default. Unlike `sensitive_keys` above, this
 # tool ships no built-in guess at what a "sensitive parent" category is
-# called in any particular repository's config shape — inventing one (e.g.
-# copying a name like "environment_variables" out of somebody's existing
-# gate script) would be exactly the kind of environment-specific knowledge
-# this module exists to keep out of a public, generic tool. A repo that
-# wants whole categories of keys flagged declares `sensitive_parents`
-# itself, which then REPLACES this (empty) default outright.
+# called in any particular repository's config shape: any non-empty default
+# would be a guess about someone's config shape, which is exactly the kind of
+# environment-specific knowledge this module exists to keep out of a public,
+# generic tool. A repo that wants whole categories of keys flagged declares
+# `sensitive_parents` itself, which then REPLACES this (empty) default
+# outright.
 BUILTIN_SENSITIVE_PARENTS: frozenset[str] = frozenset()
 
 _MODEL_NET_VALUES = frozenset({"artifact", "none"})
@@ -318,8 +332,24 @@ def _build_config(data: dict[str, Any]) -> Config:
     )
 
 
-def load_config(path: Path) -> Config:
-    """Parse and validate `path` as `.stackward.toml`.
+def load_config_text(text: str, origin: str) -> Config:
+    """Parse and validate `text` as `.stackward.toml` content.
+
+    Parsing is separated from reading a file on purpose, and this is the
+    seam that makes it so. `commands.pre_commit` must load the policy the
+    *index* holds -- `git show ":.stackward.toml"` -- because a policy read
+    from the working tree could relax the gate for a commit that does not
+    itself carry the relaxation. Having only a path-taking loader forced
+    that command to read the working tree, which was a fail-open: the
+    content it scanned came from the index while the rules it scanned under
+    came from wherever the developer had most recently typed. There is no
+    round-trip through a temporary file here either, for the same reason
+    `pre_commit` never writes a staged blob to disk.
+
+    `origin` is what the raised `ConfigError` names, so a caller can label
+    where the text came from in the terms a person would use to reproduce
+    it: a filesystem path for `load_config`, and `":.stackward.toml"` -- the
+    literal argument to `git show` -- for the index.
 
     Raises `ConfigError` naming the offending key on anything invalid: an
     unknown key at any recognised level, a value of the wrong type, or an
@@ -327,20 +357,35 @@ def load_config(path: Path) -> Config:
     fails to validate must not be treated as though it did not exist.
     """
     try:
-        with path.open("rb") as handle:
-            data = tomllib.load(handle)
-    except OSError as exc:
-        raise ConfigError(f"{path}: cannot read: {exc}") from exc
+        data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
         # `.stackward.toml` holds path and key *names* only, never a
         # credential value, so it is safe for this message to include
         # whatever tomllib quotes from the offending line.
-        raise ConfigError(f"{path}: invalid TOML: {exc}") from exc
+        raise ConfigError(f"{origin}: invalid TOML: {exc}") from exc
 
     try:
         return _build_config(data)
     except ConfigError as exc:
-        raise ConfigError(f"{path}: {exc}") from exc
+        raise ConfigError(f"{origin}: {exc}") from exc
+
+
+def load_config(path: Path) -> Config:
+    """Parse and validate the file at `path` as `.stackward.toml`.
+
+    A thin reader in front of `load_config_text`, which does all the
+    validation; see there for what is raised and why the two are separate.
+    An unreadable file and one that is not UTF-8 are both `ConfigError`,
+    never a silent fall back to defaults: TOML is defined as UTF-8, so bytes
+    that are not are a broken config file, not an absent one.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ConfigError(f"{path}: cannot read: {exc}") from exc
+    except UnicodeDecodeError as exc:
+        raise ConfigError(f"{path}: cannot read: not valid UTF-8: {exc}") from exc
+    return load_config_text(text, str(path))
 
 
 def enforce_min_version(
@@ -351,12 +396,21 @@ def enforce_min_version(
 ) -> None:
     """Raise `MinVersionError` when `installed` is older than `config.min_version`.
 
-    Commands in `cli.VERSION_CHECK_EXEMPT` (`doctor`, `self-update`) always
-    run: blocking either one would make the upgrade instruction this raises
-    unreachable. `cli` is imported locally rather than at module level
-    because `cli` imports `find_repo_config` from this module — importing
-    `cli` here at module scope would make the two modules need each other to
-    finish executing.
+    Called from `cli.main` between argument parsing and dispatch, so the
+    floor applies to every command rather than to whichever ones remembered
+    to ask. Commands in `cli.VERSION_CHECK_EXEMPT` always run: blocking
+    `doctor` would make the upgrade instruction this raises unreachable from
+    the one command that diagnoses the problem.
+
+    The instruction names `install.sh`, the installer this project actually
+    ships, rather than a `stackward self-update` subcommand -- there is no
+    such subcommand, and an error message whose only advice is a command
+    that does not exist is worse than no advice at all.
+
+    `cli` is imported locally rather than at module level because `cli`
+    imports `find_repo_config` from this module — importing `cli` here at
+    module scope would make the two modules need each other to finish
+    executing.
     """
     from .cli import VERSION_CHECK_EXEMPT  # local: breaks an import cycle
 
@@ -367,5 +421,8 @@ def enforce_min_version(
     if _parse_version(installed) < _parse_version(config.min_version):
         raise MinVersionError(
             f"this repository requires stackward >= {config.min_version} "
-            f"(installed: {installed}); upgrade with: stackward self-update"
+            f"(installed: {installed}); upgrade by re-running the installer: "
+            "curl -fsSL "
+            "https://raw.githubusercontent.com/longthread/stackward/main/install.sh"
+            " | sh"
         )

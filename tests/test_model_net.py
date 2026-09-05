@@ -1882,27 +1882,15 @@ def test_neither_scan_entry_point_makes_the_model_net_optional(entry_point):
     assert parameter.default is inspect.Parameter.empty
 
 
-def test_the_gate_path_reaches_no_credential_code():
-    """`check-config` and `pre-commit` must never reach the credential store
-    or `cryptography`, so a commit cannot be blocked by an expired session or
-    a missing native extension. This net added an import to the gate path, so
-    the property is worth asserting rather than assuming — checked in a
-    subprocess, since this test process has imported half the tool already.
-    """
-    proc = subprocess.run(
-        [
-            sys.executable,
-            "-c",
-            "import sys; import stackward.commands.check_config; "
-            "import stackward.commands.pre_commit; "
-            "print(sorted(m for m in ('cryptography', 'stackward.store') "
-            "if m in sys.modules))",
-        ],
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    assert proc.stdout.strip() == "[]"
+# The gate-path invariant this net's own imports could have broken — that
+# `check-config` and `pre-commit` reach no credential-store or `cryptography`
+# code — lives in `tests/test_gate_isolation.py`. It used to live here, and
+# it was checked by importing the two command modules *directly*: that
+# bypassed `cli.py`, which imported `commands.check_passphrase` and
+# `commands.session` at module scope and so pulled `cryptography` and
+# `stackward.store` onto the real gate path with this test still green. The
+# replacement runs `cli.main(["check-config", ...])`, the path a `git commit`
+# actually takes, and asserts the union of every forbidden module.
 
 
 def test_doctor_reports_the_model_walker_as_readable(capsys):

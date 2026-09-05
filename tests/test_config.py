@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import pytest
 
+from stackward import __version__
 from stackward.config import (
     BUILTIN_SENSITIVE_KEYS,
     Config,
@@ -21,6 +22,7 @@ from stackward.config import (
     enforce_min_version,
     find_repo_config,
     load_config,
+    load_config_text,
 )
 
 
@@ -329,7 +331,13 @@ def test_min_version_rejects_a_lower_installed_version():
         enforce_min_version(config, "check-config", installed="0.3.0")
     message = str(exc_info.value)
     assert "0.4.0" in message
-    assert "self-update" in message
+    # The instruction has to name something that exists. `stackward
+    # self-update` does not: `cli.build_parser` registers no such
+    # subcommand, so the one message this feature prints used to end by
+    # telling the reader to run a command that would exit 2 as a usage
+    # error. `install.sh` is the upgrade path this project actually ships.
+    assert "install.sh" in message
+    assert "self-update" not in message
 
 
 def test_min_version_compares_numerically_not_lexicographically():
@@ -401,3 +409,170 @@ def test_secrets_value_that_is_not_a_table_raises(tmp_path):
 def test_secrets_member_that_is_not_a_table_raises(tmp_path):
     with pytest.raises(ConfigError):
         load_config(write_config(tmp_path, '[secrets]\ninfra = "oops"\n'))
+
+
+# ---------------------------------------------------------------------------
+# Branches that had no test at all: each `raise`/`read` below survived the
+# whole suite when mutated into a silent default, which is the exact failure
+# shape this module's docstring says must not exist ("no third state where an
+# invalid file quietly falls back to defaults").
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "key", ["sensitive_keys", "sensitive_parents", "allowed_references"]
+)
+def test_a_list_valued_check_key_of_the_wrong_type_raises(tmp_path, key):
+    """`_require_str_list`'s rejection. Mutating its `raise` to `return
+    None` made every one of these load as "key absent" — which for
+    `sensitive_keys` means the built-ins alone, and for `sensitive_parents`
+    means the empty default: a policy that declared a whole sensitive
+    category, mistyped, would silently protect nothing."""
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(write_config(tmp_path, f"[check]\n{key} = 5\n"))
+    assert f"check.{key}" in str(exc_info.value)
+
+
+def test_a_list_valued_check_key_containing_a_non_string_raises(tmp_path):
+    """The `all(isinstance(...))` half of the same guard: a list is not
+    enough, its members have to be names."""
+    with pytest.raises(ConfigError):
+        load_config(write_config(tmp_path, '[check]\nsensitive_keys = ["ok", 5]\n'))
+
+
+def test_a_check_table_that_is_not_a_table_raises(tmp_path):
+    """`_build_check`'s type guard. Mutating it to `raw = {}` made
+    `check = "oops"` load as an empty `[check]` table — every declared key
+    silently discarded, including `model_net`."""
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(write_config(tmp_path, 'check = "oops"\n'))
+    assert "check" in str(exc_info.value)
+
+
+def test_an_unreadable_config_raises_rather_than_defaulting(tmp_path):
+    """`load_config`'s `OSError` branch. Mutating it to `return Config()`
+    turned a config the tool could not read into a config that said
+    nothing — the single worst outcome available, since `Config()` carries
+    `model_net = "none"`."""
+    unreadable = tmp_path / ".stackward.toml"
+    unreadable.mkdir()  # a directory where a file is expected
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(unreadable)
+    assert "cannot read" in str(exc_info.value)
+
+
+def test_a_config_that_is_not_utf8_raises_rather_than_defaulting(tmp_path):
+    """TOML is defined as UTF-8, so bytes that are not are a broken config
+    file, not an absent one. `Path.read_text` raises `UnicodeDecodeError`,
+    which is a `ValueError` and not an `OSError` — caught separately, or it
+    would escape `load_config` as something no caller expects."""
+    path = tmp_path / ".stackward.toml"
+    path.write_bytes(b'profile = "\xff\xfe"\n')
+    with pytest.raises(ConfigError):
+        load_config(path)
+
+
+# ---------------------------------------------------------------------------
+# Parsing separated from reading: what `commands.pre_commit` needs to load
+# the policy the git index holds rather than the one on disk.
+# ---------------------------------------------------------------------------
+
+
+def test_load_config_text_parses_without_touching_the_filesystem():
+    config = load_config_text('[check]\nmodel_net = "artifact"\n', ":.stackward.toml")
+    assert config.check.model_net == "artifact"
+
+
+def test_load_config_text_names_its_origin_in_an_error():
+    """The origin label is how a person reproduces the failure: for the
+    index reader it is literally the argument to `git show`."""
+    with pytest.raises(ConfigError) as exc_info:
+        load_config_text("this is not valid toml [[[", ":.stackward.toml")
+    assert ":.stackward.toml" in str(exc_info.value)
+
+
+def test_load_config_applies_the_same_validation_as_load_config_text(tmp_path):
+    """The file reader must not be a second, drifting implementation: it is
+    a reader in front of the same validator, so an invalid key is rejected
+    identically whichever entry point saw it."""
+    text = '[check]\nmodel_net = "bogus"\n'
+    with pytest.raises(ConfigError):
+        load_config_text(text, "<memory>")
+    with pytest.raises(ConfigError):
+        load_config(write_config(tmp_path, text))
+
+
+# ---------------------------------------------------------------------------
+# `min_version` reaches a real invocation.
+#
+# The floor was built here and never wired: `enforce_min_version` had zero
+# production call sites, and `cli.main` dispatched straight to `args.func`.
+# The plan states Task 2's goal as "Load and validate `.stackward.toml`, and
+# enforce `min_version`" — the second half of which no command performed.
+# These tests go through `cli.main`, because that is the only place the
+# wiring exists and a unit test of `enforce_min_version` cannot see it.
+# ---------------------------------------------------------------------------
+
+
+def _repo_declaring(tmp_path, monkeypatch, text: str):
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".stackward.toml").write_text(text)
+    (tmp_path / "Pulumi.dev.yaml").write_text("name: myproject\n")
+    monkeypatch.chdir(tmp_path)
+    return tmp_path / "Pulumi.dev.yaml"
+
+
+def test_main_refuses_a_command_below_the_repositorys_min_version(
+    tmp_path, monkeypatch, capsys
+):
+    """A repository whose policy needs a newer `stackward` than the one
+    installed must not have that policy interpreted by this one. Exit 2 —
+    could-not-run, never 1 — and the message names the required version and
+    how to upgrade."""
+    from stackward.cli import main as cli_main
+
+    target = _repo_declaring(
+        tmp_path, monkeypatch, 'min_version = "99.0.0"\n[check]\nmodel_net = "none"\n'
+    )
+    assert cli_main(["check-config", str(target)]) == 2
+    err = capsys.readouterr().err
+    assert "99.0.0" in err
+    assert "install.sh" in err
+
+
+def test_main_dispatches_normally_when_the_floor_is_met(tmp_path, monkeypatch, capsys):
+    """The other half: a satisfied floor must be invisible. Without this, the
+    test above would pass just as well if every command exited 2."""
+    from stackward.cli import main as cli_main
+
+    target = _repo_declaring(
+        tmp_path, monkeypatch, 'min_version = "0.0.1"\n[check]\nmodel_net = "none"\n'
+    )
+    assert cli_main(["check-config", str(target)]) == 0
+    assert capsys.readouterr().out == ""
+
+
+def test_doctor_still_runs_under_an_unmet_min_version(tmp_path, monkeypatch, capsys):
+    """`VERSION_CHECK_EXEMPT` reaching a real invocation. `doctor` is how you
+    diagnose the problem; a floor that blocked it would print an instruction
+    from a command it had just made unreachable."""
+    from stackward.cli import main as cli_main
+
+    _repo_declaring(tmp_path, monkeypatch, 'min_version = "99.0.0"\n')
+    assert cli_main(["doctor"]) == 0
+    assert __version__ in capsys.readouterr().out
+
+
+def test_a_malformed_config_does_not_break_dispatch(tmp_path, monkeypatch, capsys):
+    """Task 2's carry-forward ruling, re-pinned against the new call site:
+    the floor check runs before every command, so a `.stackward.toml` that
+    will not parse must make it stand aside rather than take `doctor` down
+    with it. The gate commands still refuse — with their own, better
+    message — because they load the same file themselves."""
+    from stackward.cli import main as cli_main
+
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".stackward.toml").write_text("this is not valid toml [[[")
+    monkeypatch.chdir(tmp_path)
+    assert cli_main(["doctor"]) == 0
+    assert __version__ in capsys.readouterr().out

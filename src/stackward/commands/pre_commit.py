@@ -14,12 +14,29 @@ Consequently every rule below leans the same way when in doubt: refuse
 rather than guess, because the cost of a false positive here is a rerun,
 and the cost of a false negative is permanent.
 
-**Staged, never working-tree.** Every path this module reads goes through
-`git show ":<path>"` (see `_read_staged_blob`), which is stage 0 of the
-index as it stands right now -- not `Path.read_text()`. An unstaged fix
-sitting only in the working tree must not let an already-staged credential
-through, and a working-tree file that merely *looks* clean must not be
-mistaken for what will actually be committed.
+**Staged, never working-tree -- policy included.** Every path this module
+reads goes through `git show ":<path>"` (see `_read_staged_blob`), which is
+stage 0 of the index as it stands right now -- not `Path.read_text()`. An
+unstaged fix sitting only in the working tree must not let an already-staged
+credential through, and a working-tree file that merely *looks* clean must
+not be mistaken for what will actually be committed.
+
+`.stackward.toml` is read the same way (`_index_config_path`,
+`_load_check_policy`), and it took a review to notice it had not been.
+Reading content from the index while reading the *rules* from the working
+tree is a fail-open with a working exploit: stage a credential, then edit
+the working-tree `.stackward.toml` to add an `allowed_references` entry for
+it -- staging nothing -- and this command exits 0. The credential is
+committed under a relaxation that is not itself being committed, and the
+next clone of the repository contains the leak but not the excuse. Three
+knobs weaken from that direction (`allowed_references` adds a suppression,
+`model_net = "none"` drops a whole net, and `sensitive_parents` *replaces*
+rather than extends, so the worktree can shrink what the index declared);
+`nets.model.verify_sources` cannot close any of them, because it compares an
+index blob against a recorded blob and a worktree-only edit touches neither,
+and under `model_net = "none"` it does not run at all. Reading policy from
+the index closes all three at once: a relaxation only takes effect in the
+same commit that carries it.
 
 **Content-level, not file-level.** `_scan_staged_config` calls
 `nets.heuristic.find_plaintext_credentials` and
@@ -56,27 +73,27 @@ credential; it never fetches, decrypts, or connects anywhere to do it.
 repository's top level regardless of the caller's current working
 directory (verified empirically: a path printed by the first command,
 handed unchanged to the second, resolves correctly whether invoked from
-the repo root or a subdirectory several levels down). `_load_check_policy`
-relies on the same property transitively through `find_repo_config`, which
-walks upward from `Path.cwd()` to the repository root and checks
-`<candidate>/.stackward.toml` before checking whether `<candidate>/.git`
-exists -- so the repo root's own `.stackward.toml` is always found on the
-same pass that discovers `.git`, never one step too late. Between the two,
-this command needs no special handling for "the hook ran from a
-subdirectory": there is no such thing, only "the hook ran somewhere inside
-the repository."
+the repo root or a subdirectory several levels down). `_index_config_path`
+reproduces `config.find_repo_config`'s upward walk in those same
+repository-relative terms, using `git rev-parse --show-prefix` for where
+the caller is standing -- so a `.stackward.toml` in a subdirectory is found
+from below it and ignored from beside it, exactly as the working-tree walk
+would. Between the two, this command needs no special handling for "the hook
+ran from a subdirectory": there is no such thing, only "the hook ran
+somewhere inside the repository."
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import PurePosixPath
 
 import yaml
 
-from ..config import CheckConfig, ConfigError, find_repo_config, load_config
+from ..config import CONFIG_FILENAME, CheckConfig, ConfigError, load_config_text
 from ..nets.heuristic import DocumentError, find_plaintext_credentials
 from ..nets.model import (
     ModelNet,
@@ -84,7 +101,13 @@ from ..nets.model import (
     find_declared_credentials,
     load_model_net,
 )
-from .check_config import CheckError, describe_yaml_error, fail_closed
+from .check_config import (
+    CheckError,
+    MissingPolicyError,
+    describe_yaml_error,
+    fail_closed,
+    missing_policy_message,
+)
 
 _STATE_EXPORT_NAME = "state.json"
 _STATE_EXPORT_SUFFIX = ".stack-export.json"
@@ -102,14 +125,27 @@ def _run_git(args: list[str]) -> bytes:
     tree, or the invoked subcommand failing for any git-reported reason
     (including `git show` on a path with no stage-0 entry -- an unmerged
     path). The message includes git's own stderr text verbatim: the only
-    two invocations this module ever makes are `diff --cached --name-only`
-    and `show ":<path>"`, and a *failing* run of either never gets far
-    enough to have printed blob content -- a non-zero exit here means git
-    could not produce output at all, so its diagnostic is always about a
-    path or a ref, never about what a blob contains.
+    invocations this module makes are `diff --cached --name-only`,
+    `rev-parse --show-prefix`, `ls-files` and `show ":<path>"`, and a
+    *failing* run of any of them never gets far enough to have printed blob
+    content -- a non-zero exit here means git could not produce output at
+    all, so its diagnostic is always about a path or a ref, never about what
+    a blob contains.
+
+    Runs under `LC_ALL=C`. Everything below branches on `returncode` alone
+    and never on git's message text, so this is hardening rather than a live
+    fix here -- but git's diagnostics are gettext-marked, and a message
+    quoted into a `CheckError` should read the same in a bug report as it did
+    on the machine that hit it. The environment is *merged*, never replaced:
+    git sets `GIT_INDEX_FILE`, `GIT_DIR` and friends for a hook process, and
+    dropping them would make this command read a different index than the
+    commit it is gating.
     """
+    env = {**os.environ, "LC_ALL": "C"}
     try:
-        proc = subprocess.run(["git", *args], capture_output=True, check=False)
+        proc = subprocess.run(
+            ["git", *args], capture_output=True, check=False, env=env
+        )
     except OSError as exc:
         raise CheckError(f"cannot run git {' '.join(args)}: {exc}") from exc
     if proc.returncode != 0:
@@ -224,8 +260,9 @@ def _scan_staged_config(
     PyYAML would otherwise interpolate into its own message), or a
     document that is not a mapping.
 
-    `net` is `None` when the repository declares `model_net = "none"`, or
-    has no `[check]` policy at all; the heuristic net always runs.
+    `net` is `None` when the repository declares `model_net = "none"`; the
+    heuristic net always runs. There is no third case where it is `None`
+    because no policy was found -- that is a refusal now, not a scan.
     """
     text = _read_staged_blob(path)
     try:
@@ -241,20 +278,108 @@ def _scan_staged_config(
     return sorted(found)
 
 
-def _load_check_policy() -> CheckConfig:
-    """The `[check]` policy for the repository containing the current
-    working directory, or the built-in defaults when there is none --
-    absence is a normal state (see `config.py`), not an error.
+def _index_config_path() -> str | None:
+    """Repository-relative path of the nearest `.stackward.toml` **in the
+    index** at or above the current directory, or `None` if the index holds
+    none.
 
-    The same three lines as `check_config`'s private helper of the same
-    name, built entirely from this module's own public imports
-    (`find_repo_config`, `load_config`); not worth an inter-command import
-    for something this small.
+    The index-side twin of `config.find_repo_config`, and it walks in the
+    same direction for the same reason: a policy file beside the caller
+    beats one at the repository root. `git rev-parse --show-prefix` gives
+    the current directory as a repository-relative prefix -- git's own
+    answer, in git's own byte encoding, so no assumption is needed about
+    where the process's `cwd` sits relative to a symlinked work tree, and
+    (verified) it is not subject to `core.quotePath` mangling the way
+    `ls-files` output would be without `-z`.
+
+    Candidates are matched with `:(literal,top)` pathspec magic. `top` is
+    load-bearing: `ls-files`' pathspecs resolve against the *caller's*
+    directory, not the repository root, so a hook invoked from a
+    subdirectory would otherwise look for `<subdir>/<subdir>/.stackward.toml`
+    and find nothing. `literal` is belt-and-braces -- verified empirically
+    that git compares a pathspec's literal text against each path before
+    falling back to wildmatch, so an exact-path pathspec containing `[`, `*`
+    or `?` matches its own directory either way -- and it is kept because
+    the intent here is an exact path, and nothing downstream should have to
+    depend on that fallback ordering staying as it is. What actually makes
+    a metacharacter harmless is the line below: a candidate is accepted only
+    by exact string equality against this list, never by taking whatever git
+    happened to print. `--full-name` makes the answer repository-relative,
+    which is what `git show ":<path>"` then wants, and `-z` keeps
+    `core.quotePath` from escaping a non-ASCII path into something no
+    candidate would equal.
     """
-    config_path = find_repo_config()
+    raw_prefix = _run_git(["rev-parse", "--show-prefix"])
+    try:
+        prefix = raw_prefix.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise CheckError(f"repository path is not valid UTF-8: {exc}") from exc
+    # Split rather than strip: a directory name may legally begin or end
+    # with a space, and `.strip()` would silently rename it.
+    parts = [part for part in prefix.rstrip("\n").split("/") if part]
+
+    # Nearest first, ending at the repository root -- `find_repo_config`'s
+    # order, so the two helpers cannot disagree about which file wins.
+    candidates = [
+        "/".join([*parts[:depth], CONFIG_FILENAME])
+        for depth in range(len(parts), -1, -1)
+    ]
+    listed = _run_git(
+        [
+            "ls-files",
+            "-z",
+            "--full-name",
+            "--",
+            *(f":(literal,top){candidate}" for candidate in candidates),
+        ]
+    )
+    try:
+        text = listed.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise CheckError(f"index path list is not valid UTF-8: {exc}") from exc
+    present = {path for path in text.split("\0") if path}
+    for candidate in candidates:
+        if candidate in present:
+            return candidate
+    return None
+
+
+def _load_check_policy() -> CheckConfig:
+    """The `[check]` policy this commit will actually carry, read from the
+    **index** -- never from the working tree.
+
+    Not the same three lines as `check_config`'s helper of the same name,
+    and the difference is the point rather than an oversight: `check-config`
+    answers "is this file on disk clean?" and so reads its policy from disk,
+    while this command answers "is what I am about to commit clean?" and so
+    reads both the content and the rules from the index. Reading the rules
+    from the working tree was a fail-open with a working exploit -- see the
+    module docstring for it and for the three knobs that weaken from that
+    direction.
+
+    A policy file present in the working tree but never staged is therefore
+    *not* a policy as far as this command is concerned, which is the same
+    rule it already applies to every stack config it scans. Absence is a
+    refusal (`MissingPolicyError`), never the built-in defaults: those carry
+    `model_net = "none"`, so returning them here would drop the stronger net
+    in exactly the repositories that had never said anything about it.
+    """
+    config_path = _index_config_path()
     if config_path is None:
-        return CheckConfig()
-    return load_config(config_path).check
+        raise MissingPolicyError(
+            missing_policy_message(
+                where="in the index",
+                remedy=(
+                    f"then stage it: git add {CONFIG_FILENAME}  "
+                    "(this command reads its policy from staged content, "
+                    "exactly like the files it scans, so a relaxation cannot "
+                    "take effect without being committed alongside what it "
+                    "relaxes)"
+                ),
+            )
+        )
+    # Labelled the way a person would reproduce it: `git show ":<path>"`.
+    return load_config_text(_read_staged_blob(config_path), f":{config_path}").check
 
 
 @fail_closed
@@ -268,20 +393,21 @@ def cmd_pre_commit(_args: argparse.Namespace) -> int:
     state export is credentials by construction, not by finding);
     **2** the check could not run at all -- an unmerged index entry, a git
     command failing, staged content that is not decodable or not valid
-    YAML, a document that is not a mapping, an invalid `.stackward.toml`,
-    a missing or stale declared-secrets artifact under
-    `model_net = "artifact"`, or an unanticipated exception. Python's own default for an uncaught
+    YAML, a document that is not a mapping, a `.stackward.toml` that is
+    invalid *or absent from the index*, a missing or stale
+    declared-secrets artifact under `model_net = "artifact"`, or an
+    unanticipated exception. Python's own default for an uncaught
     exception is exit 1, which here would misreport "a credential was
     found" for a file this command never actually finished evaluating --
     every per-file scan below is wrapped accordingly, and the `@fail_closed`
     decorator above is the outer boundary that catches anything else this
     function does not: policy loading (`_load_check_policy`) and the
     staged-file listing (`_staged_paths`) both run *outside* the per-file
-    loop, guarded only by `except ConfigError` / `except CheckError`
-    respectively, so a different, unanticipated exception from either --
-    a bare `OSError` from `find_repo_config` walking through an
-    unreadable parent directory, say -- needs `@fail_closed` to avoid
-    escaping uncaught and exiting 1 by Python's own default.
+    loop, guarded only by `except (ConfigError, CheckError)` / `except
+    CheckError` respectively, so a different, unanticipated exception from
+    either -- an `OSError` from the `git` invocation layer that neither
+    converts, say -- needs `@fail_closed` to avoid escaping uncaught and
+    exiting 1 by Python's own default.
 
     Checks run in this fixed order, each a hard gate before the next:
 
@@ -299,7 +425,16 @@ def cmd_pre_commit(_args: argparse.Namespace) -> int:
        unmerged, and this command can be invoked directly, bypassing that
        refusal.
     2. Staged Pulumi state exports (`state.json`, `*.stack-export.json`) --
-       refused outright, before the credential scan below even starts.
+       refused outright, before the credential scan below even starts, and
+       deliberately *before* the policy is loaded: this refusal needs no
+       policy to make (a state export is credentials by construction, not
+       by finding), and exit 1 is the more specific answer than the exit 2
+       a missing or unparseable policy would produce. A repository that has
+       not written a `.stackward.toml` yet still gets told it staged a
+       state export, rather than being told about its config first.
+    2a. The `[check]` policy, loaded from the index (`_load_check_policy`).
+       A repository with none is refused here, exit 2, naming the minimal
+       file to create -- never scanned under `CheckConfig()`'s defaults.
     3. The declared-secrets artifact, loaded from the index. Loaded once,
        before the scan loop, and a failure to load it exits 2 having
        reported nothing: a stale artifact means this command does not know
@@ -341,7 +476,7 @@ def cmd_pre_commit(_args: argparse.Namespace) -> int:
 
     try:
         check = _load_check_policy()
-    except ConfigError as exc:
+    except (ConfigError, CheckError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
