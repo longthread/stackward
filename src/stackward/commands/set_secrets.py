@@ -125,10 +125,11 @@ class SetSecretsError(Exception):
 class DriftPair:
     """One declared `[[secrets."<dir>".drift_pairs]]` entry: two *logical
     names*, never config paths themselves. `managed`'s config path is found
-    by inverting `ProjectManifest.secret` at check time (see `_check_drift`),
-    not stored here — the manifest is the one place that mapping lives, and
-    keeping a second copy of it in a `DriftPair` would let the two disagree
-    silently if `secret` ever changed shape.
+    by inverting `ProjectManifest.secret` **and** `.plaintext` together (both
+    are published — Ruling 1) at check time (see `_check_drift`), not stored
+    here — the manifest is the one place that mapping lives, and keeping a
+    second copy of it in a `DriftPair` would let the two disagree silently if
+    `secret`/`plaintext` ever changed shape.
     """
 
     bootstrap: str
@@ -635,14 +636,19 @@ def _check_drift(
     # `secret` and `plaintext` are guaranteed disjoint by
     # `parse_project_manifest`, so this merge cannot silently drop or shadow
     # an entry from either side -- `managed` may name a path in either table,
-    # since both are published (Ruling 1).
-    published = {**manifest.secret, **manifest.plaintext}
+    # since both are published (Ruling 1). Named distinctly from the loop's
+    # own `published` local below (`pulumi config get`'s decrypted result,
+    # rebound on every iteration): the two used to share a name, which meant
+    # the *second* and every later drift pair called `_config_path_for_name`
+    # with a `str` left over from the previous iteration instead of this
+    # dict, raising `AttributeError` rather than evaluating the pair at all.
+    published_entries = {**manifest.secret, **manifest.plaintext}
     for pair in manifest.drift_pairs:
         bootstrap_value = source.resolve(pair.bootstrap)
         if not bootstrap_value:
             continue
 
-        managed_path = _config_path_for_name(published, pair.managed)
+        managed_path = _config_path_for_name(published_entries, pair.managed)
         if managed_path is None:
             print(
                 f"warning: drift pair {pair.bootstrap!r}/{pair.managed!r}: "

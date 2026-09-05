@@ -1093,6 +1093,26 @@ _PLAINTEXT_MANAGED_DRIFT_MANIFEST = (
     'managed = "MANAGED_NAME"\n'
 )
 
+# Two drift pairs, each unambiguously resolvable -- regression coverage for
+# the `published` variable-shadowing bug: a pre-loop `published` (the merged
+# path->name dict) and the loop's own `published` (`_pulumi_config_get`'s
+# `str | None` result) used to share one name, so the second and every later
+# pair called `_config_path_for_name` with a leftover `str` instead of the
+# dict and crashed with `AttributeError`.
+_TWO_DRIFT_PAIRS_MANIFEST = (
+    '[secrets."."]\n'
+    "secret = { "
+    '"managed.path.one" = "MANAGED_NAME_ONE", '
+    '"managed.path.two" = "MANAGED_NAME_TWO" '
+    "}\n\n"
+    '[[secrets.".".drift_pairs]]\n'
+    'bootstrap = "BOOTSTRAP_NAME_ONE"\n'
+    'managed = "MANAGED_NAME_ONE"\n\n'
+    '[[secrets.".".drift_pairs]]\n'
+    'bootstrap = "BOOTSTRAP_NAME_TWO"\n'
+    'managed = "MANAGED_NAME_TWO"\n'
+)
+
 
 def test_drift_warns_when_the_values_differ(repo, monkeypatch, capfd, stub_pulumi):
     write_repo_config(repo, _DRIFT_MANIFEST)
@@ -1205,6 +1225,46 @@ def test_drift_finds_a_managed_name_declared_in_plaintext(repo, monkeypatch, cap
     assert "drift" in captured.err
     assert "managed.path" in captured.err
     assert MARKER_BOOTSTRAP not in captured.err
+
+
+def test_a_second_drift_pair_is_evaluated_and_the_run_reaches_its_summary(
+    repo, monkeypatch, capfd, stub_pulumi
+):
+    """Regression test for the `published` variable-shadowing bug: a
+    pre-loop `published` (the merged `secret ∪ plaintext` dict) and the
+    loop's own `published` (`_pulumi_config_get`'s result) shared one name,
+    so every drift pair after the first called `_config_path_for_name` with
+    a leftover `str` and crashed with `AttributeError` -- which `fail_closed`
+    then turned into a bare exit 2 *after* every `pulumi config set` call had
+    already succeeded and been printed, with the closing `summary:` line
+    never reached at all. Two pairs, both unambiguously resolvable and both
+    genuinely differing (so both warnings must fire, not just "no crash"),
+    proves the second pair is actually evaluated rather than merely not
+    crashing on it by accident.
+    """
+    write_repo_config(repo, _TWO_DRIFT_PAIRS_MANIFEST)
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("MANAGED_NAME_ONE", "local-value-one")
+    monkeypatch.setenv("MANAGED_NAME_TWO", "local-value-two")
+    monkeypatch.setenv("BOOTSTRAP_NAME_ONE", "local-value-one")
+    monkeypatch.setenv("BOOTSTRAP_NAME_TWO", "local-value-two")
+    fake_pulumi(monkeypatch, stub_pulumi)
+    monkeypatch.setenv(
+        "STUB_GET_VALUES",
+        json.dumps(
+            {
+                "managed.path.one": "published-value-one-differs",
+                "managed.path.two": "published-value-two-differs",
+            }
+        ),
+    )
+
+    assert main(["set-secrets"]) == 0
+    captured = capfd.readouterr()
+    assert "AttributeError" not in captured.err
+    assert "MANAGED_NAME_ONE" in captured.err
+    assert "MANAGED_NAME_TWO" in captured.err
+    assert "summary:" in captured.out
 
 
 def test_drift_is_never_checked_under_dry_run(repo, monkeypatch, capfd, stub_pulumi, tmp_path):
