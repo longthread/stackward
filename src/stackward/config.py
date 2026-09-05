@@ -189,6 +189,24 @@ def _require_str_list(data: dict[str, Any], key: str, name: str) -> list[str] | 
     return value
 
 
+def _require_module_class(value: str, name: str) -> None:
+    """Validate the `"module:Class"` shape the brief states explicitly for
+    `stack_models` values.
+
+    Unlike `[secrets.*]`'s interior (left unspecified by the brief, and
+    deferred to Task 8 — see `_build_secrets`), this shape *is* specified
+    here, so it gets the same fail-closed treatment as `model_net`'s enum:
+    a malformed value (a dot instead of a colon, an empty module or class
+    name) is rejected at load time, naming the key, rather than loading
+    silently and surfacing later as a confusing `ImportError` deep inside
+    Task 10, far from the file that caused it. This only checks shape —
+    it never imports the module or resolves the class.
+    """
+    parts = value.split(":")
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise ConfigError(f"{name} must be of the form 'module:Class', got {value!r}")
+
+
 def _build_check(raw: Any) -> CheckConfig:
     if not isinstance(raw, dict):
         raise ConfigError("'check' must be a table")
@@ -204,12 +222,19 @@ def _build_check(raw: Any) -> CheckConfig:
             f"got {model_net!r}"
         )
 
-    stack_models = raw.get("stack_models", {})
-    if not isinstance(stack_models, dict) or not all(
-        isinstance(key, str) and isinstance(value, str)
-        for key, value in stack_models.items()
-    ):
+    stack_models_raw = raw.get("stack_models", {})
+    if not isinstance(stack_models_raw, dict):
         raise ConfigError("check.stack_models must be a table of string to string")
+    stack_models: dict[str, str] = {}
+    for namespace, target in stack_models_raw.items():
+        # TOML table keys are always strings; only the value needs checking.
+        if not isinstance(target, str):
+            raise ConfigError(
+                f"check.stack_models.{namespace!r} must be a string of the "
+                "form 'module:Class'"
+            )
+        _require_module_class(target, f"check.stack_models.{namespace!r}")
+        stack_models[namespace] = target
 
     sensitive_keys = _require_str_list(raw, "sensitive_keys", "check.sensitive_keys")
     sensitive_parents = _require_str_list(
@@ -221,7 +246,7 @@ def _build_check(raw: Any) -> CheckConfig:
 
     return CheckConfig(
         model_net=model_net,
-        stack_models=dict(stack_models),
+        stack_models=stack_models,
         sensitive_keys=_extend(BUILTIN_SENSITIVE_KEYS, sensitive_keys),
         sensitive_parents=_replace(BUILTIN_SENSITIVE_PARENTS, sensitive_parents),
         allowed_references=list(allowed_references or []),

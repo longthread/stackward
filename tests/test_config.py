@@ -101,6 +101,44 @@ def test_check_stack_models_is_parsed(tmp_path):
     assert config.check.stack_models == {"infra": "infra.config:StackConfig"}
 
 
+def test_check_stack_models_value_with_no_colon_raises(tmp_path):
+    """The brief states the `"module:Class"` shape explicitly (unlike
+    `[secrets.*]`'s interior), so a dot-instead-of-colon typo must be
+    rejected here rather than surfacing later as an ImportError in Task 10."""
+    with pytest.raises(ConfigError) as exc_info:
+        load_config(
+            write_config(
+                tmp_path,
+                '[check.stack_models]\n"infra" = "infra.config.StackConfig"\n',
+            )
+        )
+    assert "infra" in str(exc_info.value)
+
+
+def test_check_stack_models_value_with_two_colons_raises(tmp_path):
+    with pytest.raises(ConfigError):
+        load_config(
+            write_config(
+                tmp_path,
+                '[check.stack_models]\n"infra" = "infra:config:StackConfig"\n',
+            )
+        )
+
+
+def test_check_stack_models_value_with_empty_module_raises(tmp_path):
+    with pytest.raises(ConfigError):
+        load_config(
+            write_config(tmp_path, '[check.stack_models]\n"infra" = ":StackConfig"\n')
+        )
+
+
+def test_check_stack_models_value_with_empty_class_raises(tmp_path):
+    with pytest.raises(ConfigError):
+        load_config(
+            write_config(tmp_path, '[check.stack_models]\n"infra" = "infra.config:"\n')
+        )
+
+
 def test_check_sensitive_keys_is_parsed_and_extends_the_builtins(tmp_path):
     config = load_config(
         write_config(tmp_path, '[check]\nsensitive_keys = ["jwtsecret"]\n')
@@ -113,9 +151,9 @@ def test_check_sensitive_keys_is_parsed_and_extends_the_builtins(tmp_path):
 
 def test_check_sensitive_parents_is_parsed(tmp_path):
     config = load_config(
-        write_config(tmp_path, '[check]\nsensitive_parents = ["environment_variables"]\n')
+        write_config(tmp_path, '[check]\nsensitive_parents = ["example_parent"]\n')
     )
-    assert config.check.sensitive_parents == frozenset({"environment_variables"})
+    assert config.check.sensitive_parents == frozenset({"example_parent"})
 
 
 def test_check_allowed_references_is_parsed(tmp_path):
@@ -189,15 +227,39 @@ def test_extend_returns_builtin_unchanged_when_nothing_declared():
 
 
 def test_replace_discards_the_builtin_entirely():
-    builtin = frozenset({"environment_variables"})
+    builtin = frozenset({"example_parent"})
     result = _replace(builtin, ["only_this_one"])
     assert result == frozenset({"only_this_one"})
-    assert "environment_variables" not in result
+    assert "example_parent" not in result
 
 
 def test_replace_returns_builtin_unchanged_when_nothing_declared():
-    builtin = frozenset({"environment_variables"})
+    builtin = frozenset({"example_parent"})
     assert _replace(builtin, None) == builtin
+
+
+def test_sensitive_parents_replacement_survives_through_load_config(tmp_path, monkeypatch):
+    """End-to-end proof that `_build_check`'s call site actually wires
+    `_replace` (not `_extend`) to `sensitive_parents`.
+
+    The shipped `BUILTIN_SENSITIVE_PARENTS` is empty, so a test against the
+    real default can't tell the two apart: extending or replacing an empty
+    set both yield exactly the declared list. Monkeypatching the builtin to
+    a non-empty synthetic value makes the two operations diverge, so this
+    proves the wiring itself, not just the `_extend`/`_replace` helpers in
+    isolation — mirrors
+    `test_sensitive_keys_extension_survives_through_load_config` below,
+    which gets this proof for free against the real (non-empty)
+    `sensitive_keys` builtin.
+    """
+    monkeypatch.setattr(
+        "stackward.config.BUILTIN_SENSITIVE_PARENTS", frozenset({"builtin_only"})
+    )
+    config = load_config(
+        write_config(tmp_path, '[check]\nsensitive_parents = ["declared_only"]\n')
+    )
+    assert config.check.sensitive_parents == frozenset({"declared_only"})
+    assert "builtin_only" not in config.check.sensitive_parents
 
 
 def test_sensitive_keys_extension_survives_through_load_config(tmp_path):
