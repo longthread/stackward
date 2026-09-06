@@ -18,3 +18,17 @@ state.json
 .env
 .env.*
 !.env.example
+
+# Agent and tooling scratch directories. These hold working notes, review
+# transcripts and plan files — prose about how the work was done, written
+# for a private audience. On a public repository that is a worse exposure
+# than a stray build artefact: the neutrality gate greps for known terms,
+# and cannot catch a novel detail described in a sentence.
+#
+# Listed here rather than relying on an ignore file the tooling drops
+# inside its own directory. That file is untracked, so it protects only the
+# checkout that happened to create it — a fresh clone gets nothing, and
+# anything written outside the subdirectory it covers was never protected
+# at all.
+.superpowers/
+.claude/
