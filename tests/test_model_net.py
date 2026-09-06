@@ -872,10 +872,17 @@ STRUCTURED_LEAF = {
         class Peer:
             handshake: str = Field(default="", json_schema_extra={"secret": True})
     """,
+    # `typing_extensions.TypedDict`, not `typing`'s: pydantic refuses the
+    # stdlib one below 3.12, so on 3.11 the import fails and the command
+    # refuses for pydantic's reason instead of the walkability reason this
+    # test exists to pin. The exit code is 2 either way -- only the
+    # assertion on the message tells the two apart, which is why this
+    # surfaced in CI and not locally.
     "typed_dict": """
-        from typing import Annotated, TypedDict
+        from typing import Annotated
 
         from pydantic import Field
+        from typing_extensions import TypedDict
 
 
         class Peer(TypedDict):
