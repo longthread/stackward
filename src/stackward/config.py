@@ -30,6 +30,12 @@ is for.
 `load_config` is the thin file reader in front of it. `commands.pre_commit`
 needs the second half without the first, because its policy comes out of the
 git index rather than the working tree.
+
+**`read_min_version` is deliberately narrower than either.** It answers only
+"what floor does this file declare", for a caller that must get an answer
+even when the rest of the file is something this binary cannot validate --
+which is exactly the case a floor is declared for. See it for why that is not
+a second, laxer config loader.
 """
 
 from __future__ import annotations
@@ -310,6 +316,25 @@ def _build_secrets(raw: Any) -> dict[str, dict[str, Any]]:
     return result
 
 
+def _min_version_of(data: dict[str, Any]) -> str | None:
+    """The `min_version` a parsed document declares, validated, or `None`.
+
+    One definition rather than two, because two callers need the identical
+    answer for different reasons: `_build_config` below, which is building a
+    whole `Config` and by then knows every other key is one it recognises;
+    and `read_min_version`, which needs the floor out of a document this
+    binary may be *unable* to validate the rest of. See `read_min_version`
+    for why that second case exists at all.
+    """
+    min_version = _require_str(data, "min_version", "min_version")
+    if min_version is not None:
+        try:
+            _parse_version(min_version)
+        except ValueError as exc:
+            raise ConfigError(f"min_version: {exc}") from exc
+    return min_version
+
+
 def _build_config(data: dict[str, Any]) -> Config:
     unknown = set(data) - _TOP_LEVEL_KEYS
     if unknown:
@@ -317,12 +342,7 @@ def _build_config(data: dict[str, Any]) -> Config:
 
     profile = _require_str(data, "profile", "profile")
     python = _require_str(data, "python", "python")
-    min_version = _require_str(data, "min_version", "min_version")
-    if min_version is not None:
-        try:
-            _parse_version(min_version)
-        except ValueError as exc:
-            raise ConfigError(f"min_version: {exc}") from exc
+    min_version = _min_version_of(data)
 
     return Config(
         profile=profile,
@@ -418,22 +438,69 @@ def load_config_text(text: str, origin: str) -> Config:
         raise ConfigError(f"{origin}: {exc}") from exc
 
 
-def load_config(path: Path) -> Config:
-    """Parse and validate the file at `path` as `.stackward.toml`.
+def _read_config_text(path: Path) -> str:
+    """`path`'s content as text, or `ConfigError`.
 
-    A thin reader in front of `load_config_text`, which does all the
-    validation; see there for what is raised and why the two are separate.
     An unreadable file and one that is not UTF-8 are both `ConfigError`,
     never a silent fall back to defaults: TOML is defined as UTF-8, so bytes
     that are not are a broken config file, not an absent one.
     """
     try:
-        text = path.read_text(encoding="utf-8")
+        return path.read_text(encoding="utf-8")
     except OSError as exc:
         raise ConfigError(f"{path}: cannot read: {exc}") from exc
     except UnicodeDecodeError as exc:
         raise ConfigError(f"{path}: cannot read: not valid UTF-8: {exc}") from exc
-    return load_config_text(text, str(path))
+
+
+def load_config(path: Path) -> Config:
+    """Parse and validate the file at `path` as `.stackward.toml`.
+
+    A thin reader in front of `load_config_text`, which does all the
+    validation; see there for what is raised and why the two are separate.
+    """
+    return load_config_text(_read_config_text(path), str(path))
+
+
+def read_min_version(path: Path) -> str | None:
+    """The `min_version` the file at `path` declares — and *nothing else
+    about that file*.
+
+    This exists because a full `load_config` cannot answer the question in
+    the one case the floor is most needed for. `_build_config` rejects an
+    unrecognised top-level key before it gets as far as building anything,
+    so a repository that declares both a floor this binary does not meet
+    **and** a key this binary does not know — which is precisely
+    forward-compatibility, the situation `min_version` exists to make
+    survivable — used to report `unknown key 'future_key'` and let the
+    command run, instead of saying "upgrade stackward". The unknown key is
+    a *consequence* of the unmet floor there, not an independent problem,
+    and reporting the consequence sends the reader to fix the wrong thing.
+
+    So the floor is read on its own terms: parse the document, take
+    `min_version`, validate that one value, and form no opinion on any
+    other key. Everything else about the file is still checked, with better
+    words, by whichever command actually needs it — both gate commands
+    refuse outright on a policy they cannot parse or validate.
+
+    Raises `ConfigError` for an unreadable file, invalid TOML, or a
+    `min_version` that is not a parseable version string. Its sole caller,
+    `cli._min_version_refusal`, prints none of those: it treats every one of
+    them as "there is no floor I can establish here" and lets the command
+    run. The messages are shaped anyway, rather than left as bare
+    exceptions, so that a second caller cannot inherit an error it would be
+    unable to report.
+    """
+    text = _read_config_text(path)
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        # Position only, never the parser's message — see `toml_position`.
+        raise ConfigError(f"{path}: invalid TOML{toml_position(exc)}") from exc
+    try:
+        return _min_version_of(data)
+    except ConfigError as exc:
+        raise ConfigError(f"{path}: {exc}") from exc
 
 
 def enforce_min_version(

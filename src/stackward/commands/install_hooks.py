@@ -165,10 +165,16 @@ def _is_tracked(path: Path) -> bool:
     --error-unmatch <dir>` -- a directory pathspec matches if git tracks
     anything underneath it. Passing the pre-resolved absolute path, rather
     than a relative one, keeps this correct regardless of what the current
-    working directory happens to be. Git's own `.git/hooks`, unredirected,
-    never matches: paths under `.git/` are not part of the tracked
-    namespace at all, so this reliably distinguishes that default location
-    from a `core.hooksPath` deliberately pointed at a tracked directory.
+    working directory happens to be. The same command answers for a *file*
+    path, where it degenerates to "is this in the index" -- which is what
+    `_warn_when_no_policy` asks it about `.stackward.toml`, so that both
+    callers get their answer from one place rather than from two spellings
+    of `git ls-files` that could come to disagree.
+
+    Git's own `.git/hooks`, unredirected, never matches: paths under
+    `.git/` are not part of the tracked namespace at all, so this reliably
+    distinguishes that default location from a `core.hooksPath`
+    deliberately pointed at a tracked directory.
 
     A non-zero exit is deliberately *not* read as "not tracked" on its
     own -- only two specific, recognised git failures are: the ordinary
@@ -383,32 +389,80 @@ def cmd_install_hooks(_args: argparse.Namespace) -> int:
 
 
 def _warn_when_no_policy() -> None:
-    """Warn on stderr when the repository declares no `.stackward.toml`.
+    """Warn on stderr when the hook just installed will not find a policy.
+
+    **The question is what `pre-commit` will see, not what is on disk.**
+    That gate reads its `[check]` policy from the *index* -- deliberately,
+    since a policy read from the working tree could relax the rules for a
+    commit that does not itself carry the relaxation -- so a
+    `.stackward.toml` that exists but has never been staged is, to the hook
+    being installed here, no policy at all. Asking `find_repo_config` alone
+    reads the working tree and answers a different question than the one
+    this warning is for: the repository got no warning and then blocked
+    every commit. That state is a *more* likely one right after `hooks
+    install` than a wholly absent policy, since writing the file and
+    installing the hook is one sitting and staging it is a separate act.
+
+    Three outcomes, and the third is the reason the other two are worth
+    distinguishing:
+
+    * Nothing in the working tree: say so, and name the minimal file.
+    * Present but not in the index: say *that*, and name `git add` -- the
+      remedy is one word, and "you have no policy" would be visibly false
+      to someone looking at the file.
+    * In the index: silence, whatever the file's content. A
+      `.stackward.toml` that does not parse is present as far as this is
+      concerned -- reporting it is the gate's job, at the point it actually
+      reads it, and duplicating that judgement here would give one
+      repository two different verdicts on the same file.
+
+    One bounded gap, stated so it is a decision and not an oversight: a
+    policy that is in the index but deleted from the working tree gets the
+    "declares none" message, though the hook would in fact find it. Closing
+    it means a second copy of `pre_commit._index_config_path`'s
+    nearest-first candidate search, and two copies of that would be a worse
+    defect than the wrong wording on a state nobody reaches by accident.
 
     Deliberately *after* the hook is written and deliberately not an error:
-    see `cmd_install_hooks`'s own docstring. On stderr, not stdout, for the
-    same reason `store.warn_if_permissive` puts its warning there -- this
-    command's stdout says where the hook landed, and a caller reading that
-    must not have to filter advisory text out of it.
+    see `cmd_install_hooks`'s own docstring. That is also why a git failure
+    here is silence rather than a raise -- this function runs after the
+    install has already succeeded, inside a `@fail_closed` command, so an
+    escaping `InstallError` would report exit 2 for a hook that is on disk
+    and working. Nothing is lost: the gate itself reports a policy it
+    cannot find, in better words, at the moment it matters.
 
-    `find_repo_config` returns `None` for absence rather than raising, so
-    this cannot turn a legitimate install into a failure. A
-    `.stackward.toml` that exists but does not parse is *present* as far as
-    this is concerned -- reporting it is the gate's job, at the point it
-    actually reads it, and duplicating that judgement here would give one
-    repository two different verdicts on the same file.
+    On stderr, not stdout, for the same reason `store.warn_if_permissive`
+    puts its warning there -- this command's stdout says where the hook
+    landed, and a caller reading that must not have to filter advisory text
+    out of it.
     """
-    if find_repo_config() is not None:
+    path = find_repo_config()
+    if path is None:
+        print(
+            f"warning: this repository declares no {CONFIG_FILENAME}, and "
+            "`stackward pre-commit` refuses a repository that declares none "
+            "-- the hook is installed, but every commit will be blocked "
+            "until one exists.",
+            file=sys.stderr,
+        )
+        print(
+            f"Create {CONFIG_FILENAME} at the repository root with at least:\n"
+            + "\n".join(f"    {line}" for line in MINIMAL_POLICY.splitlines()),
+            file=sys.stderr,
+        )
         return
+
+    try:
+        if _is_tracked(path):
+            return
+    except InstallError:
+        return
+
     print(
-        f"warning: this repository declares no {CONFIG_FILENAME}, and "
-        "`stackward pre-commit` refuses a repository that declares none -- "
-        "the hook is installed, but every commit will be blocked until one "
-        "exists.",
+        f"warning: {path} exists but is not staged, and `stackward "
+        "pre-commit` reads its policy from the index rather than the "
+        "working tree -- the hook is installed, but every commit will be "
+        "blocked until the policy is staged too.",
         file=sys.stderr,
     )
-    print(
-        f"Create {CONFIG_FILENAME} at the repository root with at least:\n"
-        + "\n".join(f"    {line}" for line in MINIMAL_POLICY.splitlines()),
-        file=sys.stderr,
-    )
+    print(f"Stage it: git add {CONFIG_FILENAME}", file=sys.stderr)

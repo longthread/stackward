@@ -113,6 +113,37 @@ def test_doctor_still_works_when_repo_config_is_malformed(tmp_path, monkeypatch,
     assert str(tmp_path / ".stackward.toml") in capsys.readouterr().out
 
 
+def test_an_unmet_floor_is_reported_beside_a_key_this_binary_does_not_know(
+    tmp_path, monkeypatch, capsys
+):
+    """The floor must win over the unknown key, because the unknown key is
+    a *consequence* of the unmet floor.
+
+    A repository that demands a newer stackward is very likely to be using
+    something that newer stackward added, so an unrecognised top-level key
+    next to an unmet `min_version` is the expected shape of this config
+    rather than an exotic one -- it is forward-compatibility, which is the
+    situation the floor exists to make survivable. Reporting `unknown key
+    'future_key'` here names the symptom and sends the reader to delete the
+    one line that would have explained what to do.
+
+    The exit code is 2 either way (`check-config` refuses a config it
+    cannot validate), so this asserts on the *message*: that is the whole
+    difference, and an exit-code-only assertion would hold whether the
+    refusal reads the floor first or not.
+    """
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".stackward.toml").write_text(
+        'min_version = "9.9.9"\nfuture_key = "a key only a newer stackward knows"\n'
+    )
+    monkeypatch.chdir(tmp_path)
+
+    assert main(["check-config", "Pulumi.dev.yaml"]) == 2
+    err = capsys.readouterr().err
+    assert "requires stackward >= 9.9.9" in err
+    assert "future_key" not in err
+
+
 # ---------------------------------------------------------------------------
 # Lazy dispatch, and the frozen bundle
 # ---------------------------------------------------------------------------

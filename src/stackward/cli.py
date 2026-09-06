@@ -28,10 +28,11 @@ from .commands.check_config import cmd_check_config
 from .commands.install_hooks import cmd_install_hooks
 from .commands.pre_commit import cmd_pre_commit
 from .config import (
+    Config,
     MinVersionError,
     enforce_min_version,
     find_repo_config,
-    load_config,
+    read_min_version,
 )
 
 # Commands that must keep working even when a repo demands a newer stackward
@@ -380,6 +381,21 @@ def _min_version_refusal(command: str) -> int | None:
 
     A second, outer guard around this would be worse than none: with two,
     neither is falsifiable, and a test that deletes either one still passes.
+    The same rule is why the floor is read by `read_min_version` rather than
+    by `load_config` *and* re-ordered inside `_build_config`: one mechanism,
+    so that deleting it turns a test red.
+
+    `read_min_version`, not `load_config`, because the case this refusal
+    exists for is the case a full load cannot report. A repository that
+    demands a newer stackward is very likely to be using something that
+    newer stackward added, and an unrecognised top-level key makes
+    `load_config` raise before `min_version` is ever looked at -- so the
+    broad guard below would swallow it and the command would run, having
+    reported an unknown key rather than the upgrade that explains it.
+    Reading the floor alone keeps this refusal working on exactly the
+    forward-compatible config it is for. Nothing else about the file is
+    trusted here, and nothing else needs to be: it is validated in full by
+    whichever command reads it for its own purposes.
 
     It reads the *working tree*, deliberately, even though `pre-commit`
     reads its `[check]` policy from the index. `min_version` is a statement
@@ -389,8 +405,8 @@ def _min_version_refusal(command: str) -> int | None:
     """
     try:
         path = find_repo_config()
-        config = load_config(path) if path is not None else None
-        enforce_min_version(config, command)
+        min_version = read_min_version(path) if path is not None else None
+        enforce_min_version(Config(min_version=min_version), command)
     except MinVersionError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

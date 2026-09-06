@@ -603,11 +603,35 @@ def test_a_pulumi_timeout_is_reported_as_error_without_aborting_other_stacks(
     assert "stack-fast: accepted" in captured.out
 
 
+class _ControlViolation(BaseException):
+    """Raised by a control that must never run. `BaseException`, not
+    `Exception`, and that is the whole point of it.
+
+    `cmd_check_passphrase` is `@fail_closed` *and* its per-stack loop has
+    its own `except Exception`, so a control raised as an `AssertionError`
+    inside either is swallowed into `all_accepted = False` and the command
+    returns 2 -- the same 2 the test below expects for the right reason.
+    The assertion then holds whether the early refusal exists or not, which
+    is not a test. `tests/test_credentials.py`'s `_PromptViolation` and
+    `tests/test_gate_isolation.py`'s `GateViolation` are the same device for
+    the same reason. Not `KeyboardInterrupt`, which pytest treats as a
+    request to abort the whole session.
+    """
+
+
 def test_no_passphrase_provided_on_stdin_errors_before_any_stack_is_checked(monkeypatch):
+    """The refusal must happen *before* the loop, not be absorbed by it.
+
+    Both halves of that are load-bearing: without a passphrase there is
+    nothing to check, and a per-stack "could not check" would report the
+    same exit code while having run `pulumi` against every named stack.
+    Only a control that `fail_closed` cannot swallow can tell the two
+    apart -- see `_ControlViolation`.
+    """
     monkeypatch.setattr(check_passphrase.sys, "stdin", _FakeStdin(isatty=False, lines=[]))
 
     def boom(*a, **k):
-        raise AssertionError("no stack should be checked without a passphrase")
+        raise _ControlViolation("no stack should be checked without a passphrase")
 
     monkeypatch.setattr(check_passphrase, "_check_stack", boom)
     assert main(["check-passphrase", "stack-a"]) == 2

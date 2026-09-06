@@ -208,8 +208,19 @@ being `0o755`; the body containing an absolute path.
 
 **Requirements.**
 - Location: `${XDG_CONFIG_HOME:-~/.config}/stackward/`, holding `config`
-  (TOML, mode 0o644, backend identity, no credentials) and `credentials`
+  (TOML, mode 0o600, backend identity) and `credentials`
   (mode 0o600, directory 0o700).
+  - **Revised during implementation**, from "mode 0o644, backend identity, no
+    credentials". Both halves were superseded by the requirement below that
+    `backend_url` be passed through **verbatim**: `postgres://user:password@host/db`
+    is a documented, supported backend form, so `config` can hold a credential
+    after all. Enforcing "no credentials" would mean parsing a URL this project
+    deliberately does not parse, and would reject a backend Pulumi accepts.
+    The consequences are carried instead: mode `0o600` (`store.CONFIG_MODE`),
+    and a parse failure reports a coordinate rather than tomllib's own message,
+    which quotes document text (`config.toml_position`). Recorded here rather
+    than corrected silently, because "no credentials" reads like a rule the
+    code broke when it is a premise the code disproved.
 - `config` holds `default_profile` and `[profile.<name>]` tables. A profile
   carries **either** `backend_url` (passed through verbatim — `s3://`, `gs://`,
   `azblob://`, `file://` must all work) **or** the component form `bucket`,

@@ -263,6 +263,16 @@ def cmd_credentials_set(args: argparse.Namespace) -> int:
     required name must be supplied on every run -- a "set one name" that
     silently dropped the other two would be far worse than a refusal.
 
+    **It also seals every *extra* name it is given, on purpose.** `< .env`
+    is the documented way to fill the store and a real `.env` carries more
+    than the three names `exec`/`shell` inject; refusing the extras would
+    make the documented workflow fail on the ordinary file it was written
+    for, and would contradict `_require_values` and `_prompt_for_values`,
+    which both already say an envelope may legitimately hold more than this
+    tool consumes. What was missing was not a refusal but a sentence:
+    `credentials show` now names the sealed-but-not-injected ones, which is
+    where a person looking at their own store would notice them.
+
     The password is asked for last, so that malformed input, a missing name
     or an empty value is reported before anyone types it.
     """
@@ -330,6 +340,12 @@ def cmd_credentials_show(args: argparse.Namespace) -> int:
     profile carry -- was answered correctly, and the store is not in a state
     anything needs to refuse. `exec` is what refuses an incomplete envelope,
     and it already does.
+
+    Both notes go to stderr, so stdout stays the parseable list of names.
+    The second one -- names sealed that nothing injects -- exists because
+    this is the only place the asymmetry is visible: `set` seals what it is
+    given and `exec` injects three, so `set < .env` on a `.env` holding
+    anything else seals it with no word said anywhere.
     """
     try:
         profile = session._resolve_profile(args.profile)
@@ -347,6 +363,23 @@ def cmd_credentials_show(args: argparse.Namespace) -> int:
     if missing:
         print(
             f"missing, and required by exec/shell: {', '.join(missing)}",
+            file=sys.stderr,
+        )
+
+    # The other half of the same question, and the one nothing else in the
+    # tool says out loud: `set` seals every name it is given, `exec`/`shell`
+    # inject only `CREDENTIAL_NAMES`. `< .env` is the documented way to fill
+    # the store, and a `.env` that carries anything beyond those three seals
+    # the extras silently. That is intended (see `cmd_credentials_set`), and
+    # this is where someone would notice it -- `show` is the command that
+    # answers "what is in there", so an unexplained fourth name in its own
+    # listing is exactly what needs a sentence beside it.
+    extra = [name for name in names if name not in session.CREDENTIAL_NAMES]
+    if extra:
+        print(
+            f"sealed, but never injected by exec/shell: {', '.join(extra)} "
+            "(`credentials set` seals every name it is given; only "
+            f"{', '.join(session.CREDENTIAL_NAMES)} are injected)",
             file=sys.stderr,
         )
     return 0

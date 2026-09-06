@@ -38,9 +38,15 @@ prints is ever a value: `list` prints profile names, `show` prints the
 credential *names* an envelope carries, and neither prints what is beside
 them.
 
+`set` seals **every** name it is given, while `exec`/`shell` inject only the
+three they need — so a `.env` carrying more than those three has the extras
+sealed too. That is deliberate: a real `.env` holds more, and refusing it
+would break the very workflow this command exists for. `show` names any such
+extra, so it is visible rather than merely true.
+
 ```sh
 stackward credentials init                       # once, per machine
-stackward credentials set --profile NAME < .env  # then delete the .env
+stackward credentials set --profile NAME < .env  # every name in it; then rm .env
 stackward credentials show --profile NAME        # names only, never values
 ```
 

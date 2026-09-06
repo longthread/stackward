@@ -70,73 +70,23 @@ jobs:
             entry.py
 
       - name: It must actually run
-        # A bundle that builds is not a bundle that works. doctor performs a
-        # real Argon2id + AES-GCM round trip, so this catches a native
-        # extension that failed to freeze — the classic failure of this route.
-        #
-        # doctor also reads `regen.py` back out of the bundle through the same
-        # accessor `sync-declared-secrets` uses. That file is carried by the
-        # `--add-data` entry above rather than by import analysis, so dropping
-        # it would produce a binary that builds, starts, and then fails at the
-        # one command that needs it — in the shipped artifact and nowhere
-        # else. doctor exits non-zero on that, and the grep below states the
-        # expectation so a future edit to doctor's output cannot silently
-        # retire this check.
+        # A bundle that builds is not a bundle that works. The checks, and
+        # the reasoning behind each, live in `scripts/check-bundle.sh` --
+        # one definition, run here against what this job just built and
+        # again in `publish` against the artifact actually being released.
+        # Two copies of this is how `publish` came to test only `--version`
+        # and `doctor`, the two commands a missing lazily-dispatched module
+        # cannot break.
         run: |
           set -euo pipefail
-          ./dist/stackward/stackward --version
-          ./dist/stackward/stackward doctor | tee doctor.txt
-          grep -q "^model walker    regen.py readable" doctor.txt
+          scripts/check-bundle.sh ./dist/stackward/stackward
 
-          # A lazily dispatched command must actually load in the bundle.
-          # `cli._dispatch` imports each command module only when its
-          # subcommand runs, and PyInstaller can only see an import it can
-          # read as a literal statement: while that dispatch named its module
-          # dynamically, every one of these commands was missing from the
-          # binary and died on `ModuleNotFoundError` with a traceback and
-          # exit code 1 — the code reserved for "a credential was found" —
-          # while `--version` and `doctor` (both registered directly) kept
-          # passing this very step.
-          #
-          # Two commands, from two different modules, and neither needs a
-          # credential, a store or a network: each refuses with exit code 2
-          # after its module has loaded, which is exactly the evidence
-          # wanted. `set -e` is off for these because a non-zero exit is the
-          # expected outcome.
-          # Run from an empty directory, not the checkout: `cli.main`
-          # enforces a repository's `min_version` floor *before* dispatch, so
-          # a `.stackward.toml` above the working directory could make both
-          # commands exit 2 without either module ever loading -- the check
-          # would then pass on exactly the evidence it exists to reject.
-          bundle="$PWD/dist/stackward/stackward"
-          for command in "credentials list" "exec"; do
-            set +e
-            # shellcheck disable=SC2086
-            out="$(cd "$(mktemp -d)" && XDG_CONFIG_HOME="$PWD" "$bundle" $command 2>&1)"
-            code=$?
-            set -e
-            if [ "$code" -ne 2 ]; then
-              echo "::error::\`stackward $command\` exited $code, expected 2" >&2
-              printf '%s\n' "$out" >&2
-              exit 1
-            fi
-            case "$out" in
-              *ModuleNotFoundError*|*Traceback*|*"invalid choice"*)
-                # "invalid choice" is the other way this passes for the wrong
-                # reason: an unregistered subcommand also exits 2, from
-                # argparse, having loaded nothing at all.
-                echo "::error::\`stackward $command\` did not load in the bundle" >&2
-                printf '%s\n' "$out" >&2
-                exit 1
-                ;;
-            esac
-          done
-
-          # The other half of that arrangement: `regen.py` ships as data
-          # precisely so nothing imports it and pydantic stays test-only. If it
-          # ever became an import, the bundle would still build, doctor would
-          # still pass, and the only visible symptom would be a fatter
-          # download — so the absence has to be asserted, not assumed.
+          # Not in the shared script: this one inspects the PyInstaller
+          # output tree, which only this job has. `regen.py` ships as data
+          # precisely so nothing imports it and pydantic stays test-only. If
+          # it ever became an import, the bundle would still build, doctor
+          # would still pass, and the only visible symptom would be a fatter
+          # download -- so the absence has to be asserted, not assumed.
           if find dist -iname '*pydantic*' -print -quit | grep -q .; then
             echo "::error::pydantic was bundled; it is a test-only dependency" >&2
             find dist -iname '*pydantic*' | head -20 >&2
@@ -182,16 +132,23 @@ jobs:
 
       - name: Verify the install path before publishing it
         # Install exactly as a user would, from the artifacts about to be
-        # released, and run the smoke test. A release that cannot be installed
-        # is deleted, not patched: the tag is already immutable in people's
-        # lockfiles and instructions.
+        # released, and run the same check the build job ran -- against the
+        # bytes actually being published, which is the only artifact whose
+        # correctness this job can still act on. A release that cannot be
+        # installed is deleted, not patched: the tag is already immutable in
+        # people's lockfiles and instructions.
+        #
+        # `scripts/check-bundle.sh`, not a second smoke test written here:
+        # this step used to run `--version` and `doctor` alone, and those are
+        # exactly the two commands that stayed green through a bundle that
+        # was missing every lazily dispatched one.
         run: |
           set -euo pipefail
           cd artifacts
           sha256sum --check stackward-Linux-x86_64.tar.gz.sha256
           mkdir -p /tmp/probe && tar -xzf stackward-Linux-x86_64.tar.gz -C /tmp/probe
-          /tmp/probe/stackward/stackward --version
-          /tmp/probe/stackward/stackward doctor
+          # Absolute: the working directory is `artifacts`, not the checkout.
+          "$GITHUB_WORKSPACE/scripts/check-bundle.sh" /tmp/probe/stackward/stackward
 
       - name: Publish
         env:

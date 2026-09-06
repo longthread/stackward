@@ -899,14 +899,21 @@ def test_git_runs_under_a_fixed_locale(repo, monkeypatch):
     read the same in a bug report as it did on the machine that hit it.
 
     Scope, so this does not become a trap for whoever changes the fixture
-    next: the loop covers every git invocation the command makes, and it
-    holds only because `repo` declares `model_net = "none"`. Under
-    `model_net = "artifact"`, `nets.model.run_git` also runs, and it sets no
-    locale -- a second call site with the same gap, in a file this wave does
-    not own. `commands.install_hooks._is_tracked` is a third, and there it
-    is a live bug rather than hardening: it branches on git's *translated*
-    strings, so under a non-English locale it raises and `hooks install`
-    exits 2 in every repository.
+    next: the loop covers every git invocation *this command* makes, and
+    that holds only because `repo` declares `model_net = "none"`. Under
+    `model_net = "artifact"` a second call site runs as well
+    (`nets.model.run_git`), and `commands.install_hooks._git` is a third.
+    This docstring used to record both as gaps -- and `install_hooks`, which
+    matches git's *translated* strings, as a live bug rather than
+    hardening. Both were closed afterwards: each sets `LC_ALL=C` with the
+    environment merged, and each is pinned by a test in its own file that
+    goes red if the override is dropped: `test_model_net.py` and
+    `test_install_hooks.py` each carry their own
+    `test_every_git_invocation_runs_under_a_fixed_locale`, and the live half
+    is pinned at the level where it bit by
+    `test_hooks_install_survives_a_git_that_translates_its_diagnostics`.
+    What must stay true is that a *new* call site brings its own file's
+    test, not that this loop grows to reach across modules.
 
     The merge half matters more than the override: git sets `GIT_INDEX_FILE`
     and `GIT_DIR` for a hook process, and passing a bare `env={"LC_ALL":

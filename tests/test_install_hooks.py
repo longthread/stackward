@@ -775,7 +775,7 @@ def test_the_repo_fixture_ignores_a_global_core_hookspath(repo, isolated_git):
 
 
 # ---------------------------------------------------------------------------
-# A repository with no policy file: a warning, never a refusal.
+# No policy the *hook* will find: a warning, never a refusal.
 # ---------------------------------------------------------------------------
 
 
@@ -824,6 +824,42 @@ def test_a_repository_that_declares_a_policy_gets_no_warning(repo, monkeypatch, 
     assert "warning" not in capsys.readouterr().err.lower()
 
 
+@pytest.fixture
+def repo_with_unstaged_policy(repo) -> Path:
+    """`repo` with its `.stackward.toml` still on disk but no longer in the
+    index.
+
+    `--cached` removes the index entry and leaves the working-tree file
+    alone, which is the state a repository is in between writing a policy
+    and staging it -- and that is the moment somebody runs `hooks install`.
+    """
+    _git(repo, "rm", "-q", "--cached", ".stackward.toml")
+    return repo
+
+
+def test_an_unstaged_policy_warns_that_it_is_unstaged(
+    repo_with_unstaged_policy, monkeypatch, capsys
+):
+    """The warning has to answer the question the hook will ask.
+
+    `pre-commit` reads its policy from the index, so a file sitting
+    unstaged in the working tree is no policy to it -- and this repository
+    used to be told nothing at all, then block every commit. Saying
+    "declares none" here would be worse than silence: it is visibly false
+    to someone looking straight at the file, which is how a warning teaches
+    people to stop reading warnings.
+    """
+    assert install(repo_with_unstaged_policy, monkeypatch) == 0
+    assert (repo_with_unstaged_policy / ".git" / "hooks" / "pre-commit").is_file()
+
+    err = capsys.readouterr().err
+    assert "warning" in err.lower()
+    assert "not staged" in err
+    assert f"git add {install_hooks_module.CONFIG_FILENAME}" in err
+    # Not the absent-policy wording: the file is right there.
+    assert "declares no" not in err
+
+
 def test_the_policy_warning_does_not_change_the_exit_code_of_a_refusal(
     repo_without_policy, monkeypatch, capsys
 ):
@@ -838,6 +874,43 @@ def test_the_policy_warning_does_not_change_the_exit_code_of_a_refusal(
 
     assert install(repo_without_policy, monkeypatch) == 1
     assert "no .stackward.toml" not in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# A repository that demands a newer stackward than this one.
+# ---------------------------------------------------------------------------
+
+
+def test_an_unmet_min_version_floor_refuses_before_any_hook_is_written(
+    repo, monkeypatch, capsys
+):
+    """`hooks install` is the command with the most to lose from a floor
+    check that quietly gives up.
+
+    Every other command refuses a `.stackward.toml` it cannot validate, so
+    an unreported floor still costs them only the wrong *message*. This one
+    reads no policy at all: with the refusal silenced it installs the hook
+    and exits 0, and the repository is then gated by a binary its own
+    policy says is too old to understand the policy. The floor is what
+    catches that, and it has to survive the config carrying a key this
+    binary does not know -- which is the shape a repository demanding a
+    newer stackward actually has.
+
+    Staged, not merely written, so that the missing-policy warning has
+    nothing to say here and the only thing under test is the floor.
+    """
+    # Top-level keys before the `[check]` table -- after it they would be
+    # members of it, and this would test something else entirely.
+    (repo / ".stackward.toml").write_text(
+        'min_version = "9.9.9"\n'
+        'future_key = "a key only a newer stackward knows"\n'
+        '[check]\nmodel_net = "none"\n'
+    )
+    _git(repo, "add", ".stackward.toml")
+
+    assert install(repo, monkeypatch) == 2
+    assert not (repo / ".git" / "hooks" / "pre-commit").exists()
+    assert "requires stackward >= 9.9.9" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

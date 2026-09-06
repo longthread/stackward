@@ -60,7 +60,12 @@ NEW_PASSWORD = "Qv6Wb4Xs2Tk9Pm3Ld"
 MARKER_KEY = "Ab7Kd2Ns9Rv4Tq6Xw"
 MARKER_SECRET = "Cf3Jm8Ph5Lz1Yb7Gd"
 MARKER_PASSPHRASE = "Ew9Ur4Vt2Kn6Sx8Qc"
-ALL_MARKERS = (MARKER_KEY, MARKER_SECRET, MARKER_PASSPHRASE)
+MARKER_EXTRA = "Hq5Zt3Bw8Nk2Ly6Fp"
+ALL_MARKERS = (MARKER_KEY, MARKER_SECRET, MARKER_PASSPHRASE, MARKER_EXTRA)
+
+# A name a real `.env` would carry that this tool never injects. Generic on
+# purpose: no vendor, product or environment appears in this repository.
+EXTRA_NAME = "DATABASE_URL"
 
 FULL_CREDENTIALS = {
     AWS_ACCESS_KEY_ID: MARKER_KEY,
@@ -558,6 +563,51 @@ def test_show_reports_a_shortfall_without_failing(initialised, monkeypatch, capf
     captured = capfd.readouterr()
     assert AWS_SECRET_ACCESS_KEY in captured.err
     assert_no_leak(captured.out + captured.err, MARKER_KEY, what="a credential")
+
+
+def test_show_names_what_is_sealed_but_never_injected(
+    initialised, monkeypatch, capfd
+):
+    """`set` seals every name it is given; `exec`/`shell` inject three.
+
+    Sealing the extras is intended -- `< .env` is the documented workflow
+    and a real `.env` carries more than three names -- so the defect was
+    never the behaviour, it was that nothing anywhere said so. `show` is
+    where a person would notice a fourth name, so it is where the sentence
+    belongs; without it the listing states a fact and leaves its meaning to
+    be guessed at.
+    """
+    monkeypatch.setenv(ENV_STORE_PASSWORD, PASSWORD)
+    store.set_credentials(
+        "staging",
+        {**FULL_CREDENTIALS, EXTRA_NAME: MARKER_EXTRA},
+        PASSWORD,
+        directory=initialised,
+    )
+
+    assert main(["credentials", "show", "--profile", "staging"]) == 0
+
+    captured = capfd.readouterr()
+    # Sealed and listed, exactly as before -- the note explains it, it does
+    # not hide it.
+    assert EXTRA_NAME in captured.out
+    assert EXTRA_NAME in captured.err
+    assert "never injected" in captured.err
+    for marker in ALL_MARKERS:
+        assert_no_leak(captured.out + captured.err, marker, what="a credential")
+
+
+def test_show_says_nothing_about_extras_when_there_are_none(
+    initialised, monkeypatch, capfd
+):
+    """The other half: a note that fires on the ordinary envelope is noise,
+    and noise is how the useful half stops being read."""
+    monkeypatch.setenv(ENV_STORE_PASSWORD, PASSWORD)
+    store.set_credentials("staging", FULL_CREDENTIALS, PASSWORD, directory=initialised)
+
+    assert main(["credentials", "show", "--profile", "staging"]) == 0
+
+    assert "never injected" not in capfd.readouterr().err
 
 
 def test_show_on_a_profile_with_no_envelope_says_so(initialised, monkeypatch, capsys):

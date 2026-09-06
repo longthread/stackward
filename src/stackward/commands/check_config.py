@@ -262,10 +262,25 @@ def describe_yaml_error(exc: yaml.YAMLError) -> str:
     character some other way. `tests/test_heuristic.py`'s parameterized
     redaction test is what would catch a future wording change that
     escapes this pattern; this docstring does not promise it can't happen.
-    Contrast `config.py`'s `load_config`, which safely echoes tomllib's
-    message in full because `.stackward.toml` holds only path and key
-    *names* — this file holds the opposite, so it gets the more careful,
-    still-bounded treatment.
+    **`config.py` is not the contrast this comment used to draw.** It said
+    `load_config` safely echoed tomllib's message in full, because
+    `.stackward.toml` holds only path and key *names*. Both halves were
+    wrong, and both have since been fixed in the code. `tomllib` does quote
+    document text — `tomllib.loads("[a]\nx=1\n[a]\n")` raises `Cannot
+    declare ('a',) twice (at line 3, column 3)`, naming the key back — and
+    "the file holds no value" is exactly the assumption a file that failed
+    to parse has already broken, which is the one thing an error path
+    reporting on such a file must not lean on.
+
+    What the two modules actually do, so neither is reverted on the
+    strength of a sentence about the other: `config.toml_position` matches
+    the `(at line L, column C)` coordinate out of the message and emits
+    *only* that, which it can afford because nearly every tomllib message
+    is a fixed description plus that coordinate. PyYAML's `problem` carries
+    most of the information instead, so this function keeps it and strips
+    every repr-quoted run out of it. Two bounded treatments of one rule —
+    a parser's message is never passed through as it came — and a licence,
+    anywhere, to pass one through in full is not among them.
     """
     if isinstance(exc, yaml.MarkedYAMLError) and exc.problem is not None:
         problem = _QUOTED_FRAGMENT.sub("<redacted>", exc.problem)
