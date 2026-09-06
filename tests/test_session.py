@@ -88,6 +88,20 @@ AMBIENT_CREDENTIALS = {
     PULUMI_CONFIG_PASSPHRASE: AMBIENT_PASSPHRASE,
 }
 
+# The other half of what "a developer who already has AWS credentials
+# exported" looks like: a session token from an assumed role, and a selected
+# shared-config profile. Seeded into the parent environment for the same
+# reason `AMBIENT_CREDENTIALS` is -- a test whose parent never carries these
+# names cannot tell "scrubbed" from "was never there", which is precisely
+# the assertion `SCRUBBED_NAMES` needs. Values, not just names, so nothing
+# here depends on whether the developer running the suite happens to have
+# either exported.
+AMBIENT_SESSION_TOKEN = "ambient-session-token-3a5c7e9b"
+AMBIENT_AWS_PROFILE = "ambient-config-profile-8d0f2b4a"
+AMBIENT_SCRUBBED = dict(
+    zip(session.SCRUBBED_NAMES, (AMBIENT_SESSION_TOKEN, AMBIENT_AWS_PROFILE))
+)
+
 # A backend URL that carries a password in its userinfo -- the
 # `postgres://user:password@host/db` form `pulumi login --help` documents and
 # `_redact_url` exists for. Used wherever a test would otherwise only ever see
@@ -145,6 +159,10 @@ def no_real_pulumi_state(monkeypatch, tmp_path):
     monkeypatch.setenv("PULUMI_HOME", str(tmp_path / "pulumi-home"))
     monkeypatch.delenv(PULUMI_BACKEND_URL, raising=False)
     for name, value in AMBIENT_CREDENTIALS.items():
+        monkeypatch.setenv(name, value)
+    # See AMBIENT_SCRUBBED: set for the same reason the three above are, so
+    # that the delta assertions can see a removal rather than an absence.
+    for name, value in AMBIENT_SCRUBBED.items():
         monkeypatch.setenv(name, value)
 
 
@@ -750,16 +768,52 @@ def test_child_env_overlays_exactly_four_names_on_a_copy_of_the_parent(monkeypat
     child_keys = set(env)
     # `PULUMI_BACKEND_URL` is the only name the parent does not already have.
     assert child_keys - parent_keys == {PULUMI_BACKEND_URL}
-    # The one name that must be *dropped*, not merely left alone.
-    assert parent_keys - child_keys == {ENV_STORE_PASSWORD}
+    # The names that must be *dropped*, not merely left alone.
+    assert parent_keys - child_keys == {ENV_STORE_PASSWORD, *session.SCRUBBED_NAMES}
     assert ENV_STORE_PASSWORD not in env
-    for key in parent_keys - {ENV_STORE_PASSWORD} - set(AMBIENT_CREDENTIALS):
+    dropped = {ENV_STORE_PASSWORD, *session.SCRUBBED_NAMES}
+    for key in parent_keys - dropped - set(AMBIENT_CREDENTIALS):
         assert env[key] == parent_before[key]  # nothing else changed
     assert env[AWS_ACCESS_KEY_ID] == MARKER_KEY != AMBIENT_KEY
     assert env[AWS_SECRET_ACCESS_KEY] == MARKER_SECRET != AMBIENT_SECRET
     assert env[PULUMI_CONFIG_PASSPHRASE] == MARKER_PASSPHRASE != AMBIENT_PASSPHRASE
     assert env[PULUMI_BACKEND_URL] == "file:///backend"
     assert PASSWORD not in env.values()
+
+
+def test_a_stale_session_token_and_shared_profile_are_dropped_from_the_child():
+    """The two `SCRUBBED_NAMES`, each present in the parent with a value.
+
+    Not a restatement of the delta assertion above: this one names the two
+    variables literally, so it stays honest if `SCRUBBED_NAMES` is ever
+    emptied -- a delta written as `{ENV_STORE_PASSWORD, *SCRUBBED_NAMES}`
+    passes against an empty tuple, since both sides shrink together.
+    """
+    assert os.environ["AWS_SESSION_TOKEN"] == AMBIENT_SESSION_TOKEN
+    assert os.environ["AWS_PROFILE"] == AMBIENT_AWS_PROFILE
+
+    env = session._child_env(FULL_CREDENTIALS, "file:///backend")
+
+    assert "AWS_SESSION_TOKEN" not in env
+    assert "AWS_PROFILE" not in env
+
+
+def test_a_scrubbed_name_sealed_into_the_envelope_is_still_not_injected():
+    """Scrubbed *and* never supplied.
+
+    An envelope may legitimately hold names beyond the three required ones
+    (`test_extra_names_beyond_the_three_required_are_accepted`), so "the
+    store has a value for it" is a reachable state. It still must not reach
+    the child: a token sealed months ago is exactly the stale one the scrub
+    exists to remove, and injecting it would make the store a way to
+    reintroduce the problem.
+    """
+    sealed = dict(FULL_CREDENTIALS)
+    sealed["AWS_SESSION_TOKEN"] = "envelope-session-token-6c8a0e2d"
+
+    env = session._child_env(sealed, "file:///backend")
+
+    assert "AWS_SESSION_TOKEN" not in env
 
 
 # ---------------------------------------------------------------------------
@@ -1102,12 +1156,21 @@ def assert_expected_session_env(
     child_keys = set(child_env)
     # `PULUMI_BACKEND_URL` is the only name the parent does not already carry.
     assert child_keys - parent_keys == {PULUMI_BACKEND_URL}
-    # The one name that must be *dropped*, not merely left alone: the store
+    # The names that must be *dropped*, not merely left alone: the store
     # master password unlocks every profile, not just this one, and must
-    # never reach caller-supplied code.
-    assert parent_keys - child_keys == {ENV_STORE_PASSWORD}
+    # never reach caller-supplied code; the two `SCRUBBED_NAMES` would sit
+    # beside the freshly injected key pair and contradict it. All three are
+    # in the parent with real values (see `no_real_pulumi_state`), so this
+    # asserts a removal and not an absence.
+    assert parent_keys - child_keys == {ENV_STORE_PASSWORD, *session.SCRUBBED_NAMES}
     assert ENV_STORE_PASSWORD not in child_env
-    untouched = parent_keys - {"STUB_DUMP_ENV_TO", ENV_STORE_PASSWORD}
+    for name in session.SCRUBBED_NAMES:
+        assert name not in child_env
+    untouched = (
+        parent_keys
+        - {"STUB_DUMP_ENV_TO", ENV_STORE_PASSWORD}
+        - set(session.SCRUBBED_NAMES)
+    )
     for key in untouched - set(AMBIENT_CREDENTIALS):
         assert child_env[key] == parent_before[key]
     assert child_env[AWS_ACCESS_KEY_ID] == MARKER_KEY != AMBIENT_KEY
@@ -1706,6 +1769,30 @@ def test_login_scrubs_the_store_password_from_pulumis_environment(
     child_env = json.loads(dump.read_text())
     assert ENV_STORE_PASSWORD not in child_env
     assert PASSWORD not in child_env.values()
+
+
+def test_login_keeps_the_ambient_aws_names_it_does_not_contradict(
+    cli_store, monkeypatch, tmp_path, stub
+):
+    """The deliberate asymmetry, asserted rather than merely documented.
+
+    `login` injects no credentials, so neither scrubbed name can conflict
+    with one there -- and a backend the caller reaches through their own
+    assumed role or shared-config profile is a working setup. Scrubbing in
+    `_environ_without_store_password` (shared with `login`) instead of in
+    `_child_env` would break it silently, and every other test in this file
+    would still pass.
+    """
+    seed_profile(cli_store, "staging", backend_url="file:///staging-backend")
+    dump = tmp_path / "env.json"
+    monkeypatch.setenv("STUB_DUMP_ENV_TO", str(dump))
+    fake_pulumi(monkeypatch, stub)
+
+    assert main(["login", "--profile", "staging"]) == 0
+
+    child_env = json.loads(dump.read_text())
+    assert child_env["AWS_SESSION_TOKEN"] == AMBIENT_SESSION_TOKEN
+    assert child_env["AWS_PROFILE"] == AMBIENT_AWS_PROFILE
 
 
 def test_login_never_puts_a_userinfo_bearing_url_in_argv_or_output(

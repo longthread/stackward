@@ -88,6 +88,50 @@ jobs:
           ./dist/stackward/stackward doctor | tee doctor.txt
           grep -q "^model walker    regen.py readable" doctor.txt
 
+          # A lazily dispatched command must actually load in the bundle.
+          # `cli._dispatch` imports each command module only when its
+          # subcommand runs, and PyInstaller can only see an import it can
+          # read as a literal statement: while that dispatch named its module
+          # dynamically, every one of these commands was missing from the
+          # binary and died on `ModuleNotFoundError` with a traceback and
+          # exit code 1 — the code reserved for "a credential was found" —
+          # while `--version` and `doctor` (both registered directly) kept
+          # passing this very step.
+          #
+          # Two commands, from two different modules, and neither needs a
+          # credential, a store or a network: each refuses with exit code 2
+          # after its module has loaded, which is exactly the evidence
+          # wanted. `set -e` is off for these because a non-zero exit is the
+          # expected outcome.
+          # Run from an empty directory, not the checkout: `cli.main`
+          # enforces a repository's `min_version` floor *before* dispatch, so
+          # a `.stackward.toml` above the working directory could make both
+          # commands exit 2 without either module ever loading -- the check
+          # would then pass on exactly the evidence it exists to reject.
+          bundle="$PWD/dist/stackward/stackward"
+          for command in "credentials list" "exec"; do
+            set +e
+            # shellcheck disable=SC2086
+            out="$(cd "$(mktemp -d)" && XDG_CONFIG_HOME="$PWD" "$bundle" $command 2>&1)"
+            code=$?
+            set -e
+            if [ "$code" -ne 2 ]; then
+              echo "::error::\`stackward $command\` exited $code, expected 2" >&2
+              printf '%s\n' "$out" >&2
+              exit 1
+            fi
+            case "$out" in
+              *ModuleNotFoundError*|*Traceback*|*"invalid choice"*)
+                # "invalid choice" is the other way this passes for the wrong
+                # reason: an unregistered subcommand also exits 2, from
+                # argparse, having loaded nothing at all.
+                echo "::error::\`stackward $command\` did not load in the bundle" >&2
+                printf '%s\n' "$out" >&2
+                exit 1
+                ;;
+            esac
+          done
+
           # The other half of that arrangement: `regen.py` ships as data
           # precisely so nothing imports it and pydantic stays test-only. If it
           # ever became an import, the bundle would still build, doctor would

@@ -34,6 +34,7 @@ git index rather than the working tree.
 
 from __future__ import annotations
 
+import re
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -332,6 +333,53 @@ def _build_config(data: dict[str, Any]) -> Config:
     )
 
 
+# The `(at line L, column C)` coordinate `tomllib` appends to most of its
+# messages, and the only part of such a message that is safe to quote back —
+# see `toml_position`.
+_TOML_POSITION = re.compile(r"\(at (?:line \d+, column \d+|end of document)\)")
+
+
+def toml_position(exc: tomllib.TOMLDecodeError) -> str:
+    """Just the coordinate out of a `TOMLDecodeError`, as ` (at line L,
+    column C)`, or `""` when the message does not carry one.
+
+    **`tomllib` echoes document text.** Most of its messages are a fixed
+    description plus a coordinate, but not all: `tomllib.loads("[a]\\nx=1\\n
+    [a]\\n")` raises `Cannot declare ('a',) twice`, naming the key back. So
+    a call site that interpolates `exc` is quoting whatever the parser
+    decided to quote, which is a property of the input file rather than a
+    decision this code made — and Global Constraint 4 forbids printing the
+    matching text.
+
+    That was found first in `store.py`, whose `config` file can hold a
+    credential (a `backend_url` of the documented
+    `postgres://user:password@host/db` form), and the same defect was still
+    in `load_config_text` below, guarded only by the claim that
+    `.stackward.toml` holds path and key *names* and never a value. The
+    claim is a reasonable reading of what that file is *for*, and it is not
+    something this error path can check: the text it is reporting on is, by
+    definition, a file that failed to parse — half-pasted, mid-edit, or
+    written by someone who misunderstood it. "The file should not contain a
+    credential" is exactly the assumption a mistake violates, and the error
+    that catches the mistake is the last place that should read one back.
+
+    One definition, in `config.py` rather than in `store.py`, because both
+    modules need it and only this direction of import is available:
+    `store.py` imports `crypto`, and `config.py` is on the gate path, where
+    Global Constraint 2 forbids reaching either. So `store` imports this,
+    and never the reverse.
+
+    The coordinate is kept because it is what makes the error actionable and
+    it is structural, not quoted text. `TOMLDecodeError` exposes no
+    `lineno`/`colno` before 3.13 and this project supports 3.11, so it is
+    matched out of the message rather than read off the exception; a message
+    shape this does not recognise simply yields no coordinate, which loses
+    diagnostics and never discloses anything.
+    """
+    match = _TOML_POSITION.search(str(exc))
+    return f" {match.group(0)}" if match else ""
+
+
 def load_config_text(text: str, origin: str) -> Config:
     """Parse and validate `text` as `.stackward.toml` content.
 
@@ -359,10 +407,10 @@ def load_config_text(text: str, origin: str) -> Config:
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as exc:
-        # `.stackward.toml` holds path and key *names* only, never a
-        # credential value, so it is safe for this message to include
-        # whatever tomllib quotes from the offending line.
-        raise ConfigError(f"{origin}: invalid TOML: {exc}") from exc
+        # Position only, never the parser's message — see `toml_position`,
+        # and `store.load_store_config`, which is the same refusal for the
+        # same reason.
+        raise ConfigError(f"{origin}: invalid TOML{toml_position(exc)}") from exc
 
     try:
         return _build_config(data)

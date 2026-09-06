@@ -480,29 +480,31 @@ def _build_secret_source(
     )
 
 
-def parse_env_file(path: Path) -> dict[str, str]:
-    """Parse one `KEY=VALUE` file: blank lines and `#` comments are ignored, a
+def parse_env_text(text: str, origin: str) -> dict[str, str]:
+    """Parse `KEY=VALUE` text: blank lines and `#` comments are ignored, a
     leading `export ` is stripped from the key side, and exactly one matched
     pair of surrounding quotes is stripped from the value.
 
-    Warns on stderr (via `store.warn_if_permissive`, the same message shape
-    used for the credential store's own files) when `path` is more permissive
-    than `0o600` — this file can hold a bootstrap secret in plaintext on disk,
-    so a mode that lets another local user read it is worth flagging, even
-    though refusing to read it outright would only lock a user out of their
-    own secrets after the exposure already happened.
+    `origin` names where the text came from, so a malformed line can be
+    reported as `<origin>:<line number>` — a filesystem path for
+    `parse_env_file` below, and `"stdin"` for `commands.credentials`, which
+    reads the same format off a pipe (a `.env` file being sealed into the
+    store is the migration this format exists to serve at both ends).
 
     A non-blank, non-comment line with no `=` is a `SetSecretsError` naming
-    the file and line number, never the line's own text — this is fail-closed
-    on a genuinely malformed bootstrap file rather than silently skipping a
-    line that was probably meant to define something.
-    """
-    warn_if_permissive(path, 0o600)
-    try:
-        text = path.read_text()
-    except OSError as exc:
-        raise SetSecretsError(f"{path}: cannot read: {exc}") from exc
+    the origin and line number, **never the line's own text** — this is
+    fail-closed on a genuinely malformed bootstrap file rather than silently
+    skipping a line that was probably meant to define something, and the
+    message stays safe to forward to a caller with a different vocabulary
+    (see `commands.credentials`, which re-raises it) precisely because it
+    carries no content.
 
+    Whitespace around a value is stripped, and quoting is how a value that
+    genuinely ends in a space survives — the same rule a shell applies to
+    `KEY=value` and the same one every `.env` reader applies, which is what
+    makes "pipe the file you already have" mean the same thing here as it
+    did there.
+    """
     values: dict[str, str] = {}
     for line_number, raw_line in enumerate(text.splitlines(), start=1):
         line = raw_line.strip()
@@ -511,16 +513,40 @@ def parse_env_file(path: Path) -> dict[str, str]:
         if line.startswith(_EXPORT_PREFIX):
             line = line[len(_EXPORT_PREFIX) :]
         if "=" not in line:
-            raise SetSecretsError(f"{path}:{line_number}: not a KEY=VALUE line")
+            raise SetSecretsError(f"{origin}:{line_number}: not a KEY=VALUE line")
         key, _, value = line.partition("=")
         key = key.strip()
         value = value.strip()
         if len(value) >= 2 and value[0] == value[-1] and value[0] in _QUOTE_CHARS:
             value = value[1:-1]
         if not key:
-            raise SetSecretsError(f"{path}:{line_number}: empty key")
+            raise SetSecretsError(f"{origin}:{line_number}: empty key")
         values[key] = value
     return values
+
+
+def parse_env_file(path: Path) -> dict[str, str]:
+    """`parse_env_text` over one file's contents.
+
+    Warns on stderr (via `store.warn_if_permissive`, the same message shape
+    used for the credential store's own files) when `path` is more permissive
+    than `0o600` — this file can hold a bootstrap secret in plaintext on disk,
+    so a mode that lets another local user read it is worth flagging, even
+    though refusing to read it outright would only lock a user out of their
+    own secrets after the exposure already happened.
+
+    The parsing itself is in `parse_env_text` because two commands need it
+    over two different sources: this one reads a declared source file, and
+    `commands.credentials` reads the same format off stdin. A second
+    implementation of "what does a `.env` line mean" is how the two come to
+    disagree about a quoted value on the day it matters.
+    """
+    warn_if_permissive(path, 0o600)
+    try:
+        text = path.read_text()
+    except OSError as exc:
+        raise SetSecretsError(f"{path}: cannot read: {exc}") from exc
+    return parse_env_text(text, str(path))
 
 
 # ---------------------------------------------------------------------------

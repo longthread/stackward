@@ -1,15 +1,20 @@
 """Command dispatch.
 
-v0.1.0 deliberately ships only `--version` and `doctor`. The point of this
-release is to prove the distribution path — build, sign, publish, download,
-install, run — while it is still cheap to change. Features land on top of a
-distribution mechanism that is already known to work, not the other way round.
+`v0.1.0` shipped `--version` and `doctor` alone, deliberately: the point of
+that release was to prove the distribution path — build, sign, publish,
+download, install, run — while it was still cheap to change. That path held,
+and the commands below landed on top of a distribution mechanism already
+known to work, rather than the other way round.
+
+Every subcommand that can touch a credential is registered through
+`_dispatch`, which imports its module only when the subcommand actually
+runs. That is not a startup-time optimisation; see `_dispatch` for what it
+is.
 """
 
 from __future__ import annotations
 
 import argparse
-import importlib
 import os
 import platform
 import shutil
@@ -42,6 +47,52 @@ from .config import (
 VERSION_CHECK_EXEMPT = frozenset({"doctor", "self-update"})
 
 
+# Every command module reached through `_dispatch`, as literal `import`
+# statements. See `_import_command` for why this is not a dictionary, a
+# registry, or `importlib.import_module`.
+def _import_command(module_name: str):
+    """The `commands` submodule named by `module_name`, imported now.
+
+    Written as one literal `import` statement per module rather than as
+    `importlib.import_module(f".commands.{module_name}", __package__)`,
+    which is what this was, because of what a *frozen* build can see.
+    PyInstaller resolves imports by reading `import` statements out of
+    compiled bytecode -- including statements inside a function body, which
+    is exactly what keeps these lazy (`crypto_selftest`'s own function-level
+    `import cryptography` is why the cryptography backend is in the bundle at
+    all). It cannot resolve a module name assembled at runtime.
+
+    So with the f-string form, **none** of the lazily dispatched commands was
+    in the shipped binary. Verified against the release workflow's own build
+    command: `stackward exec` in the bundle died with `ModuleNotFoundError:
+    No module named 'stackward.commands.session'`, a raw traceback, and exit
+    code 1 -- the code this tool reserves exclusively for "a credential was
+    found". The failure existed only in the artifact everyone installs, which
+    is the same shape as the two failures `doctor`'s self-tests were added
+    to catch, and for the same reason it is not something a source checkout
+    can notice.
+
+    An `if` chain, and not a mapping of names to import thunks, because a
+    mapping built at module scope would run every one of those thunks when
+    this module is imported -- which is the whole cost being avoided. The
+    same shape, for the same reason, as
+    `session._build_credential_store`'s provider dispatch.
+    """
+    if module_name == "session":
+        from .commands import session as module
+    elif module_name == "credentials":
+        from .commands import credentials as module
+    elif module_name == "set_secrets":
+        from .commands import set_secrets as module
+    elif module_name == "sync_declared":
+        from .commands import sync_declared as module
+    elif module_name == "check_passphrase":
+        from .commands import check_passphrase as module
+    else:  # pragma: no cover - a name `build_parser` never passes
+        raise RuntimeError(f"no command module named {module_name!r}")
+    return module
+
+
 def _dispatch(module_name: str, function_name: str):
     """A subcommand entry point that imports its module only when the
     subcommand is actually run.
@@ -67,8 +118,7 @@ def _dispatch(module_name: str, function_name: str):
     """
 
     def dispatch(args: argparse.Namespace) -> int:
-        module = importlib.import_module(f".commands.{module_name}", __package__)
-        return getattr(module, function_name)(args)
+        return getattr(_import_command(module_name), function_name)(args)
 
     dispatch.__name__ = function_name
     dispatch.__qualname__ = f"{module_name}.{function_name}"
@@ -248,6 +298,60 @@ def build_parser() -> argparse.ArgumentParser:
         help="regenerate the declared-secrets artifact from this repo's models",
     )
     sync_declared.set_defaults(func=_dispatch("sync_declared", "cmd_sync_declared"))
+
+    # `credentials`, like the session commands, is registered through
+    # `_dispatch`: its module imports `store` -> `crypto` -> `cryptography`,
+    # and `tests/test_gate_isolation.py` asserts that a `check-config` run
+    # loads none of those. Nothing in the help text below may name anything
+    # from that module either -- an f-string interpolating
+    # `session.CREDENTIAL_NAMES` here would import it at *this* module's
+    # scope and break the same property in a way no reader would connect to
+    # a help string.
+    credentials = sub.add_parser(
+        "credentials", help="manage the encrypted credential store"
+    )
+    credentials_sub = credentials.add_subparsers(
+        dest="credentials_command", metavar="<command>"
+    )
+
+    credentials_init = credentials_sub.add_parser(
+        "init", help="create the credential store (asks for a new password twice)"
+    )
+    credentials_init.set_defaults(func=_dispatch("credentials", "cmd_credentials_init"))
+
+    credentials_set = credentials_sub.add_parser(
+        "set",
+        help=(
+            "seal a profile's credentials, read as KEY=VALUE lines on stdin "
+            "(replaces the profile's whole envelope; never takes a value as "
+            "an argument)"
+        ),
+    )
+    credentials_set.add_argument(
+        "--profile", help="profile to use (overrides selection precedence)"
+    )
+    credentials_set.set_defaults(func=_dispatch("credentials", "cmd_credentials_set"))
+
+    credentials_list = credentials_sub.add_parser(
+        "list", help="list the profiles that have credentials sealed (names only)"
+    )
+    credentials_list.set_defaults(func=_dispatch("credentials", "cmd_credentials_list"))
+
+    credentials_show = credentials_sub.add_parser(
+        "show",
+        help="list the credential names a profile carries, never their values",
+    )
+    credentials_show.add_argument(
+        "--profile", help="profile to use (overrides selection precedence)"
+    )
+    credentials_show.set_defaults(func=_dispatch("credentials", "cmd_credentials_show"))
+
+    credentials_rotate = credentials_sub.add_parser(
+        "rotate", help="re-seal every envelope under a new password, or none"
+    )
+    credentials_rotate.set_defaults(
+        func=_dispatch("credentials", "cmd_credentials_rotate")
+    )
 
     check_passphrase = sub.add_parser(
         "check-passphrase",

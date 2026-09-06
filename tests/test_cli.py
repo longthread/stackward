@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import argparse
+import ast
+import inspect
+
 import pytest
 
-from stackward import __version__
+from stackward import __version__, cli
 from stackward.cli import (
     VERSION_CHECK_EXEMPT,
+    _import_command,
+    build_parser,
     config_home,
     crypto_selftest,
     main,
@@ -105,3 +111,84 @@ def test_doctor_still_works_when_repo_config_is_malformed(tmp_path, monkeypatch,
     monkeypatch.chdir(tmp_path)
     assert main(["doctor"]) == 0
     assert str(tmp_path / ".stackward.toml") in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Lazy dispatch, and the frozen bundle
+# ---------------------------------------------------------------------------
+
+
+def _dispatched_module_names(parser: argparse.ArgumentParser) -> set[str]:
+    """Every command module reached through `cli._dispatch`, read off the
+    parser rather than from a list a test keeps in step by hand.
+
+    `_dispatch` stamps its thunk's `__qualname__` as `<module>.<function>`;
+    a directly registered entry point (`cmd_doctor`, `cmd_check_config`) has
+    no dot in its qualname and is therefore not one of these.
+    """
+    found: set[str] = set()
+    for action in parser._actions:
+        if not isinstance(action, argparse._SubParsersAction):
+            continue
+        for sub in action.choices.values():
+            found |= _dispatched_module_names(sub)
+            func = sub.get_default("func")
+            qualname = getattr(func, "__qualname__", "")
+            if func is not None and "." in qualname:
+                found.add(qualname.partition(".")[0])
+    return found
+
+
+def test_every_lazily_dispatched_command_module_can_actually_be_imported():
+    """A command registered through `_dispatch` but missing from
+    `_import_command`'s chain would raise `RuntimeError` the first time
+    anyone ran it, and nothing else in the suite would notice: every other
+    test either calls an entry point directly or goes through a subcommand
+    that already works.
+
+    The membership check is a vacuity guard -- a `_dispatched_module_names`
+    that silently returned nothing would satisfy the loop below against any
+    implementation at all.
+    """
+    names = _dispatched_module_names(build_parser())
+    assert {"session", "credentials"} <= names
+
+    for name in names:
+        assert _import_command(name).__name__ == f"stackward.commands.{name}"
+
+
+def test_a_command_module_is_never_named_dynamically():
+    """The one property no in-process test can observe, asserted against the
+    module's own syntax tree instead.
+
+    PyInstaller resolves imports by reading `import` statements out of
+    bytecode; it cannot resolve a module name assembled at runtime. While
+    dispatch used `importlib.import_module(f".commands.{name}", ...)`, every
+    lazily dispatched command -- `login`, `exec`, `shell`, `set-secrets`,
+    `sync-declared-secrets`, `check-passphrase` -- was simply absent from
+    the shipped binary and died on `ModuleNotFoundError` with a traceback
+    and exit code 1, the code reserved for "a credential was found". Source
+    checkouts, this suite included, cannot see that: they import from a real
+    filesystem where the module is there to be found.
+
+    The tree, not the text: this module's own docstrings quote the old call
+    on purpose, and a substring search over the source would fail on the
+    explanation of the fix rather than on the defect.
+
+    So this asserts the mechanism, and the release workflow's smoke step
+    asserts the consequence by running a lazily dispatched command against
+    the real bundle. Neither is sufficient alone: this one cannot prove the
+    bundle works, and that one only runs on a release.
+    """
+    tree = ast.parse(inspect.getsource(cli))
+    called = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+    }
+    assert "import_module" not in called
+    assert "__import__" not in {
+        node.func.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }

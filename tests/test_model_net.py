@@ -481,7 +481,16 @@ def git(repo: Path, *args: str) -> subprocess.CompletedProcess:
 
 
 @pytest.fixture
-def repo(tmp_path: Path) -> Path:
+def repo(tmp_path: Path, isolated_git: Path) -> Path:
+    """A real git repository, isolated from the machine's own git config.
+
+    `isolated_git` (see `tests/conftest.py`) is not optional decoration
+    here. Without it, a global `core.hooksPath` -- husky, lefthook, the
+    `pre-commit` framework -- makes every `git commit` below inherit that
+    hook, which errored sixty-five tests in this file; and the tests that
+    run `hooks install` wrote a stackward hook into that global directory,
+    outside `tmp_path`, where it stayed after the run.
+    """
     path = tmp_path / "repo"
     path.mkdir()
     git(path, "init", "-q")

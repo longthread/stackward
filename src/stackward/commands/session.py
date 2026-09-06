@@ -24,6 +24,13 @@ was actually invoked to receive. Every error path in this module names a
 profile, a key, a file or a redacted backend URL, and never a credential
 value.
 
+**Two AWS names are removed from the child, and never supplied.**
+`AWS_SESSION_TOKEN` and `AWS_PROFILE` (`SCRUBBED_NAMES`) are dropped by
+`exec`/`shell` -- not because they are secrets this tool owns, but because
+either one *next to* a freshly injected long-lived key pair is a live
+misconfiguration whose failure names neither of them. See `SCRUBBED_NAMES`
+for the full argument, including why `login` keeps both.
+
 **`shell` inherits, it does not replace.** Both `exec` and `shell` overlay
 exactly four names onto a *copy* of the caller's own environment
 (`PATH`, `HOME`, `TERM` and everything else the child would otherwise need
@@ -164,6 +171,30 @@ PULUMI_CONFIG_PASSPHRASE = "PULUMI_CONFIG_PASSPHRASE"
 PULUMI_BACKEND_URL = "PULUMI_BACKEND_URL"
 
 CREDENTIAL_NAMES = (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, PULUMI_CONFIG_PASSPHRASE)
+
+# Removed from the child's environment by `exec`/`shell`, and never put
+# back. Neither is ever *injected*: the store holds no value for either, and
+# `CREDENTIAL_NAMES` above stays the complete list of what is supplied.
+#
+# They are scrubbed rather than left alone because of what they do *beside*
+# a freshly injected long-lived key pair, which is exactly the situation
+# `exec` creates. `AWS_SESSION_TOKEN` is only valid for the temporary key
+# pair it was issued with: next to this profile's own keys it is not merely
+# stale, it makes every request fail to authenticate, and the error names
+# neither the token nor the mismatch -- it reads as "your credentials are
+# wrong", about credentials that are fine. `AWS_PROFILE` names a section of
+# the caller's own shared credentials file, a separate source of keys and
+# region entirely; a child that reads it has been told two different things
+# about which account it is talking to, and which one wins depends on the
+# SDK and the code path rather than on anything this tool said. Both are
+# ordinary things to have exported (an assumed role, a shell with a profile
+# selected), so this is the common case and not a rare one.
+#
+# `login` deliberately does not scrub them: it injects no credentials, so
+# neither name can contradict one there, and reaching a backend through the
+# caller's own ambient AWS configuration is a working setup that `login`
+# has no business breaking.
+SCRUBBED_NAMES = ("AWS_SESSION_TOKEN", "AWS_PROFILE")
 
 
 class SessionError(Exception):
@@ -380,7 +411,10 @@ def _tty_available() -> bool:
     return True
 
 
-def _read_store_password() -> str:
+DEFAULT_PASSWORD_PROMPT = "stackward credential store password: "
+
+
+def _read_store_password(prompt: str = DEFAULT_PASSWORD_PROMPT) -> str:
     """`STACKWARD_PASSWORD` if set, otherwise an interactive prompt.
 
     Never reads `sys.stdin`. The environment variable exists for the
@@ -389,6 +423,15 @@ def _read_store_password() -> str:
     against); the prompt exists for everyone else, and refuses outright,
     rather than degrading to a visible, stdin-consuming fallback, when
     `_tty_available` says `/dev/tty` cannot be opened.
+
+    `prompt` only changes the wording. It exists so that
+    `commands.credentials` -- which asks for a password it is about to
+    *set*, and asks twice to confirm it -- can say which password it wants
+    without introducing a second way of obtaining one: the environment
+    variable, the `/dev/tty` check and the refusal are all decided here, in
+    one place, for every command that needs the store password. A caller
+    passing its own wording gets none of that logic to reimplement, and
+    cannot accidentally skip the parts of it that are load-bearing.
     """
     from_env = os.environ.get(ENV_STORE_PASSWORD)
     if from_env is not None:
@@ -398,7 +441,7 @@ def _read_store_password() -> str:
             f"no store password available: set {ENV_STORE_PASSWORD}, or run "
             "this command from an interactive terminal"
         )
-    return getpass.getpass("stackward credential store password: ")
+    return getpass.getpass(prompt)
 
 
 def _require_credential_names(credentials: Mapping[str, str], profile: str) -> None:
@@ -433,9 +476,17 @@ def _environ_without_store_password() -> dict[str, str]:
 
 
 def _child_env(credentials: Mapping[str, str], backend_url: str) -> dict[str, str]:
-    """The caller's own environment, minus the store password, plus exactly
-    the four session names."""
+    """The caller's own environment, minus the store password and the two
+    `SCRUBBED_NAMES`, plus exactly the four session names.
+
+    The removals happen here rather than in `_environ_without_store_password`
+    on purpose: that helper is shared with `login`, and `login` must keep
+    them (see `SCRUBBED_NAMES` for why the hazard is specific to a child
+    that has just been handed a different set of keys).
+    """
     env = _environ_without_store_password()
+    for name in SCRUBBED_NAMES:
+        env.pop(name, None)
     for name in CREDENTIAL_NAMES:
         env[name] = credentials[name]
     env[PULUMI_BACKEND_URL] = backend_url

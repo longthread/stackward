@@ -158,6 +158,16 @@ def test_check_config_neither_prompts_nor_connects_on_a_finding(
 
 
 def _repo_with_policy(tmp_path: Path) -> Path:
+    """A real repository with a minimal policy, committed.
+
+    Every caller takes the `isolated_git` fixture (see `tests/conftest.py`)
+    before calling this: `git commit` below runs whatever hook the machine's
+    own `core.hooksPath` points at otherwise, which fails these two tests
+    for a reason that has nothing to do with the gate. Taken as a fixture by
+    the tests rather than as a parameter here, since what it does is set
+    environment variables for the duration of the test, not return a value
+    this function needs.
+    """
     repo = tmp_path / "repo"
     repo.mkdir()
     for args in (
@@ -176,7 +186,9 @@ def _repo_with_policy(tmp_path: Path) -> Path:
     return repo
 
 
-def test_pre_commit_neither_prompts_nor_connects(sealed, tmp_path, monkeypatch):
+def test_pre_commit_neither_prompts_nor_connects(
+    sealed, tmp_path, monkeypatch, isolated_git
+):
     """The half that matters most: `pre-commit` is the command a `git
     commit` runs, so a prompt here blocks the commit on a terminal and hangs
     it everywhere else."""
@@ -191,7 +203,7 @@ def test_pre_commit_neither_prompts_nor_connects(sealed, tmp_path, monkeypatch):
 
 
 def test_pre_commit_neither_prompts_nor_connects_on_a_finding(
-    sealed, tmp_path, monkeypatch
+    sealed, tmp_path, monkeypatch, isolated_git
 ):
     repo = _repo_with_policy(tmp_path)
     (repo / "Pulumi.dev.yaml").write_text("config:\n  myproject:dbPassword: hunter2\n")

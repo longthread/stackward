@@ -26,6 +26,8 @@ import json
 import pytest
 from cryptography.exceptions import InvalidTag, UnsupportedAlgorithm
 
+from leakcheck import assert_no_leak
+
 from stackward import crypto
 from stackward.crypto import (
     ARGON2ID_ITERATIONS,
@@ -40,6 +42,7 @@ from stackward.crypto import (
     DecryptionError,
     EmptyPasswordError,
     EnvelopeError,
+    describe_value,
     seal,
     seal_json,
     unseal,
@@ -178,6 +181,82 @@ def test_an_unknown_kdf_is_refused():
     envelope["kdf"]["name"] = "something-else"
     with pytest.raises(EnvelopeError):
         unseal(envelope, PASSWORD, AAD)
+
+
+# ---------------------------------------------------------------------------
+# `describe_value` -- the guard on the two header fields whose *contents* get
+# printed back. Untested until now: `return repr(value)` for every input
+# passed the entire suite, because the two tests that reach the branch
+# (`test_an_unsupported_envelope_version_is_refused` and
+# `test_an_unknown_kdf_is_refused`) assert only that something was raised.
+# ---------------------------------------------------------------------------
+
+# Opaque on purpose -- see `tests/leakcheck.py`. A marker containing a real
+# word would share an eight-character run with the words these very messages
+# print ("version", "unsupported"), and the run check would fire on output
+# that disclosed nothing.
+PASTED_INTO_A_HEADER_FIELD = "Zq7Xv4Rm2Kt9Lp5Nc8Wd6Hb3Jf"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "some string",
+        PASTED_INTO_A_HEADER_FIELD,
+        ["a", "list"],
+        {"a": "dict"},
+        b"some bytes",
+    ],
+    # Named, so that a value never reaches a test id: pytest builds ids out
+    # of the parameters themselves, and a failure report is output like any
+    # other (GC4).
+    ids=["str", "pasted-credential", "list", "dict", "bytes"],
+)
+def test_describe_value_reports_a_type_and_never_the_value(value):
+    described = describe_value(value)
+    assert described == f"<{type(value).__name__}>"
+    assert str(value) not in described
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, -7, 1.5, True])
+def test_describe_value_shows_what_cannot_carry_a_credential(value):
+    """A number, a bool and `None` are shown, because the message is far more
+    useful naming the version it actually found than reporting `<int>` -- and
+    none of the three can be a pasted credential. `True` is included
+    deliberately: `bool` is an `int` subclass, so it takes the shown branch,
+    and a future rewrite that tightened the check to `type(value) is int`
+    would silently start reporting `<bool>`."""
+    assert describe_value(value) == repr(value)
+
+
+def test_a_credential_pasted_into_the_version_field_is_not_read_back():
+    """`v` is hand-editable and this message is printed. A user who pasted a
+    credential one field too high must not have it echoed by the error that
+    caught the mistake."""
+    envelope = seal(MARKER, PASSWORD, AAD)
+    envelope["v"] = PASTED_INTO_A_HEADER_FIELD
+
+    with pytest.raises(EnvelopeError) as raised:
+        unseal(envelope, PASSWORD, AAD)
+
+    message = str(raised.value)
+    assert_no_leak(message, PASTED_INTO_A_HEADER_FIELD, what="a pasted header value")
+    assert "<str>" in message
+
+
+def test_a_credential_pasted_into_the_kdf_name_is_not_read_back():
+    """The second call site, which the version test above cannot cover: the
+    two are separate `describe_value` calls and a fix applied to one only
+    would leave the other echoing."""
+    envelope = seal(MARKER, PASSWORD, AAD)
+    envelope["kdf"]["name"] = PASTED_INTO_A_HEADER_FIELD
+
+    with pytest.raises(EnvelopeError) as raised:
+        unseal(envelope, PASSWORD, AAD)
+
+    message = str(raised.value)
+    assert_no_leak(message, PASTED_INTO_A_HEADER_FIELD, what="a pasted header value")
+    assert "<str>" in message
 
 
 @pytest.mark.parametrize(

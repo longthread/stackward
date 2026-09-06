@@ -35,41 +35,6 @@ def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
 
 
 @pytest.fixture
-def isolated_git(tmp_path: Path, monkeypatch) -> Path:
-    """Cut every `git` these tests run off from the machine's own git config.
-
-    Without this, a developer (or a CI image) with a *global*
-    `core.hooksPath` -- what husky, lefthook and the `pre-commit` framework
-    all set, and precisely the configuration this command exists to handle
-    -- makes `git init` here inherit that hook, and sixty-odd tests across
-    this file and `test_pre_commit.py` error out for a reason that has
-    nothing to do with the code under test. Worse here than anywhere else
-    in the suite: a global `core.hooksPath` also silently moves where
-    `hooks install` writes, so tests asserting on `.git/hooks/pre-commit`
-    would be examining a directory the command was never pointed at.
-
-    All four sources git consults are redirected, not only the global one:
-    `GIT_CONFIG_SYSTEM` covers `/etc/gitconfig`, which is exactly where an
-    org-wide `hooksPath` lives; `HOME` and `XDG_CONFIG_HOME` cover
-    `~/.gitconfig` and `$XDG_CONFIG_HOME/git/config`, which git still reads
-    on a path that leaves `GIT_CONFIG_GLOBAL` unset. `/dev/null` is git's
-    own documented spelling of "this configuration file does not exist" for
-    the two `GIT_CONFIG_*` variables.
-
-    The redirect is set with `monkeypatch`, so it is still in place while
-    the *test body* runs `git commit` -- not only while the fixture built
-    the repository.
-    """
-    home = tmp_path / "git-home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / "config"))
-    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
-    monkeypatch.setenv("GIT_CONFIG_SYSTEM", os.devnull)
-    return home
-
-
-@pytest.fixture
 def repo(tmp_path: Path, isolated_git: Path) -> Path:
     """A real, minimal git repository with one initial commit that declares
     a `.stackward.toml`.

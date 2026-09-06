@@ -9,7 +9,11 @@ present-but-invalid must raise, never fall back to a default.
 
 from __future__ import annotations
 
+import tomllib
+
 import pytest
+
+from leakcheck import assert_no_leak
 
 from stackward import __version__
 from stackward.config import (
@@ -489,6 +493,92 @@ def test_load_config_text_names_its_origin_in_an_error():
     with pytest.raises(ConfigError) as exc_info:
         load_config_text("this is not valid toml [[[", ":.stackward.toml")
     assert ":.stackward.toml" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# A parse failure reports a position, never the parser's own message.
+#
+# `tomllib` quotes document text in some of its messages, and this call site
+# interpolated `exc` in full on the strength of a claim about what
+# `.stackward.toml` is allowed to contain -- which is exactly the assumption
+# a file that failed to parse has already broken. `store.py` fixed the same
+# defect for the store's own `config`; both now go through
+# `config.toml_position`.
+# ---------------------------------------------------------------------------
+
+# Opaque -- see `tests/leakcheck.py`. The messages under test print the
+# origin label and the words "invalid TOML", and a marker built out of real
+# words would share an eight-character run with them.
+PASTED_INTO_THE_POLICY = "Xr4Nb8Kw2Vd6Ty9Qm3Zs7Fj"
+
+
+def test_a_duplicate_declaration_is_reported_by_position_and_never_quoted_back():
+    """`tomllib` really does read a document's own text back.
+
+    Not hypothetical, and not reachable through the malformed-syntax tests
+    above: nearly every `TOMLDecodeError` is a fixed description plus a
+    coordinate, and only a handful name something from the file. A
+    re-declared table is the one this project has actually confirmed --
+    `Cannot declare ('a',) twice` -- so it is the shape worth pinning.
+    """
+    text = (
+        f'[secrets."{PASTED_INTO_THE_POLICY}"]\n'
+        f'[secrets."{PASTED_INTO_THE_POLICY}"]\n'
+    )
+    # Guard: if a future tomllib stops quoting the key, this test would pass
+    # against the unfixed call site too, and would need to be rewritten
+    # rather than quietly kept.
+    try:
+        tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        assert PASTED_INTO_THE_POLICY in str(exc), "tomllib no longer quotes the key"
+
+    with pytest.raises(ConfigError) as exc_info:
+        load_config_text(text, ":.stackward.toml")
+
+    message = str(exc_info.value)
+    assert_no_leak(message, PASTED_INTO_THE_POLICY, what="text from the policy file")
+    assert message.startswith(":.stackward.toml: invalid TOML")
+    assert "line 2" in message
+
+
+def test_a_parser_message_is_reduced_to_its_coordinate(monkeypatch):
+    """The general rule, independent of which messages this `tomllib` happens
+    to produce: whatever the parser says, only the coordinate survives."""
+
+    def raise_quoting_the_document(*_args, **_kwargs):
+        raise tomllib.TOMLDecodeError(
+            f"Cannot declare ('{PASTED_INTO_THE_POLICY}',) twice "
+            "(at line 3, column 3)"
+        )
+
+    monkeypatch.setattr(tomllib, "loads", raise_quoting_the_document)
+    with pytest.raises(ConfigError) as exc_info:
+        load_config_text("irrelevant", "<memory>")
+
+    message = str(exc_info.value)
+    assert_no_leak(message, PASTED_INTO_THE_POLICY, what="the parser's own message")
+    assert message == "<memory>: invalid TOML (at line 3, column 3)"
+
+
+def test_a_message_with_no_coordinate_loses_the_coordinate_not_the_secrecy(monkeypatch):
+    """The fallback must degrade to *no position*, never to the whole
+    message -- which is what this call site used to do unconditionally.
+    `TOMLDecodeError`'s text is not an API and this project supports three
+    Python versions, so an unrecognised shape has to be survivable."""
+
+    def raise_an_unparseable_shape(*_args, **_kwargs):
+        raise tomllib.TOMLDecodeError(
+            f"a shape from some future release: {PASTED_INTO_THE_POLICY}"
+        )
+
+    monkeypatch.setattr(tomllib, "loads", raise_an_unparseable_shape)
+    with pytest.raises(ConfigError) as exc_info:
+        load_config_text("irrelevant", "<memory>")
+
+    message = str(exc_info.value)
+    assert_no_leak(message, PASTED_INTO_THE_POLICY, what="the parser's own message")
+    assert message == "<memory>: invalid TOML"
 
 
 def test_load_config_applies_the_same_validation_as_load_config_text(tmp_path):

@@ -247,7 +247,7 @@ def test_a_config_value_is_never_quoted_back_by_a_syntax_error(store_directory):
 def test_a_credential_at_the_end_of_the_document_is_not_quoted_back(store_directory):
     """The other coordinate `tomllib` produces, `(at end of document)`.
 
-    `_toml_position` matches two message shapes and every other test here
+    `toml_position` matches two message shapes and every other test here
     exercises only the first, which would leave the second silently
     unrecognised -- and an unrecognised shape yields no coordinate at all,
     so the branch is worth a test of its own. An unterminated string is the
@@ -272,7 +272,7 @@ def test_a_toml_message_with_no_coordinate_loses_the_coordinate_not_the_secrecy(
     position, never to quoting the message.
 
     `TOMLDecodeError`'s text is not an API and this project supports three
-    Python versions, so `_toml_position` has to cope with a message it
+    Python versions, so `toml_position` has to cope with a message it
     cannot parse. The safe degradation is losing the diagnostic; the unsafe
     one is falling back to the whole message, which is exactly what this
     call site used to do unconditionally.
@@ -728,6 +728,29 @@ def test_an_unsupported_store_version_is_refused(initialised):
     path.write_text(json.dumps(document))
     with pytest.raises(StoreError):
         resolve_credentials("one", PASSWORD, directory=initialised)
+
+
+def test_a_credential_pasted_into_the_store_version_is_not_read_back(initialised):
+    """`v` is the one hand-editable header field in the file that is
+    *expected* to hold secrets, and its contents are printed back. The test
+    above sets an integer, which `describe_value` shows on purpose, so it
+    could never see a version field that echoed a string.
+
+    Opaque marker -- see `tests/leakcheck.py`: this message also prints the
+    store path, and a marker built from real words shares runs with it.
+    """
+    pasted = "Yw3Kd8Qr5Vn2Tx7Bz4Ms9Gj6"
+    path = initialised / "credentials"
+    document = json.loads(path.read_bytes())
+    document["v"] = pasted
+    path.write_text(json.dumps(document))
+
+    with pytest.raises(StoreError) as raised:
+        resolve_credentials("one", PASSWORD, directory=initialised)
+
+    message = str(raised.value)
+    assert_no_leak(message, pasted, what="a pasted store version")
+    assert "<str>" in message
 
 
 def test_a_store_with_no_verifier_is_refused_rather_than_opened(initialised):
