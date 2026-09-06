@@ -17,7 +17,14 @@ license = { text = "Apache-2.0" }
 # pull in grpcio and friends for no benefit.
 dependencies = [
     "pyyaml>=6.0",
-    "cryptography>=42.0",
+    # 44.0 is the floor because it is the first release shipping
+    # `cryptography.hazmat.primitives.kdf.argon2`, which `stackward.crypto`
+    # imports at module scope. Established by installing each release into a
+    # throwaway environment and importing it — 42.0.0, 43.0.0 and 43.0.3 all
+    # raise ModuleNotFoundError, 44.0.0 imports and derives — not from the
+    # changelog and not from memory. Below this floor the credential store does
+    # not degrade at runtime: the module does not load at all.
+    "cryptography>=44.0",
 ]
 
 [project.scripts]

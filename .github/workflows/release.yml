@@ -59,17 +59,39 @@ jobs:
           set -euo pipefail
           python -m pip install --quiet --upgrade pip
           python -m pip install --quiet . pyinstaller
+          # `bootstrap/regen.py` is shipped as DATA, not as a module: it is
+          # piped to the consuming repository's own interpreter, and nothing
+          # in stackward imports it — which is what keeps pydantic out of the
+          # bundle. PyInstaller's import analysis therefore never sees it, so
+          # it has to be added explicitly.
           python -m PyInstaller --noconfirm --clean --onedir \
-            --name stackward --paths src --distpath dist --workpath build entry.py
+            --name stackward --paths src --distpath dist --workpath build \
+            --add-data "src/stackward/bootstrap/regen.py:stackward/bootstrap" \
+            entry.py
 
       - name: It must actually run
-        # A bundle that builds is not a bundle that works. doctor performs a
-        # real Argon2id + AES-GCM round trip, so this catches a native
-        # extension that failed to freeze — the classic failure of this route.
+        # A bundle that builds is not a bundle that works. The checks, and
+        # the reasoning behind each, live in `scripts/check-bundle.sh` --
+        # one definition, run here against what this job just built and
+        # again in `publish` against the artifact actually being released.
+        # Two copies of this is how `publish` came to test only `--version`
+        # and `doctor`, the two commands a missing lazily-dispatched module
+        # cannot break.
         run: |
           set -euo pipefail
-          ./dist/stackward/stackward --version
-          ./dist/stackward/stackward doctor
+          scripts/check-bundle.sh ./dist/stackward/stackward
+
+          # Not in the shared script: this one inspects the PyInstaller
+          # output tree, which only this job has. `regen.py` ships as data
+          # precisely so nothing imports it and pydantic stays test-only. If
+          # it ever became an import, the bundle would still build, doctor
+          # would still pass, and the only visible symptom would be a fatter
+          # download -- so the absence has to be asserted, not assumed.
+          if find dist -iname '*pydantic*' -print -quit | grep -q .; then
+            echo "::error::pydantic was bundled; it is a test-only dependency" >&2
+            find dist -iname '*pydantic*' | head -20 >&2
+            exit 1
+          fi
 
       - name: Sign for macOS
         if: runner.os == 'macOS'
@@ -110,16 +132,23 @@ jobs:
 
       - name: Verify the install path before publishing it
         # Install exactly as a user would, from the artifacts about to be
-        # released, and run the smoke test. A release that cannot be installed
-        # is deleted, not patched: the tag is already immutable in people's
-        # lockfiles and instructions.
+        # released, and run the same check the build job ran -- against the
+        # bytes actually being published, which is the only artifact whose
+        # correctness this job can still act on. A release that cannot be
+        # installed is deleted, not patched: the tag is already immutable in
+        # people's lockfiles and instructions.
+        #
+        # `scripts/check-bundle.sh`, not a second smoke test written here:
+        # this step used to run `--version` and `doctor` alone, and those are
+        # exactly the two commands that stayed green through a bundle that
+        # was missing every lazily dispatched one.
         run: |
           set -euo pipefail
           cd artifacts
           sha256sum --check stackward-Linux-x86_64.tar.gz.sha256
           mkdir -p /tmp/probe && tar -xzf stackward-Linux-x86_64.tar.gz -C /tmp/probe
-          /tmp/probe/stackward/stackward --version
-          /tmp/probe/stackward/stackward doctor
+          # Absolute: the working directory is `artifacts`, not the checkout.
+          "$GITHUB_WORKSPACE/scripts/check-bundle.sh" /tmp/probe/stackward/stackward
 
       - name: Publish
         env:
