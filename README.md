@@ -12,7 +12,7 @@ diff. `stackward` exists to make that mistake hard.
 
 > **Status: early.** `v0.1.0` shipped `--version` and `doctor` alone, to prove
 > the release and install path before anything was built on top of it. That
-> path held, and every command in the table below is now implemented.
+> path held, and `v0.2.0` ships every command in the table below.
 > Interfaces may change.
 
 ## What it does
@@ -103,8 +103,8 @@ In CI, pin both halves. `raw` serves any ref, so a tag pins the installer, and
 `STACKWARD_VERSION` pins the binary it fetches:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/longthread/stackward/v0.1.1/install.sh \
-  | STACKWARD_VERSION=v0.1.1 sh
+curl -fsSL https://raw.githubusercontent.com/longthread/stackward/v0.2.0/install.sh \
+  | STACKWARD_VERSION=v0.2.0 sh
 ```
 
 Both endpoints are cached — `raw` for five minutes, and the
